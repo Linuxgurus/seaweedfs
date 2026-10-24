@@ -19,8 +19,8 @@
 # Environment overrides:
 #   RUNTIME=podman|docker   container runtime       (default: podman)
 #   REGISTRY=host           container registry      (default: ghcr.io)
-#   PROJECT=name            registry namespace      (default: jdblack)
-#   IMAGE=name              repository/image name   (default: jblack-seaweedfs)
+#   PROJECT=name            registry namespace      (default: linuxgurus -- the GitHub org)
+#   IMAGE=name              repository/image name   (default: seaweedfs)
 #   PLATFORM=linux/amd64    build platform          (default: linux/amd64; arm64 works)
 #   VERSION=4.46            override the moving version alias (default: constants.go)
 #   TAGS=5BytesOffset       go build tags. Non-empty also suffixes the image tags
@@ -64,8 +64,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME="${RUNTIME:-podman}"
 REGISTRY="${REGISTRY:-ghcr.io}"
-PROJECT="${PROJECT:-jdblack}"
-IMAGE="${IMAGE:-jblack-seaweedfs}"
+PROJECT="${PROJECT:-linuxgurus}"
+IMAGE="${IMAGE:-seaweedfs}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAGS="${TAGS:-}"
 WITH_RUST="${WITH_RUST:-${RUST:-1}}"
@@ -403,6 +403,28 @@ for t in "${IMAGE_TAGS[@]}"; do
   echo "    -> $REF:$t"
   "$RUNTIME" push "$IMAGE_ID" "$REF:$t"
 done
+
+# A push can succeed while a kubelet cannot pull: ghcr packages are their own
+# object and default to `internal`, and repository visibility never changes
+# that. Ask the registry as an anonymous client, the way a node would.
+check_anonymous_pull() {
+  [[ "$REGISTRY" == ghcr.io ]] || return 0
+  local repo="${PROJECT}/${IMAGE}" token code
+  token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  [[ -n "$token" ]] || { echo "    WARNING: could not get an anonymous token for $repo"; return 0; }
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $token" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json' \
+    "https://ghcr.io/v2/${repo}/manifests/${IMAGE_TAGS[0]}")
+  if [[ "$code" != 200 ]]; then
+    echo "    WARNING: anonymous pull of $repo:${IMAGE_TAGS[0]} returns HTTP $code."
+    echo "             The push worked; a kubelet without credentials will NOT pull it."
+    echo "             Fix: org -> Packages -> $IMAGE -> Package settings -> Danger Zone"
+    echo "                  -> Change visibility -> Public."
+  fi
+}
+check_anonymous_pull
 
 echo
 echo "Done. Verify:"
