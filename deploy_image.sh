@@ -30,9 +30,10 @@
 #   WITH_RUST=0             DEFAULT. /usr/bin/weed-volume and /usr/bin/weed-worker stay
 #                           the zero-byte placeholders upstream's builder writes; nothing
 #                           is built or fetched. Safe because nothing here execs them:
-#                           the Rust volume server is opt-in and test-only, and a chart
-#                           >= 4.45 lance sidecar is kept out with s3.lancePort=0
-#                           (worker.namespaceUrl must stay empty too).
+#                           the Rust volume server is opt-in and test-only, and the Lance
+#                           sidecar is off (s3.lancePort=0, worker.namespaceUrl empty) --
+#                           and it cannot authenticate to the 4.49 admin anyway, because
+#                           the chart gives that container no signing key.
 #   WITH_RUST=1             build the two Rust binaries from THIS TREE and include them.
 #                           Never anything from an upstream image: weed-volume must carry
 #                           this fork's master.proto fields (data_shards/parity_shards)
@@ -68,7 +69,7 @@ PROJECT="${PROJECT:-linuxgurus}"
 IMAGE="${IMAGE:-seaweedfs}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAGS="${TAGS:-}"
-WITH_RUST="${WITH_RUST:-${RUST:-1}}"
+WITH_RUST="${WITH_RUST:-${RUST:-0}}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 
 DO_PUSH=1
