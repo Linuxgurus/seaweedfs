@@ -26,7 +26,9 @@ func init() {
 		Category: pluginworker.CategoryHeavy,
 		Aliases:  []string{"erasure-coding", "erasure.coding", "ec"},
 		Build: func(opts pluginworker.HandlerBuildOptions) (pluginworker.JobHandler, error) {
-			return NewErasureCodingHandler(opts.GrpcDialOption, opts.WorkingDir), nil
+			h := NewErasureCodingHandler(opts.GrpcDialOption, opts.WorkingDir)
+			h.workerAddress = strings.TrimSpace(opts.WorkerAddress)
+			return h, nil
 		},
 	})
 }
@@ -39,6 +41,7 @@ type erasureCodingWorkerConfig struct {
 type ErasureCodingHandler struct {
 	grpcDialOption grpc.DialOption
 	workingDir     string
+	workerAddress  string
 }
 
 func NewErasureCodingHandler(grpcDialOption grpc.DialOption, workingDir string) *ErasureCodingHandler {
@@ -166,6 +169,13 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0}},
 							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
 						},
+						{
+							Name:        "strict_placement",
+							Label:       "Strict Placement",
+							Description: "Fail EC planning when the placement constraints cannot be met instead of relaxing them.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_BOOL,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_TOGGLE,
+						},
 					},
 				},
 			},
@@ -190,6 +200,9 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 				},
 				"parity_shards": {
 					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0},
+				},
+				"strict_placement": {
+					Kind: &plugin_pb.ConfigValue_BoolValue{BoolValue: false},
 				},
 			},
 		},
@@ -544,6 +557,7 @@ func (h *ErasureCodingHandler) Execute(
 		params.Collection,
 		h.grpcDialOption,
 	)
+	task.workerAddress = h.workerAddress
 	execCtx, execCancel := context.WithCancel(ctx)
 	defer execCancel()
 	task.SetProgressCallback(func(progress float64, stage string) {
@@ -661,6 +675,7 @@ func deriveErasureCodingWorkerConfig(values map[string]*plugin_pb.ConfigValue) *
 
 	// fork: configurable EC ratio (helper in ec_ratio_fork.go)
 	applyConfiguredEcRatio(values, taskConfig)
+	taskConfig.StrictPlacement = pluginworker.ReadBoolConfig(values, "strict_placement", taskConfig.StrictPlacement)
 
 	return &erasureCodingWorkerConfig{
 		TaskConfig: taskConfig,
@@ -696,8 +711,15 @@ func buildErasureCodingProposal(
 	}
 
 	sourceNode := ""
-	if len(params.Sources) > 0 {
-		sourceNode = strings.TrimSpace(params.Sources[0].Node)
+	var replicaServers []string
+	for _, s := range params.Sources {
+		if s == nil || strings.TrimSpace(s.Node) == "" || len(s.ShardIds) > 0 {
+			continue
+		}
+		replicaServers = append(replicaServers, s.Node)
+		if sourceNode == "" {
+			sourceNode = strings.TrimSpace(s.Node)
+		}
 	}
 
 	summary := fmt.Sprintf("Erasure code volume %d", result.VolumeID)
@@ -727,6 +749,9 @@ func buildErasureCodingProposal(
 			},
 			"source_server": {
 				Kind: &plugin_pb.ConfigValue_StringValue{StringValue: sourceNode},
+			},
+			"replica_servers": {
+				Kind: &plugin_pb.ConfigValue_StringList{StringList: &plugin_pb.StringList{Values: replicaServers}},
 			},
 			"collection": {
 				Kind: &plugin_pb.ConfigValue_StringValue{StringValue: result.Collection},

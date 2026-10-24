@@ -25,8 +25,9 @@ type Config struct {
 	// (ec.config) for the collection, else the build default
 	// (erasure_coding.DataShardsCount / ParityShardsCount). An explicit value here
 	// overrides the policy.
-	DataShards   int `json:"data_shards"`
-	ParityShards int `json:"parity_shards"`
+	DataShards      int  `json:"data_shards"`
+	ParityShards    int  `json:"parity_shards"`
+	StrictPlacement bool `json:"strict_placement"` // fail planning instead of relaxing placement constraints
 }
 
 // NewDefaultConfig creates a new default erasure coding configuration
@@ -216,6 +217,18 @@ func GetConfigSpec() base.ConfigSpec {
 				InputType:    "number",
 				CSSClasses:   "form-control",
 			},
+			{
+				Name:         "strict_placement",
+				JSONName:     "strict_placement",
+				Type:         config.FieldTypeBool,
+				DefaultValue: false,
+				Required:     false,
+				DisplayName:  "Strict Placement",
+				Description:  "Refuse to encode a volume when the placement constraints can't be satisfied",
+				HelpText:     "When enabled, a volume is only encoded if every shard can be placed within the per-disk, anti-affinity, replica-placement and per-rack caps, so the configured resilience is preserved. When disabled (default), unsatisfiable constraints are relaxed and noted in the log",
+				InputType:    "checkbox",
+				CSSClasses:   "form-check-input",
+			},
 		},
 	}
 }
@@ -237,6 +250,7 @@ func (c *Config) ToTaskPolicy() *worker_pb.TaskPolicy {
 				CollectionFilter: c.CollectionFilter,
 				PreferredTags:    preferredTagsCopy,
 				ReplicaPlacement: c.ReplicaPlacement,
+				StrictPlacement:  c.StrictPlacement,
 			},
 		},
 	}
@@ -261,6 +275,7 @@ func (c *Config) FromTaskPolicy(policy *worker_pb.TaskPolicy) error {
 		c.CollectionFilter = ecConfig.CollectionFilter
 		c.PreferredTags = append([]string(nil), ecConfig.PreferredTags...)
 		c.ReplicaPlacement = ecConfig.ReplicaPlacement
+		c.StrictPlacement = ecConfig.StrictPlacement
 	}
 
 	return nil

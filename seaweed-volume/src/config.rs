@@ -125,6 +125,11 @@ pub struct Cli {
     #[arg(long = "maintenanceMBps", default_value_t = 0)]
     pub maintenance_mb_per_second: u32,
 
+    /// Limit how many vacuum commits run at once on this server; queued
+    /// commits hold no volume lock. 0 means unlimited.
+    #[arg(long = "compactionMaxParallelCommits", default_value_t = 0)]
+    pub max_parallel_vacuum_commits: usize,
+
     /// Limit file size to avoid out of memory.
     #[arg(long = "fileSizeLimitMB", default_value_t = 256)]
     pub file_size_limit_mb: u32,
@@ -263,6 +268,8 @@ pub struct VolumeServerConfig {
     pub mem_profile: String,
     pub compaction_byte_per_second: i64,
     pub maintenance_byte_per_second: i64,
+    /// Max concurrent vacuum commits; 0 means unlimited.
+    pub max_parallel_vacuum_commits: usize,
     pub file_size_limit_bytes: i64,
     pub concurrent_upload_limit: i64,
     pub concurrent_download_limit: i64,
@@ -296,8 +303,6 @@ pub struct VolumeServerConfig {
     pub grpc_allowed_wildcard_domain: String,
     pub grpc_volume_allowed_common_names: Vec<String>,
     pub tls_policy: TlsPolicy,
-    /// Enable batched write queue for improved throughput under load.
-    pub enable_write_queue: bool,
     /// Path to security.toml — stored for SIGHUP reload.
     pub security_file: String,
     /// If true, FetchAndWriteNeedle skips remote S3 endpoint validation
@@ -927,6 +932,7 @@ fn resolve_config_with_env(cli: Cli, env: EnvLookup<'_>) -> VolumeServerConfig {
         mem_profile: cli.mem_profile,
         compaction_byte_per_second: cli.compaction_mb_per_second as i64 * 1024 * 1024,
         maintenance_byte_per_second: cli.maintenance_mb_per_second as i64 * 1024 * 1024,
+        max_parallel_vacuum_commits: cli.max_parallel_vacuum_commits,
         file_size_limit_bytes: cli.file_size_limit_mb as i64 * 1024 * 1024,
         concurrent_upload_limit: cli.concurrent_upload_limit_mb as i64 * 1024 * 1024,
         concurrent_download_limit: cli.concurrent_download_limit_mb as i64 * 1024 * 1024,
@@ -960,8 +966,6 @@ fn resolve_config_with_env(cli: Cli, env: EnvLookup<'_>) -> VolumeServerConfig {
         grpc_allowed_wildcard_domain: sec.grpc_allowed_wildcard_domain,
         grpc_volume_allowed_common_names: sec.grpc_volume_allowed_common_names,
         tls_policy: sec.tls_policy,
-        enable_write_queue: env_string(env, "SEAWEED_WRITE_QUEUE")
-            .is_some_and(|v| v == "1" || v == "true"),
         security_file: cli.security_file,
         allow_untrusted_remote_endpoints: cli.allow_untrusted_remote_endpoints,
     }

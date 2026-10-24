@@ -1289,6 +1289,16 @@ func (m *ObjectMutation) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.KeepRemoteObject {
+		i--
+		if m.KeepRemoteObject {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x70
+	}
 	if m.RemoveEmptyParent {
 		i--
 		if m.RemoveEmptyParent {
@@ -1556,6 +1566,20 @@ func (m *ObjectTransactionRequest) MarshalToSizedBufferVT(dAtA []byte) (int, err
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if len(m.ConditionAltKey) > 0 {
+		i -= len(m.ConditionAltKey)
+		copy(dAtA[i:], m.ConditionAltKey)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.ConditionAltKey)))
+		i--
+		dAtA[i] = 0x52
+	}
+	if len(m.RequestId) > 0 {
+		i -= len(m.RequestId)
+		copy(dAtA[i:], m.RequestId)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.RequestId)))
+		i--
+		dAtA[i] = 0x4a
 	}
 	if m.IsMoved {
 		i--
@@ -2461,6 +2485,16 @@ func (m *DeleteEntryRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.KeepRemoteObject {
+		i--
+		if m.KeepRemoteObject {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x50
 	}
 	if m.IfNotModifiedAfter != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.IfNotModifiedAfter))
@@ -4358,6 +4392,11 @@ func (m *TraverseBfsMetadataResponse) MarshalToSizedBufferVT(dAtA []byte) (int, 
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.EntryTsNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.EntryTsNs))
+		i--
+		dAtA[i] = 0x18
 	}
 	if m.Entry != nil {
 		size, err := m.Entry.MarshalToSizedBufferVT(dAtA[:i])
@@ -7066,6 +7105,9 @@ func (m *ObjectMutation) SizeVT() (n int) {
 	if m.RemoveEmptyParent {
 		n += 2
 	}
+	if m.KeepRemoteObject {
+		n += 2
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -7159,6 +7201,14 @@ func (m *ObjectTransactionRequest) SizeVT() (n int) {
 	}
 	if m.IsMoved {
 		n += 2
+	}
+	l = len(m.RequestId)
+	if l > 0 {
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	l = len(m.ConditionAltKey)
+	if l > 0 {
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -7494,6 +7544,9 @@ func (m *DeleteEntryRequest) SizeVT() (n int) {
 	}
 	if m.IfNotModifiedAfter != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.IfNotModifiedAfter))
+	}
+	if m.KeepRemoteObject {
+		n += 2
 	}
 	n += len(m.unknownFields)
 	return n
@@ -8240,6 +8293,9 @@ func (m *TraverseBfsMetadataResponse) SizeVT() (n int) {
 	if m.Entry != nil {
 		l = m.Entry.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	if m.EntryTsNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.EntryTsNs))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -13030,6 +13086,26 @@ func (m *ObjectMutation) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.RemoveEmptyParent = bool(v != 0)
+		case 14:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field KeepRemoteObject", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.KeepRemoteObject = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -13787,6 +13863,70 @@ func (m *ObjectTransactionRequest) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.IsMoved = bool(v != 0)
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestId", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.RequestId = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ConditionAltKey", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.ConditionAltKey = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -15997,6 +16137,26 @@ func (m *DeleteEntryRequest) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field KeepRemoteObject", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.KeepRemoteObject = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -20799,6 +20959,25 @@ func (m *TraverseBfsMetadataResponse) UnmarshalVT(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field EntryTsNs", wireType)
+			}
+			m.EntryTsNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.EntryTsNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])

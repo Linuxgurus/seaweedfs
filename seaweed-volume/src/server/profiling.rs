@@ -136,6 +136,7 @@ mod tests {
             mem_profile: String::new(),
             compaction_byte_per_second: 0,
             maintenance_byte_per_second: 0,
+            max_parallel_vacuum_commits: 0,
             file_size_limit_bytes: 0,
             concurrent_upload_limit: 0,
             concurrent_download_limit: 0,
@@ -169,7 +170,6 @@ mod tests {
             grpc_allowed_wildcard_domain: String::new(),
             grpc_volume_allowed_common_names: vec![],
             tls_policy: TlsPolicy::default(),
-            enable_write_queue: false,
             security_file: String::new(),
         }
     }

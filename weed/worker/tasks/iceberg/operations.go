@@ -342,8 +342,17 @@ func collectOrphanCandidates(
 	}
 
 	referencedFiles[path.Join("metadata", metadataFileName)] = struct{}{}
+	// Table-root readers (DuckDB iceberg_scan, Hadoop tables) open this to find
+	// the current metadata; nothing in the metadata references it.
+	referencedFiles[path.Join("metadata", "version-hint.text")] = struct{}{}
 	for mle := range meta.PreviousFiles() {
 		referencedFiles[mle.MetadataFile] = struct{}{}
+	}
+	for sf := range meta.Statistics() {
+		referencedFiles[sf.StatisticsPath] = struct{}{}
+	}
+	for psf := range meta.PartitionStatistics() {
+		referencedFiles[psf.StatisticsPath] = struct{}{}
 	}
 
 	referencedFilerPaths := make(map[string]struct{}, len(referencedFiles))
@@ -560,8 +569,11 @@ func (h *Handler) rewriteManifests(
 		}
 	}
 
+	// v3 row lineage (row_lineage.go): the merged manifests are assigned first_row_id from the table's next-row-id; the
+	// data files keep the first_row_id they carry, so no row is renumbered
+	firstRowID := rowLineageFirstRowID(meta)
 	var manifestListBuf bytes.Buffer
-	err = iceberg.WriteManifestList(version, &manifestListBuf, newSnapshotID, &snapshotID, &newSeqNum, 0, newManifests)
+	addedRows, err := writeManifestList(version, &manifestListBuf, newSnapshotID, &snapshotID, &newSeqNum, firstRowID, newManifests)
 	if err != nil {
 		return "", nil, fmt.Errorf("write manifest list: %w", err)
 	}
@@ -580,9 +592,9 @@ func (h *Handler) rewriteManifests(
 		// Guard: verify table head hasn't advanced since we planned.
 		// The merged manifest and manifest list were built against snapshotID;
 		// if the head moved, they reference stale state.
-		cs := currentMeta.CurrentSnapshot()
-		if cs == nil || cs.SnapshotID != snapshotID {
-			return errStalePlan
+		cs, err := checkCommitPlan(currentMeta, snapshotID, version, firstRowID)
+		if err != nil {
+			return err
 		}
 
 		newSnapshot := &table.Snapshot{
@@ -598,6 +610,7 @@ func (h *Handler) rewriteManifests(
 				return &id
 			}(),
 		}
+		setRowLineage(newSnapshot, version, firstRowID, addedRows)
 		if err := builder.AddSnapshot(newSnapshot); err != nil {
 			return err
 		}

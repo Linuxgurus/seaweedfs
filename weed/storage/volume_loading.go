@@ -63,9 +63,16 @@ func loadVolumeWithoutWorker(dirname string, dirIdx string, collection string, i
 //
 // No-op when v.nm is already a writable form.
 func (v *Volume) reopenIdxForWrite() error {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
+	return v.reopenIdxForWriteLocked()
+}
 
+// reopenIdxForWriteLocked is reopenIdxForWrite for callers already holding
+// dataFileAccessLock (MarkVolumeReadonly).
+func (v *Volume) reopenIdxForWriteLocked() error {
 	oldNm, isSorted := v.nm.(*SortedFileNeedleMap)
 	if !isSorted {
 		return nil
@@ -172,7 +179,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 			return fmt.Errorf("load remote file %v: %w", v.volumeInfo, err)
 		}
 		// Set lastModifiedTsSeconds from remote file to prevent premature expiry on startup
-		if len(v.volumeInfo.GetFiles()) > 0 {
+		if len(v.volumeInfo.GetFiles()) > 0 && !v.keepLastModifiedTsOnLoad {
 			remoteFileModifiedTime := v.volumeInfo.GetFiles()[0].GetModifiedTime()
 			if remoteFileModifiedTime > 0 {
 				v.lastModifiedTsSeconds = remoteFileModifiedTime
@@ -198,7 +205,12 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 			dataFile, err = backend.OpenVolumeFile(v.FileName(".dat"), os.O_RDONLY)
 			v.noWriteOrDelete = true
 		}
-		v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
+		if err != nil {
+			return datFileLoadError(v.FileName(".dat"), err)
+		}
+		if !v.keepLastModifiedTsOnLoad {
+			v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
+		}
 		if fileSize >= super_block.SuperBlockSize {
 			alreadyHasSuperBlock = true
 		}
@@ -212,11 +224,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 	}
 
 	if err != nil {
-		if !os.IsPermission(err) {
-			return fmt.Errorf("cannot load volume data %s: %v", v.FileName(".dat"), err)
-		} else {
-			return fmt.Errorf("load data file %s: %v", v.FileName(".dat"), err)
-		}
+		return datFileLoadError(v.FileName(".dat"), err)
 	}
 
 	if alreadyHasSuperBlock {
@@ -230,7 +238,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		glog.V(2).Infof("readSuperBlock volume %d version %v", v.Id, v.SuperBlock.Version)
 		if v.HasRemoteFile() {
 			// maybe temporary network problem
-			glog.Errorf("readSuperBlock remote volume %d: %v", v.Id, err)
+			logRemoteSuperBlockErr(v.Id, err)
 			err = nil
 		}
 	} else {
@@ -293,7 +301,9 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				v.noWriteOrDelete = true
 				glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
 			}
-			v.recoverLastModifiedTs(indexFile)
+			if !v.keepLastModifiedTsOnLoad {
+				v.recoverLastModifiedTs(indexFile)
+			}
 		}
 
 		// The post-load structural check below uses the in-memory needle map
@@ -416,4 +426,19 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 	}
 
 	return err
+}
+
+func datFileLoadError(fileName string, err error) error {
+	if os.IsPermission(err) {
+		return fmt.Errorf("load data file %s: %v", fileName, err)
+	}
+	return fmt.Errorf("cannot load volume data %s: %v", fileName, err)
+}
+
+var logRemoteSuperBlockFault = glog.Errorf
+
+func logRemoteSuperBlockErr(id needle.VolumeId, err error) {
+	if err != nil {
+		logRemoteSuperBlockFault("readSuperBlock remote volume %d: %v", id, err)
+	}
 }

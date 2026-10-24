@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pquerna/cachecontrol/cacheobject"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -31,6 +32,7 @@ import (
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util/constants"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -86,6 +88,20 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 	// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 
 	bucket, object := s3_constants.GetBucketAndObject(r)
+
+	// A copy-source header that did not satisfy the CopyObject route is
+	// malformed (it needs a '/' separating source bucket from key), and a
+	// partNumber/uploadId pair that did not satisfy the UploadPart route is
+	// malformed too; neither should be silently written as a plain object.
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+		return
+	}
+	if r.URL.Query().Has("partNumber") || r.URL.Query().Has("uploadId") {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidArgument)
+		return
+	}
+
 	_, err := validateContentMd5(r.Header)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidDigest)
@@ -96,7 +112,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 		s3err.WriteErrorResponse(w, r, s3err.ErrKeyTooLongError)
 		return
 	}
-	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
+	if isVerify, err := s3a.validateTableBucketObjectPathOrVerify(bucket, object); err != nil || (isVerify && !volumeVerifyPutAllowed(r, object)) {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
 	}
@@ -109,6 +125,11 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 	// Check bucket policy
 	if errCode, _ := s3a.checkPolicyWithEntry(r, bucket, object, string(s3_constants.ACTION_WRITE), "", nil); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	if errCode := ValidateRequestEncryption(r.Header); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
@@ -134,6 +155,11 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 	}
 	defer dataReader.Close()
 
+	if isExtractZip(r) {
+		s3a.extractZipObject(w, r, bucket, object, dataReader)
+		return
+	}
+
 	objectContentType := r.Header.Get("Content-Type")
 	if strings.HasSuffix(object, "/") && r.ContentLength <= 1024 {
 		// The filer mkdir below would implicitly create a missing bucket, so gate it
@@ -144,6 +170,13 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			}
 		} else if err != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, err)
+			return
+		}
+
+		var aclCode s3err.ErrorCode
+		r, aclCode = s3a.preparePutObjectACL(r, bucket)
+		if aclCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, aclCode)
 			return
 		}
 
@@ -181,7 +214,11 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			dirContent, readErr = io.ReadAll(dataReader)
 			if readErr != nil {
 				glog.Errorf("PutObjectHandler: failed to read directory marker content %s/%s: %v", bucket, object, readErr)
-				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				if strings.Contains(readErr.Error(), s3err.ErrMsgContentSha256Mismatch) {
+					s3err.WriteErrorResponse(w, r, s3err.ErrContentSHA256Mismatch)
+				} else {
+					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				}
 				return
 			}
 		}
@@ -189,6 +226,18 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 		// Compute MD5 for ETag (md5.Sum of nil/empty = MD5 of empty content)
 		dirMd5 := md5.Sum(dirContent)
 		dirEtag := fmt.Sprintf("%x", dirMd5)
+
+		// SSE applies to marker content too — it is stored in entry.Content
+		sseResult, sseErrCode := s3a.handleAllSSEEncryption(r, bytes.NewReader(dirContent), 0)
+		if sseErrCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, sseErrCode)
+			return
+		}
+		if dirContent, err = io.ReadAll(sseResult.DataReader); err != nil {
+			glog.Errorf("PutObjectHandler: failed to encrypt directory marker content %s/%s: %v", bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return
+		}
 
 		glog.Infof("PutObjectHandler: explicit directory marker %s/%s (contentType=%q, len=%d)",
 			bucket, object, objectContentType, r.ContentLength)
@@ -228,8 +277,11 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 					}
 					entry.Extended[s3_constants.ExtETagKey] = []byte(dirEtag)
 
+					storeSSEMetadata(entry, sseResult)
+
 					// Set object owner for directory objects (same as regular objects)
 					s3a.setObjectOwnerFromRequest(r, bucket, entry)
+					applyPutObjectACL(r, entry)
 
 					if lockErr := s3a.extractObjectLockMetadataFromRequest(r, entry); lockErr != nil {
 						glog.Errorf("PutObjectHandler: failed to extract object lock metadata for %s/%s: %v", bucket, object, lockErr)
@@ -243,6 +295,12 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			s3err.WriteErrorResponse(w, r, markerCode)
 			return
 		}
+		sseRespMetadata := SSEResponseMetadata{SSEType: sseResult.SSEType}
+		if sseResult.SSEKMSKey != nil {
+			sseRespMetadata.KMSKeyID = sseResult.SSEKMSKey.KeyID
+			sseRespMetadata.BucketKeyEnabled = sseResult.SSEKMSKey.BucketKeyEnabled
+		}
+		s3a.setSSEResponseHeaders(w, r, sseRespMetadata)
 		setEtag(w, dirEtag)
 	} else {
 		// Get detailed versioning state for the bucket
@@ -266,6 +324,13 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 				return
 			}
+		}
+
+		var aclCode s3err.ErrorCode
+		r, aclCode = s3a.preparePutObjectACL(r, bucket)
+		if aclCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, aclCode)
+			return
 		}
 
 		versioningEnabled := (versioningState == s3_constants.VersioningEnabled)
@@ -419,6 +484,10 @@ type putFinalize struct {
 	lockKey     string
 	mutations   []*filer_pb.ObjectMutation
 	afterCreate func(entry *filer_pb.Entry) s3err.ErrorCode
+	// conditionAltKey names the entry a routed WriteCondition falls back to
+	// when the write path is absent — a suspended-versioning write points it
+	// at the latest version so check and write stay under the filer lock
+	conditionAltKey string
 }
 
 const (
@@ -505,7 +574,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// Apply bucket default encryption if no explicit encryption was provided
 	// This implements AWS S3 behavior where bucket default encryption automatically applies
-	if !hasExplicitEncryption(customerKey, sseKMSKey, sseS3Key) && !s3a.cipher {
+	if !hasExplicitEncryption(customerKey, sseKMSKey, sseS3Key) {
 		glog.V(4).Infof("putToFiler: no explicit encryption detected, checking for bucket default encryption")
 
 		// Apply bucket default encryption and get the result
@@ -544,6 +613,12 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				return "", s3err.ErrInternalError, SSEResponseMetadata{}
 			}
 		}
+
+		sseResult.SSEKMSKey = sseKMSKey
+		sseResult.SSEKMSMetadata = sseKMSMetadata
+		sseResult.SSES3Key = sseS3Key
+		sseResult.SSES3Metadata = sseS3Metadata
+		sseResult.SSEType = sseType
 	} else {
 		glog.V(4).Infof("putToFiler: explicit encryption already applied, skipping bucket default encryption")
 	}
@@ -621,6 +696,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		MimeType:        r.Header.Get("Content-Type"),
 		Cipher:          s3a.cipher, // encrypt data on volume servers
 		AssignFunc:      assignFunc,
+		LookupJwtFunc:   s3a.lookupVolumeJwt,
 	})
 	if err != nil {
 		glog.Errorf("putToFiler: chunked upload failed: %v", err)
@@ -776,6 +852,11 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	// Store ETag in Extended attribute for future retrieval (e.g. multipart parts)
 	entry.Extended[s3_constants.ExtETagKey] = []byte(etag)
 
+	// Stamp this write's identity: an ambiguously committed PUT is told apart
+	// from an identical older object by it during recovery, which chunk identity
+	// cannot do for a chunkless (empty) object.
+	entry.Extended[s3_constants.SeaweedFSWriteId] = []byte(uuid.NewString())
+
 	// Store additional checksum if one was computed
 	checksumBase64 := ""
 	if checksumHash != nil && checksumHeaderName != "" {
@@ -796,6 +877,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// Set object owner according to bucket ownership settings.
 	s3a.setObjectOwnerFromRequest(r, bucket, entry)
+	applyPutObjectACL(r, entry)
 
 	// Set version ID if present. It is later used as a filer path segment, so a
 	// value carrying "/", "\\" or ".." must never be stored.
@@ -878,33 +960,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		glog.V(3).Infof("putToFiler: stored %d tags from X-Amz-Tagging header", len(parsedTags))
 	}
 
-	// Set SSE-C metadata
-	if customerKey != nil && len(sseIV) > 0 {
-		// Store IV as RAW bytes (matches filer behavior - filer decodes base64 headers and stores raw bytes)
-		entry.Extended[s3_constants.SeaweedFSSSEIV] = sseIV
-		entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte("AES256")
-		entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5] = []byte(customerKey.KeyMD5)
-		glog.V(3).Infof("putToFiler: storing SSE-C metadata - IV len=%d", len(sseIV))
-	}
-
-	// Set SSE-KMS metadata
-	if sseKMSKey != nil {
-		// Store metadata as RAW bytes (matches filer behavior - filer decodes base64 headers and stores raw bytes)
-		entry.Extended[s3_constants.SeaweedFSSSEKMSKey] = sseKMSMetadata
-		// Set standard SSE headers for detection
-		entry.Extended[s3_constants.AmzServerSideEncryption] = []byte("aws:kms")
-		entry.Extended[s3_constants.AmzServerSideEncryptionAwsKmsKeyId] = []byte(sseKMSKey.KeyID)
-		glog.V(3).Infof("putToFiler: storing SSE-KMS metadata - keyID=%s, raw len=%d", sseKMSKey.KeyID, len(sseKMSMetadata))
-	}
-
-	// Set SSE-S3 metadata
-	if sseS3Key != nil && len(sseS3Metadata) > 0 {
-		// Store metadata as RAW bytes (matches filer behavior - filer decodes base64 headers and stores raw bytes)
-		entry.Extended[s3_constants.SeaweedFSSSES3Key] = sseS3Metadata
-		// Set standard SSE header for detection
-		entry.Extended[s3_constants.AmzServerSideEncryption] = []byte("AES256")
-		glog.V(3).Infof("putToFiler: storing SSE-S3 metadata - keyID=%s, raw len=%d", sseS3Key.KeyID, len(sseS3Metadata))
-	}
+	storeSSEMetadata(entry, sseResult)
 
 	// Parts (object == "") stay flat: completion rebases chunk offsets, which
 	// manifest chunks cannot express.
@@ -920,21 +976,27 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	var createErr error
 	var rollbackErr error
 	entryCreated := false
+	var owner pb.ServerAddress
 	preconditionFn := func() s3err.ErrorCode {
 		if object == "" {
 			return s3err.ErrNone
 		}
 		return s3a.checkConditionalHeaders(r, bucket, object)
 	}
-	createUnderLock := func() s3err.ErrorCode {
-		createErr = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	createUnderLock := func(cond *filer_pb.WriteCondition) s3err.ErrorCode {
+		create := func(client filer_pb.SeaweedFilerClient) error {
 			req := &filer_pb.CreateEntryRequest{
 				Directory: path.Dir(filePath),
 				Entry:     entry,
+				Condition: cond,
 			}
 			glog.V(3).Infof("putToFiler: Calling CreateEntry for %s", filePath)
 			err := filer_pb.CreateEntry(context.Background(), client, req)
-			if errors.Is(err, filer_pb.ErrExistingIsDirectory) && !isReservedDirectoryName(entry.Name) {
+			// A verification key in a table bucket never becomes a prefix
+			// object: the directory it meets is a namespace, created after the
+			// handler looked.
+			if errors.Is(err, filer_pb.ErrExistingIsDirectory) && !isReservedDirectoryName(entry.Name) &&
+				!(isVolumeVerifyKey(object) && s3a.isTableBucket(bucket)) {
 				// Other keys are nested under this one. S3 keys are flat, so the key is
 				// stored on the directory they live under rather than refused.
 				entry.MarkPrefixObject()
@@ -945,7 +1007,27 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				return err
 			}
 			return nil
-		})
+		}
+		// A conditional create must not be replayed once possibly sent: a lost
+		// commit followed by a delete lets the replayed IF_NOT_EXISTS pass and
+		// recreates an entry whose chunks the delete already reclaimed.
+		if cond != nil && owner != "" {
+			// The condition and the routed write serialize on the owner's
+			// per-path lock. Failover cannot preserve that: another filer's lock
+			// is a different boundary, and its forwarding is only correct when
+			// its ring view agrees — exactly what is not guaranteed after an
+			// ambiguous write. The create goes to the owner alone; an
+			// unreachable owner leaves the outcome uncertain.
+			createErr = pb.WithFilerClient(false, 0, owner, s3a.option.GrpcDialOption, create)
+			switch status.Code(createErr) {
+			case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+				s3a.markOwnerUnreachable(owner)
+			}
+		} else if s3a.filerClient != nil {
+			createErr = s3a.withFilerClientFailover(context.Background(), "", false, cond == nil, create)
+		} else {
+			createErr = s3a.withFilerClient(context.Background(), false, create)
+		}
 		if createErr != nil {
 			return filerErrorToS3Error(createErr)
 		}
@@ -968,22 +1050,47 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	// it); conditional/object-lock/non-reducible cases fall back to the lock.
 	var createCode s3err.ErrorCode
 	routed := false
-	if owner := s3a.routableWriteOwner(bucket, object); owner != "" {
-		if cond, ok := routeWriteCondition(r, uniqueWritePath); ok {
+	routedAmbiguous := false
+	condAltKey := ""
+	if finalize != nil {
+		condAltKey = finalize.conditionAltKey
+	}
+	if owner = s3a.routableWriteOwner(bucket, object); owner != "" {
+		if cond, ok := routeWriteCondition(r, uniqueWritePath && condAltKey == ""); ok {
 			// Routed mutations ride in the PUT's transaction (committing atomically),
 			// so lockKey is the object path they carry, not the version file path.
 			lockKey, finalizeMutations := filePath, []*filer_pb.ObjectMutation(nil)
 			if finalize != nil && len(finalize.mutations) > 0 {
 				lockKey, finalizeMutations = finalize.lockKey, finalize.mutations
 			}
-			resp, err := s3a.routedPut(owner, s3a.objectRouteKey(bucket, object), lockKey, filePath, entry, cond, "", finalizeMutations)
+			routeKey := s3a.objectRouteKey(bucket, object)
+			resp, err := s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, "", condAltKey, finalizeMutations)
+			if err == nil && resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED && condAltKey != "" {
+				// A filer that ignores condition_alt_key evaluated the empty
+				// null slot alone; resend the transaction against the entry the
+				// read path serves, still under the object's path lock.
+				conditionKey := filePath
+				if resolved, resolveErr := s3a.resolveObjectEntry(bucket, object, ""); resolveErr == nil &&
+					resolved != nil &&
+					string(resolved.Extended[s3_constants.ExtDeleteMarkerKey]) != "true" &&
+					resolved.Name != path.Base(filePath) {
+					conditionKey = condAltKey + "/" + resolved.Name
+				}
+				glog.Warningf("putToFiler: routed PUT to %s precondition-failed for %s; resending against %s", owner, filePath, conditionKey)
+				resp, err = s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, conditionKey, condAltKey, finalizeMutations)
+			}
 			switch {
 			case err != nil:
+				routedAmbiguous = true
 				glog.Warningf("putToFiler: routed PUT to %s failed for %s, falling back to lock: %v", owner, filePath, err)
 			case resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED:
 				createCode, routed = s3err.ErrPreconditionFailed, true
 			case resp.Error != "":
-				// Non-precondition mutation error: fall back so the lock path maps it.
+				// A mutation can store the entry before a later step of the
+				// same mutation fails, so even an error from the first mutation
+				// does not prove nothing committed — every transaction error is
+				// ambiguous until the recovery lookup decides.
+				routedAmbiguous = true
 				glog.Warningf("putToFiler: routed PUT to %s returned %q for %s, falling back to lock", owner, resp.Error, filePath)
 			default:
 				entryCreated, routed, createCode = true, true, s3err.ErrNone
@@ -996,7 +1103,13 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		}
 	}
 	if !routed {
-		createCode = s3a.withObjectWriteLock(bucket, object, preconditionFn, createUnderLock)
+		createFn := func() s3err.ErrorCode { return createUnderLock(nil) }
+		if routedAmbiguous {
+			createFn = func() s3err.ErrorCode {
+				return s3a.createAfterAmbiguousRoute(filePath, bucket, object, owner, entry, chunkResult.FileChunks, finalize, &entryCreated, s3a.uploadedChunksExist, createUnderLock)
+			}
+		}
+		createCode = s3a.withObjectWriteLock(bucket, object, preconditionFn, createFn)
 	}
 	if createCode != s3err.ErrNone {
 		if createErr != nil {
@@ -1058,6 +1171,165 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 // the object write lock, so a hung filer cannot stall the write path.
 const createLookupTimeout = 10 * time.Second
 
+// createAfterAmbiguousRoute decides, inside the object write lock, what an
+// ambiguous routed PUT left behind before re-committing its entry. A stored
+// entry resolving to the uploaded chunks means the route landed and the create
+// is already done. A different stored entry means a concurrent write
+// superseded the commit, and its old-chunk cleanup may have deleted this
+// entry's chunks — committing would write back a stale entry pointing at dead
+// needles, so the request fails for the client to retry with a fresh upload.
+// Unresolvable lookups fail the same way; only a proven-absent entry with
+// verifiably-live chunks or a directory conflict with them falls through to
+// the normal create — an empty upload has nothing to verify, so neither the
+// absent nor the lookalike-entry outcome is provable for it.
+func (s3a *S3ApiServer) createAfterAmbiguousRoute(filePath, bucket, object string, owner pb.ServerAddress, entry *filer_pb.Entry, uploaded []*filer_pb.FileChunk, finalize *putFinalize, entryCreated *bool, chunksExist func(ctx context.Context, chunks []*filer_pb.FileChunk) bool, createUnderLock func(cond *filer_pb.WriteCondition) s3err.ErrorCode) s3err.ErrorCode {
+	dir, name := path.Dir(filePath), path.Base(filePath)
+	lookupCtx, cancel := context.WithTimeout(context.Background(), createLookupTimeout)
+	defer cancel()
+	// The verified state and the create are made atomic by a WriteCondition on
+	// the create itself, which the filer evaluates under its per-path lock — a
+	// routed write committing in between fails the precondition instead of
+	// being clobbered, and the next pass re-derives the verdict from what the
+	// racer left.
+	for attempt := 0; attempt < 2; attempt++ {
+		existing, uncertain := s3a.lookupCommittedEntry(lookupCtx, s3a.createTargetFilers(owner, bucket, object), dir, name)
+		if existing != nil {
+			if uncertain {
+				// A filer earlier in the list could not answer and may hold a
+				// newer entry; this match is not authoritative.
+				glog.Warningf("putToFiler: ambiguous routed PUT for %s matches an entry but a filer could not be checked; not recovering", filePath)
+				return s3err.ErrServiceUnavailable
+			}
+			if existing.IsDirectory {
+				// The directory can postdate this PUT's commit: the route may
+				// have stored the file entry, a delete removed it, and a nested
+				// write recreated the directory before recovery took the lock.
+				// Re-committing is only safe while the uploaded chunks verifiably
+				// survive — that delete may already have reclaimed the needles,
+				// and a create retrying over the directory would store an entry
+				// pointing at dead chunks.
+				if !chunksExist(lookupCtx, uploaded) {
+					glog.Warningf("putToFiler: ambiguous routed PUT for %s resolved to a directory and its chunks cannot be verified; not re-applying entry", filePath)
+					return s3err.ErrServiceUnavailable
+				}
+				code := createUnderLock(&filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
+					Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+					ExpectedEntry: existing,
+				}}})
+				if code != s3err.ErrPreconditionFailed {
+					return code
+				}
+				continue
+			}
+			resolved, _, resolveErr := filer.ResolveChunkManifest(lookupCtx, s3a.createLookupFileIdFunction(), existing.GetChunks(), 0, math.MaxInt64, s3a.filerClient)
+			if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
+				glog.Warningf("putToFiler: ambiguous routed PUT for %s was superseded by another write; not committing stale entry", filePath)
+				return s3err.ErrServiceUnavailable
+			}
+			// An empty PUT carries no fids, so two chunkless entries compare
+			// equal even when the stored one predates this write; only this
+			// write's stamped id proves the entry is its own commit.
+			if len(uploaded) == 0 && !sameStoredEntry(existing, entry) {
+				glog.Warningf("putToFiler: ambiguous routed PUT for %s cannot prove an empty stored entry is its own; not claiming it", filePath)
+				return s3err.ErrServiceUnavailable
+			}
+			*entryCreated = true
+			if finalize != nil && finalize.afterCreate != nil {
+				if code := finalize.afterCreate(entry); code != s3err.ErrNone {
+					// Same undo the create path applies when post-create
+					// finalization fails.
+					if rbErr := s3a.rmObject(context.Background(), dir, name, true, false); rbErr != nil {
+						glog.Errorf("putToFiler: failed to rollback recovered entry for %s: %v", filePath, rbErr)
+					}
+					return code
+				}
+			}
+			return s3err.ErrNone
+		}
+		if uncertain {
+			glog.Warningf("putToFiler: cannot confirm what ambiguous routed PUT for %s committed; not re-applying entry", filePath)
+			return s3err.ErrServiceUnavailable
+		}
+		// An absent entry cannot prove an empty PUT never committed — the routed
+		// create may have landed and a delete already reclaimed it — and there
+		// are no chunks to verify either way. IF_NOT_EXISTS would recreate an
+		// object a delete already removed, so the outcome stays uncertain.
+		if len(uploaded) == 0 {
+			glog.Warningf("putToFiler: ambiguous routed PUT for %s left no entry and no chunks to verify; not re-applying entry", filePath)
+			return s3err.ErrServiceUnavailable
+		}
+		if !chunksExist(lookupCtx, uploaded) {
+			glog.Warningf("putToFiler: ambiguous routed PUT for %s left no entry and its chunks cannot be verified; not re-applying entry", filePath)
+			return s3err.ErrServiceUnavailable
+		}
+		code := createUnderLock(clause(filer_pb.WriteCondition_IF_NOT_EXISTS))
+		if code != s3err.ErrPreconditionFailed {
+			return code
+		}
+	}
+	return s3err.ErrServiceUnavailable
+}
+
+// lookupCommittedEntry returns the entry any of the candidate filers stores
+// for dir/name. uncertain reports that a filer earlier in the list could not
+// answer, so a found entry is not authoritative — the unreachable filer may
+// hold a newer one.
+func (s3a *S3ApiServer) lookupCommittedEntry(ctx context.Context, targets []pb.ServerAddress, dir, name string) (existing *filer_pb.Entry, uncertain bool) {
+	for _, target := range targets {
+		e, lookupErr := s3a.lookupEntryOnFiler(ctx, target, dir, name)
+		if e != nil {
+			return e, uncertain
+		}
+		if lookupErr != nil && !errors.Is(lookupErr, filer_pb.ErrNotFound) {
+			uncertain = true
+		}
+	}
+	return nil, uncertain
+}
+
+// uploadedChunksExist probes every uploaded chunk's needle on the volumes the
+// master reports for it. A proven-absent entry is only safe to re-commit when
+// its chunks survive: if the routed PUT committed and a delete then removed
+// the entry, its chunk cleanup may have reclaimed the needles too.
+func (s3a *S3ApiServer) uploadedChunksExist(ctx context.Context, uploaded []*filer_pb.FileChunk) bool {
+	lookupFileId := s3a.createLookupFileIdFunction()
+	for _, chunk := range uploaded {
+		fileId := chunk.GetFileIdString()
+		urls, err := lookupFileId(ctx, fileId)
+		if err != nil || len(urls) == 0 {
+			return false
+		}
+		jwt := filer.ChunkReadJwt(urls, fileId)
+		found := false
+		for _, fileUrl := range urls {
+			if chunkNeedleExists(ctx, fileUrl, jwt) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func chunkNeedleExists(ctx context.Context, fileUrl, jwt string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, fileUrl, nil)
+	if err != nil {
+		return false
+	}
+	if jwt != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
+	}
+	resp, err := util_http.Do(req)
+	if err != nil {
+		return false
+	}
+	util_http.CloseResponse(resp)
+	return resp.StatusCode == http.StatusOK
+}
+
 // confirmCreateLanded resolves a create whose outcome is uncertain: a stored
 // entry resolving to the uploaded chunks confirms the write landed — the
 // finalization the error skipped then runs under the object write lock, and
@@ -1072,29 +1344,28 @@ func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object string, ent
 	// Verify, finalize, and roll back inside one critical section: a concurrent
 	// write to the same key must not slip in between them.
 	s3a.withObjectWriteLock(bucket, object, nil, func() s3err.ErrorCode {
-		var existing *filer_pb.Entry
-		uncertain, queried := false, false
-		for _, target := range s3a.createTargetFilers(owner, bucket, object) {
-			e, lookupErr := s3a.lookupEntryOnFiler(lookupCtx, target, dir, name)
-			queried = true
-			if e != nil {
-				existing = e
-				break
-			}
-			if lookupErr != nil && !errors.Is(lookupErr, filer_pb.ErrNotFound) {
-				uncertain = true
-			}
-		}
+		targets := s3a.createTargetFilers(owner, bucket, object)
+		existing, uncertain := s3a.lookupCommittedEntry(lookupCtx, targets, dir, name)
 		if existing == nil {
-			absent = queried && !uncertain
+			absent = len(targets) > 0 && !uncertain
+			return s3err.ErrNone
+		}
+		if uncertain {
+			// The match may sit on a replica behind the filer that could not
+			// answer; it is not authoritative enough to finalize on.
 			return s3err.ErrNone
 		}
 		if len(uploaded) == 0 {
-			return s3err.ErrNone
-		}
-		resolved, _, resolveErr := filer.ResolveChunkManifest(lookupCtx, s3a.createLookupFileIdFunction(), existing.GetChunks(), 0, math.MaxInt64, s3a.filerClient)
-		if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
-			return s3err.ErrNone
+			// No chunks to compare; only this write's stamped id proves the
+			// entry is its own commit rather than an identical older object.
+			if !sameStoredEntry(existing, entry) {
+				return s3err.ErrNone
+			}
+		} else {
+			resolved, _, resolveErr := filer.ResolveChunkManifest(lookupCtx, s3a.createLookupFileIdFunction(), existing.GetChunks(), 0, math.MaxInt64, s3a.filerClient)
+			if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
+				return s3err.ErrNone
+			}
 		}
 		glog.Warningf("putToFiler: create entry for %s failed but the entry exists, treating the write as successful", filePath)
 		if finalize == nil || finalize.afterCreate == nil {
@@ -1169,6 +1440,16 @@ func sameFileChunks(a, b []*filer_pb.FileChunk) bool {
 		counts[k]--
 	}
 	return true
+}
+
+// sameStoredEntry reports whether the stored entry is this write's own
+// commit. Matching metadata cannot say so — an identical older object carries
+// the same fields — but the write id putToFiler stamps into every entry does:
+// the filer stores Extended verbatim, so the id rides the commit and a lookup
+// reads it back. An entry without this write's id cannot be claimed.
+func sameStoredEntry(existing, entry *filer_pb.Entry) bool {
+	id := entry.GetExtended()[s3_constants.SeaweedFSWriteId]
+	return len(id) > 0 && bytes.Equal(existing.GetExtended()[s3_constants.SeaweedFSWriteId], id)
 }
 
 // checksumAlgorithmMapping maps algorithm name strings to their enum and header name.
@@ -1355,9 +1636,14 @@ func detectRequestedChecksumAlgorithmQ(r *http.Request, query url.Values) (Check
 const defaultFileMode = uint32(0660)
 
 // resolveFileMode determines the file permission mode for an S3 upload.
-// Priority: per-object X-Amz-Acl header > server default > defaultFileMode.
+// Priority: validated PUT ACL > X-Amz-Acl header > server default > defaultFileMode.
 func (s3a *S3ApiServer) resolveFileMode(r *http.Request) uint32 {
-	if cannedAcl := r.Header.Get(s3_constants.AmzCannedAcl); cannedAcl != "" {
+	cannedAcl := r.Header.Get(s3_constants.AmzCannedAcl)
+	if metadata, ok := r.Context().Value(putObjectACLContextKey{}).(putObjectACLMetadata); ok {
+		// Signed query ACLs must resolve identically to signed ACL headers.
+		cannedAcl = metadata.canned
+	}
+	if cannedAcl != "" {
 		switch cannedAcl {
 		case s3_constants.CannedAclPublicRead, s3_constants.CannedAclAuthenticatedRead,
 			s3_constants.CannedAclBucketOwnerRead:
@@ -1376,12 +1662,15 @@ func (s3a *S3ApiServer) resolveFileMode(r *http.Request) uint32 {
 
 func setEtag(w http.ResponseWriter, etag string) {
 	if etag != "" {
-		if strings.HasPrefix(etag, "\"") {
-			w.Header()["ETag"] = []string{etag}
-		} else {
-			w.Header()["ETag"] = []string{"\"" + etag + "\""}
-		}
+		w.Header()["ETag"] = []string{quoteETag(etag)}
 	}
+}
+
+func quoteETag(etag string) string {
+	if etag == "" || strings.HasPrefix(etag, "\"") {
+		return etag
+	}
+	return strconv.Quote(etag)
 }
 
 // setSSEResponseHeaders sets appropriate SSE response headers based on encryption type
@@ -1449,6 +1738,8 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 		return s3err.ErrExistingObjectIsDirectory
 	case errors.Is(err, weed_server.ErrReadOnly):
 		return s3err.ErrAccessDenied
+	case errors.Is(err, filer_pb.ErrPreconditionFailed):
+		return s3err.ErrPreconditionFailed
 	}
 
 	// A transport failure leaves the outcome ambiguous — the write may have
@@ -1498,6 +1789,8 @@ func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.Err
 	switch {
 	case errors.Is(err, weed_server.ErrReadOnly):
 		return s3err.ErrAccessDenied
+	case strings.Contains(err.Error(), s3err.ErrMsgContentSha256Mismatch):
+		return s3err.ErrContentSHA256Mismatch
 	case strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch):
 		return s3err.ErrInvalidDigest
 	case errors.Is(err, operation.ErrTruncatedBody):
@@ -1642,7 +1935,19 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	// naming a marker that is gone, and the read path heals that by promoting an older
 	// version, republishing the deleted key. Best-effort, as a stale flag self-heals on
 	// the next list.
+	// A conditional suspended write checks "the null slot if present, else the
+	// latest version". Naming the pointed-at version as the fallback lets the
+	// routed transaction evaluate that rule under the filer lock instead of
+	// splitting check and write across a gateway lock that routed writes skip.
+	conditionAltKey := ""
+	if headers, headersErr := parseConditionalHeaders(r); headersErr == s3err.ErrNone && headers.isSet {
+		// The filer resolves the latest pointer under the same lock that
+		// serializes the write, so the condition cannot read a version a
+		// concurrent delete has already displaced.
+		conditionAltKey = s3a.toFilerPath(bucket, normalizedObject+s3_constants.VersionsFolder)
+	}
 	etag, errCode, sseMetadata = s3a.putToFiler(r, filePath, body, bucket, normalizedObject, 1, 0, &putFinalize{
+		conditionAltKey: conditionAltKey,
 		afterCreate: func(entry *filer_pb.Entry) s3err.ErrorCode {
 			writtenETag := string(entry.Extended[s3_constants.ExtETagKey])
 			if err := s3a.finalizeSuspendedNullWrite("", bucket, normalizedObject, s3_constants.ExtETagKey, writtenETag); err != nil {
@@ -1650,7 +1955,7 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 			}
 			return s3err.ErrNone
 		},
-	}, false, "")
+	}, true, "")
 	if errCode != s3err.ErrNone {
 		glog.Errorf("putSuspendedVersioningObject: failed to upload object: %v", errCode)
 		return "", errCode, SSEResponseMetadata{}
@@ -1888,6 +2193,18 @@ func (s3a *S3ApiServer) updateLatestVersionInDirectory(bucket, object, versionId
 	// detected by filename equality and skip the stamp.
 	prevLatestFileName := string(versionsEntry.Extended[s3_constants.ExtLatestVersionFileNameKey])
 
+	// A newer version may have committed while this write's outcome was
+	// uncertain; a pointer already naming one newer than this version must
+	// keep latest where it belongs instead of pointing back.
+	prevLatestVersionId := string(versionsEntry.Extended[s3_constants.ExtLatestVersionIdKey])
+	if prevLatestVersionId != "" && versionId != "null" && compareVersionIds(prevLatestVersionId, versionId) < 0 {
+		// This version is born noncurrent: stamp it so the lifecycle engine
+		// can compute NoncurrentDays, but leave latest where it belongs.
+		s3a.markVersionNoncurrent(bucketDir, versionsObjectPath, versionFileName, time.Now().UnixNano())
+		glog.V(2).Infof("updateLatestVersionInDirectory: %s/%s already points at newer version %s; keeping it", bucket, object, prevLatestVersionId)
+		return nil
+	}
+
 	// Stamp the demoted entry BEFORE updating the .versions/ directory
 	// pointer. The pointer-flip emits a meta-log event that the
 	// lifecycle router consumes; that router then looks up the demoted
@@ -2052,7 +2369,7 @@ func (s3a *S3ApiServer) applySSEKMSDefaultEncryption(bucket string, r *http.Requ
 	// Use the KMS key ID from bucket configuration, or default if not specified
 	keyID := encryptionConfig.KmsKeyId
 	if keyID == "" {
-		keyID = "alias/aws/s3" // AWS default KMS key for S3
+		keyID = s3_constants.SSEKMSDefaultKeyID
 	}
 
 	// Check if bucket key is enabled in configuration
@@ -2400,6 +2717,10 @@ func parseConditionalHeaders(r *http.Request) (conditionalHeaders, s3err.ErrorCo
 
 // S3ApiServer implements EntryGetter interface
 func (s3a *S3ApiServer) getObjectETag(entry *filer_pb.Entry) string {
+	return objectETag(entry)
+}
+
+func objectETag(entry *filer_pb.Entry) string {
 	// Try to get ETag from Extended attributes first
 	if etagBytes, hasETag := entry.Extended[s3_constants.ExtETagKey]; hasETag {
 		etag := string(etagBytes)
@@ -2411,13 +2732,27 @@ func (s3a *S3ApiServer) getObjectETag(entry *filer_pb.Entry) string {
 		}
 		// Empty stored ETag — fall through to Md5/chunk-based calculation
 	}
+	// The remote ETag still describes this entry only while the local copy
+	// holds the remote bytes: a synced cache fill, or a remote-only entry
+	// with no local content. Content changes made through the filer clear
+	// the sync stamp (Filer.UpdateEntry) or add chunks or inline content;
+	// resizes without new bytes show up in FileSize. Metadata-only updates
+	// like utimens keep the remote bytes, so Mtime is not part of the check.
+	if remote := entry.RemoteEntry; remote != nil && remote.RemoteETag != "" &&
+		entry.GetAttributes().GetFileSize() == uint64(remote.RemoteSize) &&
+		(remote.LastLocalSyncTsNs > 0 || (len(entry.Chunks) == 0 && len(entry.Content) == 0)) {
+		return quoteETag(remote.RemoteETag)
+	}
 	// Check for Md5 in Attributes (matches filer.ETag behavior)
 	// Note: len(nil slice) == 0 in Go, so no need for explicit nil check
 	if entry.Attributes != nil && len(entry.Attributes.Md5) > 0 {
 		return fmt.Sprintf("\"%x\"", entry.Attributes.Md5)
 	}
 	// Fallback: calculate ETag from chunks
-	return s3a.calculateETagFromChunks(entry.Chunks)
+	if len(entry.Chunks) == 0 {
+		return `""`
+	}
+	return quoteETag(filer.ETagChunks(entry.Chunks))
 }
 
 func (s3a *S3ApiServer) etagMatches(headerValue, objectETag string) bool {
@@ -2466,8 +2801,9 @@ func (s3a *S3ApiServer) validateConditionalHeaders(r *http.Request, headers cond
 
 	// 1. Check If-Match
 	if headers.ifMatch != "" {
+		// AWS answers 404 when there is no current version (or it is a delete marker)
 		if !objectExists {
-			return s3err.ErrPreconditionFailed
+			return s3err.ErrNoSuchKey
 		}
 		// If `ifMatch` is "*", the condition is met if the object exists.
 		// Otherwise, we need to check the ETag.
@@ -2685,6 +3021,15 @@ func (s3a *S3ApiServer) checkConditionalHeadersForReads(r *http.Request, bucket,
 		return ConditionalHeaderResult{ErrorCode: s3err.ErrNone, Entry: nil}
 	}
 	return s3a.validateConditionalHeadersForReads(r, headers, entry, bucket, object)
+}
+
+// lookupVolumeJwt mints a fresh volume-server JWT for an existing file id, so a
+// cleanup delete that runs past the assignment JWT's expiry still authenticates.
+func (s3a *S3ApiServer) lookupVolumeJwt(ctx context.Context, fileId string) security.EncodedJwt {
+	if s3a.masterClient == nil {
+		return ""
+	}
+	return operation.LookupJwt(ctx, s3a.masterClient.GetMaster(ctx), s3a.option.GrpcDialOption, fileId)
 }
 
 // deleteOrphanedChunks attempts to delete chunks that were uploaded but whose entry creation failed
