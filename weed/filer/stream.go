@@ -2,6 +2,7 @@ package filer
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"fmt"
 	"io"
@@ -119,12 +120,15 @@ type VolumeServerJwtFunction func(fileId string) string
 // refreshUrls lets a fetch loop relearn a chunk's locations inside a single
 // read: drop the cached entry and look it up again, whether every location
 // failed or one did while another answered. Nil when there is nothing to
-// invalidate against.
+// invalidate against. A cancelled read keeps the cached locations.
 func refreshUrls(ctx context.Context, invalidator CacheInvalidator, lookupFn wdclient.LookupFileIdFunctionType, fileId string) util_http.RefreshUrlsFunc {
 	if invalidator == nil || lookupFn == nil {
 		return nil
 	}
 	return func() []string {
+		if ctx.Err() != nil {
+			return nil
+		}
 		invalidator.InvalidateCache(fileId)
 		urls, err := lookupFn(ctx, fileId)
 		if err != nil {
@@ -369,17 +373,34 @@ func writeZero(w io.Writer, size int64) (err error) {
 }
 
 // ----------------  ChunkStreamReader ----------------------------------
+
+// A reader buffers recently fetched chunks, not just the last one: readers
+// consumed through io.SectionReader (e.g. parallel multipart uploads) keep a
+// handful of part-sized windows hot at once, and a single shared buffer would
+// refetch a whole chunk on nearly every ReadAt. The bounds cap the memory of
+// tiny chunks as well as the total buffered bytes.
+const maxBufferedChunks = 16
+const maxBufferedChunkBytes = 128 << 20
+
+type bufferedChunk struct {
+	offset int64
+	data   []byte
+}
+
 type ChunkStreamReader struct {
-	head         *Interval[*ChunkView]
-	chunkView    *Interval[*ChunkView]
-	totalSize    int64
-	logicOffset  int64
-	buffer       []byte
-	bufferOffset int64
-	bufferLock   sync.Mutex
-	chunk        string
-	lookupFileId wdclient.LookupFileIdFunctionType
-	sourceErr    error
+	head              *Interval[*ChunkView]
+	chunkView         *Interval[*ChunkView]
+	totalSize         int64
+	logicOffset       int64
+	buffer            []byte
+	bufferOffset      int64
+	bufferLock        sync.Mutex
+	chunk             string
+	chunkBuffers      map[int64]*list.Element
+	chunkBuffersLru   *list.List
+	chunkBuffersBytes int64
+	lookupFileId      wdclient.LookupFileIdFunctionType
+	sourceErr         error
 }
 
 var _ = io.ReadSeeker(&ChunkStreamReader{})
@@ -415,11 +436,7 @@ func doNewChunkStreamReader(ctx context.Context, lookupFileIdFn wdclient.LookupF
 
 func NewChunkStreamReaderFromFiler(ctx context.Context, masterClient *wdclient.MasterClient, chunks []*filer_pb.FileChunk) *ChunkStreamReader {
 
-	lookupFileIdFn := func(ctx context.Context, fileId string) (targetUrl []string, err error) {
-		return masterClient.LookupFileId(ctx, fileId)
-	}
-
-	return doNewChunkStreamReader(ctx, lookupFileIdFn, chunks)
+	return doNewChunkStreamReader(ctx, masterClient.GetLookupFileIdFunction(), chunks)
 }
 
 // NewChunkStreamReaderFromLookup creates a ChunkStreamReader from a lookup function.
@@ -528,6 +545,14 @@ func (c *ChunkStreamReader) prepareBufferFor(offset int64) (err error) {
 }
 
 func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
+	if elem, ok := c.chunkBuffers[chunkView.ViewOffset]; ok {
+		buffered := elem.Value.(*bufferedChunk)
+		c.chunkBuffersLru.MoveToFront(elem)
+		c.buffer = buffered.data
+		c.bufferOffset = buffered.offset
+		c.chunk = chunkView.FileId
+		return nil
+	}
 	urlStrings, err := c.lookupFileId(context.Background(), chunkView.FileId)
 	if err != nil {
 		glog.V(1).Infof("operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
@@ -558,10 +583,31 @@ func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
 	c.buffer = buffer.Bytes()
 	c.bufferOffset = chunkView.ViewOffset
 	c.chunk = chunkView.FileId
+	c.rememberBufferedChunk(chunkView.ViewOffset, c.buffer)
 
 	// glog.V(0).Infof("fetched %s [%d,%d)", chunkView.FileId, chunkView.ViewOffset, chunkView.ViewOffset+int64(chunkView.ViewSize))
 
 	return nil
+}
+
+// rememberBufferedChunk caches a fetched chunk by its view offset and evicts
+// the least recently used ones past the bounds. The chunk just inserted always
+// survives eviction so the read that fetched it can proceed.
+func (c *ChunkStreamReader) rememberBufferedChunk(offset int64, data []byte) {
+	if c.chunkBuffers == nil {
+		c.chunkBuffers = make(map[int64]*list.Element)
+		c.chunkBuffersLru = list.New()
+	}
+	c.chunkBuffers[offset] = c.chunkBuffersLru.PushFront(&bufferedChunk{offset: offset, data: data})
+	c.chunkBuffersBytes += int64(len(data))
+	for c.chunkBuffersLru.Len() > 1 &&
+		(c.chunkBuffersLru.Len() > maxBufferedChunks || c.chunkBuffersBytes > maxBufferedChunkBytes) {
+		back := c.chunkBuffersLru.Back()
+		evicted := back.Value.(*bufferedChunk)
+		c.chunkBuffersLru.Remove(back)
+		delete(c.chunkBuffers, evicted.offset)
+		c.chunkBuffersBytes -= int64(len(evicted.data))
+	}
 }
 
 func (c *ChunkStreamReader) rememberSourceError(err error) error {
@@ -590,6 +636,9 @@ func (c *ChunkStreamReader) Close() error {
 	c.bufferLock.Lock()
 	defer c.bufferLock.Unlock()
 	c.buffer = nil
+	c.chunkBuffers = nil
+	c.chunkBuffersLru = nil
+	c.chunkBuffersBytes = 0
 	c.head = nil
 	c.chunkView = nil
 	return nil

@@ -116,7 +116,7 @@ func setup(topologyLayout string) *Topology {
 					}
 					if vi.ReplicaPlacement != nil {
 						vl := topo.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, needle.EMPTY_TTL, types.HardDriveType)
-						vl.RegisterVolume(&vi, server)
+						vl.RegisterVolume(&vi, server, nil)
 						vl.setVolumeWritable(vi.Id)
 					}
 					server.AddOrUpdateVolume(vi)
@@ -152,6 +152,39 @@ func TestFindEmptySlotsForOneVolume(t *testing.T) {
 	}
 	for _, server := range servers {
 		fmt.Println("assigned node :", server.Id())
+	}
+}
+
+func TestGrowthBlocker(t *testing.T) {
+	topo := setup(topologyLayout)
+
+	rp010, _ := super_block.NewReplicaPlacementFromString("010")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc1"}); err != nil {
+		t.Fatalf("dc1 has the two racks 010 needs, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc3"}); err == nil {
+		t.Fatal("dc3 has a single rack, 010 should report a blocker")
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc2"}); err == nil {
+		t.Fatal("dc2 has no racks, 010 should report a blocker")
+	}
+
+	rp000, _ := super_block.NewReplicaPlacementFromString("000")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp000, DataCenter: "dc3"}); err != nil {
+		t.Fatalf("dc3 has a node for 000, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp000, DataCenter: "dc9"}); err == nil {
+		t.Fatal("dc9 does not exist, 000 should report a blocker")
+	}
+
+	// The named location binds only the first replica: dc1 hosts it for 100
+	// and dc3 has room for the second, so the placement is reachable.
+	rp100, _ := super_block.NewReplicaPlacementFromString("100")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp100, DataCenter: "dc1"}); err != nil {
+		t.Fatalf("dc3 has room for the second 100 replica, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp100, DataCenter: "dc2"}); err == nil {
+		t.Fatal("dc2 has no room for the first 100 replica")
 	}
 }
 

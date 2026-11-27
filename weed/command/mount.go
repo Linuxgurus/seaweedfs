@@ -67,6 +67,10 @@ type MountOptions struct {
 	// POSIX compliance options
 	posixDirNlink *bool
 
+	// report opens for reading to the filer
+	accessReport         *bool
+	accessReportInterval *time.Duration
+
 	// FUSE performance options
 	writebackCache          *bool
 	asyncDio                *bool
@@ -115,7 +119,7 @@ func init() {
 	mountOptions.cacheMetaTtlSec = cmdMount.Flag.Int("cacheMetaTtlSec", 60, "metadata cache validity seconds")
 	mountOptions.cacheDirMaxEntries = cmdMount.Flag.Int("cacheDirMaxEntries", 100000, "a directory with more children than this is not cached locally but read directly from the filer; 0 caches everything")
 	mountOptions.dataCenter = cmdMount.Flag.String("dataCenter", "", "prefer to write to the data center")
-	mountOptions.allowOthers = cmdMount.Flag.Bool("allowOthers", true, "allows other users to access the file system")
+	mountOptions.allowOthers = cmdMount.Flag.Bool("allowOthers", true, "allows other users to access the file system; on Linux, when mounting as a non-root user, this requires 'user_allow_other' in /etc/fuse.conf, so set -allowOthers=false otherwise")
 	mountOptions.defaultPermissions = cmdMount.Flag.Bool("defaultPermissions", true, "enforce permissions by the operating system")
 	mountOptions.umaskString = cmdMount.Flag.String("umask", "022", "octal umask, e.g., 022, 0111")
 	mountOptions.nonempty = cmdMount.Flag.Bool("nonempty", false, "allows the mounting over a non-empty directory")
@@ -155,6 +159,9 @@ func init() {
 
 	// POSIX compliance options
 	mountOptions.posixDirNlink = cmdMount.Flag.Bool("posix.dirNLink", false, "report POSIX-compliant directory nlink (2 + subdirectory count); costs one directory listing per stat")
+
+	mountOptions.accessReport = cmdMount.Flag.Bool("accessReport", false, "report opens of a file for reading to the filer with TouchAccessTime, including opens answered from the metadata cache, at most once per -accessReport.interval for each file unless it was modified since its last report. Has no effect unless the filer implements TouchAccessTime")
+	mountOptions.accessReportInterval = cmdMount.Flag.Duration("accessReport.interval", time.Hour, "with -accessReport, the least time between two reports of the same unmodified file; 0 reports every open")
 
 	// FUSE performance options
 	mountOptions.writebackCache = cmdMount.Flag.Bool("writebackCache", false, "enable FUSE writeback cache for improved write performance (at risk of data loss on crash)")

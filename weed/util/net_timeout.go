@@ -1,8 +1,12 @@
 package util
 
 import (
+	"context"
+	"errors"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -52,6 +56,8 @@ type Conn struct {
 	mu                    sync.Mutex
 	externalReadDeadline  bool
 	externalWriteDeadline bool
+
+	readEndedByServer atomic.Bool
 }
 
 func (c *Conn) SetDeadline(t time.Time) error {
@@ -107,13 +113,12 @@ func (c *Conn) extendDeadline() error {
 
 func (c *Conn) Read(b []byte) (count int, e error) {
 	// Extend deadline before reading - any activity keeps connection alive
-	if err := c.extendDeadline(); err != nil {
-		return 0, err
+	if e = c.extendDeadline(); e == nil {
+		if count, e = c.Conn.Read(b); e == nil {
+			stats.BytesIn(int64(count))
+		}
 	}
-	count, e = c.Conn.Read(b)
-	if e == nil {
-		stats.BytesIn(int64(count))
-	}
+	c.readEndedByServer.Store(errors.Is(e, os.ErrDeadlineExceeded) || errors.Is(e, net.ErrClosed))
 	return
 }
 
@@ -140,6 +145,29 @@ func (c *Conn) Close() error {
 	return err
 }
 
+type connContextKey struct{}
+
+// ConnContext is an http.Server.ConnContext hook that lets ClientGone see the
+// connection serving a request.
+func ConnContext(ctx context.Context, c net.Conn) context.Context {
+	if tlsConn, ok := c.(interface{ NetConn() net.Conn }); ok {
+		c = tlsConn.NetConn()
+	}
+	if tc, ok := c.(*Conn); ok {
+		return context.WithValue(ctx, connContextKey{}, tc)
+	}
+	return ctx
+}
+
+// ClientGone reports whether the client is why the request context ctx is
+// canceled. net/http cancels it when a read of the connection fails or the
+// HTTP/2 stream is reset; a read the server ended itself, by the idle timeout
+// or by closing the connection, is not the client's doing.
+func ClientGone(ctx context.Context) bool {
+	tc, _ := ctx.Value(connContextKey{}).(*Conn)
+	return tc != nil && ctx.Err() == context.Canceled && !tc.readEndedByServer.Load()
+}
+
 func NewListener(addr string, timeout time.Duration) (ipListener net.Listener, err error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -154,7 +182,23 @@ func NewListener(addr string, timeout time.Duration) (ipListener net.Listener, e
 	return
 }
 
-func NewIpAndLocalListeners(host string, port int, timeout time.Duration) (ipListener net.Listener, localListener net.Listener, err error) {
+// IsLoopbackOrWildcardAddress reports whether host already covers loopback
+// traffic — empty (all interfaces), a wildcard address, or a loopback address —
+// in which case a separate localhost listener is unnecessary.
+func IsLoopbackOrWildcardAddress(host string) bool {
+	switch host {
+	case "", "localhost", "0.0.0.0", "127.0.0.1", "[::]", "[::1]":
+		return true
+	}
+	return false
+}
+
+// NewIpAndLocalListeners binds host:port and, unless listenOnLocalhost is given
+// as false, a second listener on localhost:port so that local clients still
+// reach the service when it binds a specific address. Callers pass false when
+// the user explicitly chose the bind address (e.g. -ip.bind), honoring exactly
+// that address.
+func NewIpAndLocalListeners(host string, port int, timeout time.Duration, listenOnLocalhost ...bool) (ipListener net.Listener, localListener net.Listener, err error) {
 	listener, err := net.Listen("tcp", JoinHostPort(host, port))
 	if err != nil {
 		return
@@ -165,10 +209,10 @@ func NewIpAndLocalListeners(host string, port int, timeout time.Duration) (ipLis
 		Timeout:  timeout,
 	}
 
-	if host != "localhost" && host != "" && host != "0.0.0.0" && host != "127.0.0.1" && host != "[::]" && host != "[::1]" {
+	if (len(listenOnLocalhost) == 0 || listenOnLocalhost[0]) && !IsLoopbackOrWildcardAddress(host) {
 		listener, err = net.Listen("tcp", JoinHostPort("localhost", port))
 		if err != nil {
-			glog.V(0).Infof("skip starting on %s:%d: %v", host, port, err)
+			glog.V(0).Infof("skip starting localhost listener on :%d: %v", port, err)
 			return ipListener, nil, nil
 		}
 

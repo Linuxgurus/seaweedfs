@@ -68,9 +68,14 @@ func (s3a *S3ApiServer) PutBucketTaggingHandler(w http.ResponseWriter, r *http.R
 	}
 
 	tags := tagging.ToTags()
+	// A key may appear only once in a tag set; the map keeps one of them.
+	if len(tags) != len(tagging.TagSet.Tag) {
+		glog.Errorf("PutBucketTagging duplicate tag keys %s", r.URL)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidTag)
+		return
+	}
 
-	// Validate tags using existing validation
-	err = ValidateTags(tags)
+	err = ValidateBucketTags(tags)
 	if err != nil {
 		glog.Errorf("PutBucketTagging ValidateTags error %s: %v", r.URL, err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidTag)
@@ -79,8 +84,12 @@ func (s3a *S3ApiServer) PutBucketTaggingHandler(w http.ResponseWriter, r *http.R
 
 	// Store bucket tags in metadata
 	if err = s3a.UpdateBucketTags(bucket, tags); err != nil {
-		glog.Errorf("PutBucketTagging UpdateBucketTags %s: %v", r.URL, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		if isBucketNotFoundErr(err) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else {
+			glog.Errorf("PutBucketTagging UpdateBucketTags %s: %v", r.URL, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		}
 		return
 	}
 
@@ -100,8 +109,12 @@ func (s3a *S3ApiServer) DeleteBucketTaggingHandler(w http.ResponseWriter, r *htt
 
 	// Remove bucket tags from metadata
 	if err := s3a.ClearBucketTags(bucket); err != nil {
-		glog.Errorf("DeleteBucketTagging ClearBucketTags %s: %v", r.URL, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		if isBucketNotFoundErr(err) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else {
+			glog.Errorf("DeleteBucketTagging ClearBucketTags %s: %v", r.URL, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		}
 		return
 	}
 

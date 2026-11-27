@@ -100,6 +100,8 @@ var jobTypeLaneMap = map[string]SchedulerLane{
 	"lance_compact":          LaneLance,
 	"lance_optimize_indices": LaneLance,
 	"lance_cleanup_versions": LaneLance,
+	"lance_vector_index":     LaneLance,
+	"lance_metadata_index":   LaneLance,
 }
 
 // JobTypeLane returns the scheduler lane for the given job type.
@@ -129,19 +131,12 @@ type schedulerLaneState struct {
 
 	loopMu sync.Mutex
 	loop   schedulerLoopState
-
-	// Per-lane execution reservation pool. Each lane tracks how many
-	// execution slots it has reserved on each worker independently,
-	// so lanes cannot starve each other.
-	execMu  sync.Mutex
-	execRes map[string]int
 }
 
 // newLaneState creates a schedulerLaneState for the given lane.
 func newLaneState(lane SchedulerLane) *schedulerLaneState {
 	return &schedulerLaneState{
-		lane:    lane,
-		wakeCh:  make(chan struct{}, 1),
-		execRes: make(map[string]int),
+		lane:   lane,
+		wakeCh: make(chan struct{}, 1),
 	}
 }

@@ -97,6 +97,10 @@ func (r *clusterRepairer) Rebuild(ctx context.Context, topo *master_pb.TopologyI
 		IsLocked: func() bool { return true },
 	}
 
+	// verifyChecksums is false: this path is already repairing a volume the
+	// bitrot scan identified shard-by-shard, and ec.rebuild's checksum pass
+	// re-scrubs whole collections to pick its own targets. Passing false keeps
+	// the rebuild aimed at the shards this task chose.
 	return ec.RebuildEcVolumes(env, ecNodes, io.Discard,
-		[]string{collection}, []needle.VolumeId{needle.VolumeId(volumeID)}, dt, 1, true)
+		[]string{collection}, []needle.VolumeId{needle.VolumeId(volumeID)}, dt, 1, true, false)
 }

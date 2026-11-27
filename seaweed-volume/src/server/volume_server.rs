@@ -125,6 +125,11 @@ pub struct VolumeServerState {
     pub cli_white_list: Vec<String>,
     /// Path to state.pb file for persisting VolumeServerState across restarts.
     pub state_file_path: String,
+    /// Per-vid EC lifecycle lock, serializing EC ops that install or remove a
+    /// vid's files. A tokio Mutex so the guard survives the copy's `.await` IO.
+    pub ec_lifecycle_locks: std::sync::Mutex<
+        std::collections::HashMap<crate::storage::types::VolumeId, Arc<tokio::sync::Mutex<()>>>,
+    >,
     /// Volumes with an EC decode in flight. A dropped request leaves the
     /// blocking job running; this keeps a retry from racing it on the
     /// same volume files.
@@ -140,9 +145,31 @@ pub struct VolumeServerState {
     /// Wakes .ecj appenders waiting on `ec_decode_tail` when a decode's
     /// publishing tail ends.
     pub ec_decode_tail_notify: tokio::sync::Notify,
+    /// Volumes with a VolumeCopy in flight on this server. The claim spans
+    /// reservation, transfer, mount and cleanup, so a second copy of the
+    /// same volume fails fast instead of clearing or overwriting files the
+    /// first copy still owns. Mirrors Go's volumeCopiesInFlight. Shared with
+    /// the disk locations' load scans — Go's loadGuard.
+    pub volume_copies_in_flight: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashSet<crate::storage::types::VolumeId>>,
+    >,
 }
 
 impl VolumeServerState {
+    /// Return the per-vid EC lifecycle lock, creating it on first use. Entries
+    /// are never reaped.
+    pub fn ec_lifecycle_lock(
+        &self,
+        vid: crate::storage::types::VolumeId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.ec_lifecycle_locks
+            .lock()
+            .unwrap()
+            .entry(vid)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// The master lookups should go to: the leader the heartbeat confirmed,
     /// or empty while none is known, in its announced `host:port[.grpcPort]`
     /// form. Mirrors Go's `vs.getCurrentMaster()`.

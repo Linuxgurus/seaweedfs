@@ -8,8 +8,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
@@ -128,11 +130,22 @@ type Option struct {
 	// When false (default), directories report nlink=2.
 	PosixDirNlink bool
 
+	// AccessReport reports opens of a file for reading to the filer with
+	// TouchAccessTime, at most once per AccessReportInterval for each path
+	// (0 reports every open), so a filer that tracks access also sees the
+	// reads answered from the metadata cache. It has no effect unless the
+	// filer implements TouchAccessTime: while the filer answers
+	// Unimplemented, reporting pauses.
+	AccessReport         bool
+	AccessReportInterval time.Duration
+
 	uniqueCacheDirForRead  string
 	uniqueCacheDirForWrite string
 }
 
 type WFS struct {
+	// Metadata-only refusal token, detached at final Forget; no live resources retained.
+	writebackContentErrors sync.Map
 	// https://dl.acm.org/doi/fullHtml/10.1145/3310148
 	// follow https://github.com/hanwen/go-fuse/blob/master/fuse/api.go
 	fuse.RawFileSystem
@@ -146,6 +159,7 @@ type WFS struct {
 	writeBufferAccountant *page_writer.WriteBufferAccountant
 	signature             int32
 	filerCallTimeout      time.Duration // bounds one filer call; tests only, 0 = filerRPCTimeout
+	lookupRebuildWait     time.Duration // bounds a lookup's wait on a directory rebuild; tests only, 0 = lookupRebuildTimeout
 	concurrentWriters     *util.LimitedConcurrentExecutor
 	copyBufferPool        sync.Pool
 	concurrentCopiersSem  chan struct{}
@@ -154,31 +168,37 @@ type WFS struct {
 	dhMap                 *DirectoryHandleToInode
 	fuseServer            *fuse.Server
 	IsOverQuota           bool
-	fhLockTable           *util.LockTable[FileHandleId]
-	hardLinkLockTable     *util.LockTable[string]
-	posixLocks            *PosixLockTable
-	posixSid              uint64             // this mount's session id, for routed-lock owner identity
-	posixHint             *posixLockHint     // local fcntl-lock hint for routed mode
-	posixOwn              *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
-	peerRegistrar         *PeerRegistrar
-	peerDirectory         *PeerDirectory
-	peerGrpcServer        *PeerGrpcServer
-	peerAnnouncer         *PeerAnnouncer
-	peerConnPool          *PeerConnPool
-	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
-	FilerConf             *filer.FilerConf
-	filerClient           *wdclient.FilerClient // Cached volume location client
-	refreshMu             sync.Mutex
-	refreshingDirs        map[util.FullPath]struct{}
-	atimeMu               sync.Mutex
-	atimeMap              map[uint64]time.Time // inode -> atime, in-memory only, bounded
-	dirMtimeMu            sync.Mutex
-	dirMtimeMap           map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
-	removedDirMu          sync.Mutex
-	removedDirs           map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
-	entryValidSec         uint64                     // kernel FUSE entry cache TTL in seconds
-	attrValidSec          uint64                     // kernel FUSE attr cache TTL in seconds
-	dirIdleEvict          time.Duration
+	accessReporter        *accessReporter // nil unless -accessReport
+	// Handle lock nesting order is defined at FileHandle.entryLock.
+	fhLockTable       *util.LockTable[FileHandleId]
+	hardLinkLockTable *util.LockTable[string]
+	posixLocks        *PosixLockTable
+	posixSid          uint64             // this mount's session id, for routed-lock owner identity
+	posixHint         *posixLockHint     // local fcntl-lock hint for routed mode
+	posixOwn          *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
+	fhLocks           fhLockOwners       // non-flock lock owners per open fh, drained at release
+	peerRegistrar     *PeerRegistrar
+	peerDirectory     *PeerDirectory
+	peerGrpcServer    *PeerGrpcServer
+	peerAnnouncer     *PeerAnnouncer
+	peerConnPool      *PeerConnPool
+	peerDirectoryStop chan struct{} // closed on unmount to stop the sweeper goroutine
+	FilerConf         *filer.FilerConf
+	filerClient       *wdclient.FilerClient // Cached volume location client
+	refreshMu         sync.Mutex
+	refreshingDirs    map[util.FullPath]struct{}
+	atimeMu           sync.Mutex
+	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu        sync.Mutex
+	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	removedDirMu      sync.Mutex
+	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
+	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
+	attrValidSec      uint64                     // kernel FUSE attr cache TTL in seconds
+	dirIdleEvict      time.Duration
+
+	metadataPublicationOnce  sync.Once
+	metadataPublicationLocks *util.LockTable[util.FullPath]
 
 	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
 	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
@@ -292,6 +312,11 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		glog.V(0).Infof("distributed lock manager disabled: writeback cache implies single-writer mode")
 	}
 
+	if option.AccessReport {
+		wfs.accessReporter = newAccessReporter(wfs.touchAccessTime, option.AccessReportInterval)
+		wfs.accessReporter.start()
+	}
+
 	wfs.option.filerIndex = int32(rand.IntN(len(option.FilerAddresses)))
 	wfs.option.setupUniqueCacheDirectory()
 	if option.CacheSizeMBForRead > 0 {
@@ -316,7 +341,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		// after server.Serve() would never execute.  Drain here first.
 		//
 		// Use a timeout to avoid hanging on Ctrl-C if the filer is
-		// unreachable (metadata retry can take up to 7 seconds).
+		// unreachable: writeback flushes retry until it answers.
 		// If the timeout expires, skip the write-cache removal so that
 		// still-running goroutines can finish reading swap files.
 		asyncDrained := true
@@ -339,6 +364,9 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			os.RemoveAll(option.getUniqueCacheDirForWrite())
 		}
 		os.RemoveAll(option.getUniqueCacheDirForRead())
+		if wfs.accessReporter != nil {
+			wfs.accessReporter.stop()
+		}
 		if wfs.peerAnnouncer != nil {
 			wfs.peerAnnouncer.Stop()
 		}
@@ -468,6 +496,10 @@ func (wfs *WFS) StartBackgroundTasks() error {
 		glog.V(0).Infof("writebackCache enabled: async flush on close() for improved small file performance")
 	}
 
+	if wfs.lockClient != nil {
+		wfs.followLockRing()
+	}
+
 	follower, err := wfs.subscribeFilerConfEvents()
 	if err != nil {
 		return err
@@ -541,10 +573,25 @@ func (wfs *WFS) maybeReadEntry(ctx context.Context, inode uint64) (path util.Ful
 		if entry = wfs.removedDirEntry(inode); entry != nil {
 			return "", nil, entry, fuse.OK
 		}
-		return
+		return "", nil, nil, wfs.pathlessInodeStatus(inode, status)
 	}
 	entry, _, status = wfs.maybeLoadEntry(ctx, path)
 	return
+}
+
+// pathlessInodeStatus answers an operation on an inode that has no path here.
+// While the kernel still holds the inode (no Forget yet), its name was
+// replaced or removed under it, as by a rename over it after the kernel
+// resolved the old name: ESTALE makes open, stat, access and xattr calls redo
+// the path walk and reach the current entry (as on NFS), where ENOENT would
+// fail them although the name exists. A forgotten inode keeps status. Only
+// Linux redoes the walk: FUSE on macOS and FreeBSD purges the name cache on
+// ENOENT instead, and WinFsp has neither, so they keep ENOENT.
+func (wfs *WFS) pathlessInodeStatus(inode uint64, status fuse.Status) fuse.Status {
+	if runtime.GOOS == "linux" && wfs.inodeToPath.HasInode(inode) {
+		return fuse.Status(syscall.ESTALE)
+	}
+	return status
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the
@@ -604,6 +651,23 @@ func (wfs *WFS) maybeLoadEntry(ctx context.Context, fullpath util.FullPath) (*fi
 // still allowing recovery once the filer is healthy again.
 const expiredDirRebuildCooldown = 30 * time.Second
 
+// lookupRebuildTimeout bounds how long a lookup waits on the rebuild it starts.
+// The rebuild lists the parent and every expired ancestor up to the mount root,
+// and every lookup beneath them joins the same builds, so a slow listing would
+// hold a plain stat for as long as it takes. The shared build does not run on
+// the requester's context and keeps going after a waiter gives up: this lookup
+// falls back to one LookupEntry RPC and later ones find the directory cached.
+const lookupRebuildTimeout = 2 * time.Second
+
+// lookupRebuildWaitTime is lookupRebuildTimeout unless a test set
+// lookupRebuildWait on the WFS.
+func (wfs *WFS) lookupRebuildWaitTime() time.Duration {
+	if wfs.lookupRebuildWait > 0 {
+		return wfs.lookupRebuildWait
+	}
+	return lookupRebuildTimeout
+}
+
 // lookupEntry looks up an entry by path, checking the local cache first.
 // Cached metadata is only authoritative when the parent directory itself is cached.
 // For uncached/read-through directories, always consult the filer directly so stale
@@ -611,13 +675,15 @@ const expiredDirRebuildCooldown = 30 * time.Second
 // It also returns the log position the entry reflects: the entry's stored
 // version, the lookup response's, or zero if unknown.
 func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
-	dir, _ := fullpath.DirAndName()
+	dir, name := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
 
 	// The kernel can serve a directory listing from its page cache past
 	// cacheMetaTtlSec, so ReadDir never runs and EnsureVisited is not called.
-	// Rebuild the expired directory once here so the cache hit below serves
-	// metadata lookups instead of issuing one LookupEntry RPC per entry.
+	// Invalidation, idle eviction, and a kernel Forget also drop a cached
+	// listing without scheduling a rebuild. Rebuild here — once — so the
+	// cache hit below serves metadata lookups instead of issuing one
+	// LookupEntry RPC per entry.
 	if !wfs.metaCache.IsDirectoryCached(dirPath) && wfs.inodeToPath.ShouldRebuildExpiredDir(dirPath, expiredDirRebuildCooldown) {
 		// The rebuild lists the parent from the filer; let any pending async
 		// flush of the target entry land first so the rebuilt cache does not
@@ -627,10 +693,14 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 				return nil, entryVersion{}, fuse.EINTR
 			}
 		}
-		if err := wfs.ensureDirectoryVisited(ctx, dirPath); err != nil {
+		waitCtx, cancelWait := context.WithTimeout(ctx, wfs.lookupRebuildWaitTime())
+		err := wfs.ensureDirectoryVisited(waitCtx, dirPath)
+		cancelWait()
+		if err != nil {
 			// Record the attempt so the cooldown suppresses repeated rebuilds
-			// while the listing keeps failing; once it elapses a later lookup
-			// retries. Oversized dirs are already marked read-through.
+			// while the listing keeps failing, and repeated waits while a slow
+			// one is still running; once it elapses a later lookup retries.
+			// Oversized dirs are already marked read-through.
 			var tooLarge *meta_cache.DirectoryTooLargeError
 			if !errors.As(err, &tooLarge) {
 				wfs.inodeToPath.MarkRebuildAttempt(dirPath, time.Now())
@@ -638,30 +708,60 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 		}
 	}
 
-	if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
-		cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath)
-		if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
-			glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
-			return nil, entryVersion{}, fuse.EIO
-		}
-		if cachedEntry != nil {
-			glog.V(4).Infof("lookupEntry cache hit %s", fullpath)
-			// Store versions come from applied events, not an RPC fence.
-			return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
-		}
-		// Re-check: the directory may have been evicted from cache between
-		// our IsDirectoryCached check and FindEntry.
-		// If it's no longer cached, fall through to the filer lookup below.
-		if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
-			// Authoritative ENOENT only if inodeToPath also has no record.
-			// If the kernel still tracks this inode, the three layers
-			// disagree; trust the filer over the local cache (the
-			// filer-ErrNotFound branch below logs the confirmed drift).
-			if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
-				glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
-				return nil, entryVersion{}, fuse.ENOENT
+	if wfs.metaCache.IsDirectoryCached(dirPath) {
+		if !wfs.metaCache.IsNameFresh(fullpath) {
+			// A burst of remote changes invalidated this name's section, and a
+			// workload that never reads the directory would read through per
+			// entry until one did. Re-validate just that section here so the
+			// lookups after this one are served from the cache again. As with
+			// the rebuild above, let a pending flush land first so the section
+			// refresh cannot capture pre-flush metadata. A failing refresh
+			// backs off under the same cooldown the rebuild gate uses rather
+			// than re-listing the range on every lookup.
+			if sectionLo, stale := meta_cache.StaleRangeOf(wfs.metaCache, dirPath, name); stale && wfs.inodeToPath.ShouldRefreshStaleSection(dirPath, sectionLo, expiredDirRebuildCooldown) {
+				if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+					if !wfs.waitForPendingAsyncFlush(ctx, inode) {
+						return nil, entryVersion{}, fuse.EINTR
+					}
+				}
+				if err := meta_cache.EnsureNameFresh(ctx, wfs.metaCache, wfs, dirPath, name); err != nil {
+					if errors.Is(err, meta_cache.ErrRefreshRangeTooLarge) {
+						// The section outgrew one refresh: drop the cached
+						// listing so a later lookup rebuilds it re-tiled, the
+						// same way ReadDir falls back to read-through.
+						wfs.purgeDirectoryCache(dirPath)
+					} else {
+						wfs.inodeToPath.MarkSectionRefreshAttempt(dirPath, sectionLo, time.Now())
+						glog.V(2).Infof("lookupEntry: refresh stale section of %s: %v", dirPath, err)
+					}
+				}
 			}
-			glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
+		}
+		if wfs.metaCache.IsNameFresh(fullpath) {
+			cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath)
+			if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
+				glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
+				return nil, entryVersion{}, fuse.EIO
+			}
+			if cachedEntry != nil {
+				glog.V(4).Infof("lookupEntry cache hit %s", fullpath)
+				// Store versions come from applied events, not an RPC fence.
+				return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
+			}
+			// Re-check: the directory may have been evicted from cache between
+			// our IsDirectoryCached check and FindEntry.
+			// If it's no longer cached, fall through to the filer lookup below.
+			if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
+				// Authoritative ENOENT only if inodeToPath also has no record.
+				// If the kernel still tracks this inode, the three layers
+				// disagree; trust the filer over the local cache (the
+				// filer-ErrNotFound branch below logs the confirmed drift).
+				if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
+					glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
+					return nil, entryVersion{}, fuse.ENOENT
+				}
+				glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
+			}
 		}
 	}
 
@@ -675,23 +775,47 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 		}
 	}
 
+	// A deferred create stays a local placeholder, a handle with no filer
+	// base, until a flush publishes it, and that flush can land while this
+	// lookup is in flight. Note the path's handle if it is one, resolved
+	// after the wait above.
+	var placeholder *FileHandle
+	if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+		if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound && fh.baseEntry.Load() == nil {
+			placeholder = fh
+		}
+	}
+
 	// Directory not cached - fetch directly from filer without caching the entire directory.
 	glog.V(4).Infof("lookupEntry fetching from filer %s", fullpath)
-	var entry *filer_pb.Entry
-	var lookupVersion entryVersion
-	lookupDir, lookupName := fullpath.DirAndName()
-	err := wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
-		resp, lookupErr := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
-			Directory: lookupDir,
-			Name:      lookupName,
-		})
-		if lookupErr != nil {
-			return lookupErr
+	entry, lookupVersion, err := wfs.lookupEntryOnFiler(ctx, fullpath)
+	// For a placeholder the filer may answer not-found from a read taken
+	// before the publish committed, and the flush may clear the dirty flag
+	// before the answer arrives. One look at the handle's base decides.
+	if err == filer_pb.ErrNotFound && placeholder != nil && ctx.Err() == nil {
+		if inode, found := wfs.inodeToPath.GetInode(fullpath); found && inode == placeholder.inode {
+			if placeholder.baseEntry.Load() == nil {
+				// Still unpublished: the filer cannot have the file yet. The
+				// copy the create cached answers while it is still this
+				// file's; otherwise a snapshot of the handle does.
+				if cached, cachedTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath); cacheErr == nil && cached != nil && cached.Attr.Inode == placeholder.inode {
+					return cached, entryVersion{tsNs: cachedTsNs}, fuse.OK
+				}
+				if localEntry := placeholder.entrySnapshot(dir); localEntry != nil {
+					return localEntry, entryVersion{}, fuse.OK
+				}
+			} else {
+				// A base comes only from the filer, here once it acknowledged
+				// the publish. This request leaves after that, so its answer
+				// is current: a miss means the file was removed since.
+				glog.V(1).Infof("lookupEntry %s: published while the lookup was in flight, asking the filer again", fullpath)
+				entry, lookupVersion, err = wfs.lookupEntryOnFiler(ctx, fullpath)
+				if err == filer_pb.ErrNotFound && ctx.Err() == nil {
+					return nil, entryVersion{}, fuse.ENOENT
+				}
+			}
 		}
-		entry = resp.Entry
-		lookupVersion = entryVersion{tsNs: resp.LogTsNs, signature: resp.LogSignature}
-		return nil
-	})
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, entryVersion{}, fuse.EINTR
@@ -765,6 +889,26 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 		entry.Attributes.Uid, entry.Attributes.Gid = wfs.option.UidGidMapper.FilerToLocal(entry.Attributes.Uid, entry.Attributes.Gid)
 	}
 	return filer.FromPbEntry(dir, entry), lookupVersion, fuse.OK
+}
+
+// lookupEntryOnFiler asks the filer for fullpath, bypassing the local cache.
+func (wfs *WFS) lookupEntryOnFiler(ctx context.Context, fullpath util.FullPath) (*filer_pb.Entry, entryVersion, error) {
+	dir, name := fullpath.DirAndName()
+	var entry *filer_pb.Entry
+	var version entryVersion
+	err := wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+		resp, lookupErr := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
+			Directory: dir,
+			Name:      name,
+		})
+		if lookupErr != nil {
+			return lookupErr
+		}
+		entry = resp.Entry
+		version = entryVersion{tsNs: resp.LogTsNs, signature: resp.LogSignature}
+		return nil
+	})
+	return entry, version, err
 }
 
 // entryVersion is a filer log position together with the clock domain it
@@ -861,6 +1005,12 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	handled, replacedInode := wfs.invalidateOpenFileHandle(invalidation)
 	if !handled && invalidation.RenamedTo != "" {
 		_, replacedInode = wfs.inodeToPath.MovePath(invalidation.Path, invalidation.RenamedTo)
+	} else if !handled && invalidation.Deleted && len(invalidation.LiveHardLinkId) > 0 {
+		// Otherwise the next open by nodeid resolves to the deleted name. A
+		// newer stored entry means something has taken the name since.
+		if _, _, newer := wfs.cachedEntrySince(invalidation.Path, invalidation.TsNs); !newer {
+			wfs.inodeToPath.RemoveAlias(invalidation.Path)
+		}
 	}
 	// A rename over an existing file destroys it, so its handle must not flush
 	// the old content back over what took the name. Marked from here, holding
@@ -918,6 +1068,8 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 	handled = true
 	fhActiveLock := wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
 	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	fh.entryLock.Lock()
+	defer fh.entryLock.Unlock()
 
 	// A rename changes which name the inode answers to, not which version of
 	// its content the handle holds, so it is applied ahead of the version fence
@@ -956,12 +1108,9 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 	// hit there is a stale leftover — use the event entry instead.
 	var candidate *filer_pb.Entry
 	candidateTsNs := eventTsNs
-	dir, _ := filePath.DirAndName()
-	if wfs.metaCache.IsDirectoryCached(util.FullPath(dir)) {
-		if storeEntry, storeVersionTsNs, findErr := wfs.metaCache.FindEntry(context.Background(), filePath); findErr == nil && storeEntry != nil && storeVersionTsNs >= eventTsNs {
-			candidate = storeEntry.ToProtoEntry()
-			candidateTsNs = storeVersionTsNs
-		}
+	if storeEntry, storeVersionTsNs, found := wfs.cachedEntrySince(filePath, eventTsNs); found {
+		candidate = storeEntry.ToProtoEntry()
+		candidateTsNs = storeVersionTsNs
 	}
 	if candidate == nil && eventEntry != nil {
 		candidate = proto.Clone(eventEntry).(*filer_pb.Entry)
@@ -980,6 +1129,12 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		// so no flush recreates the unlinked name. Either way the entry and
 		// dirty pages stay, so the open fd still reads its buffered writes.
 		if invalidation.Deleted {
+			// The next flush reads the survivor's stored entry before
+			// publishing, so the version stays where it was.
+			if len(invalidation.LiveHardLinkId) > 0 && wfs.followSurvivingLink(fh, filePath) {
+				fh.linkRefresh = invalidation.LiveHardLinkId
+				return
+			}
 			fh.isDeleted = true
 			fh.deleteEpoch++
 		}
@@ -1001,21 +1156,52 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		fh.advanceEntryVersion(candidateTsNs, 0)
 		return
 	}
+	// A dirty handle replays its own changes onto the peer's entry, keeping
+	// its pages. An unmergeable change or a replaced file keeps the writes;
+	// the flush reports the conflict.
+	if fh.dirtyMetadata && base != nil {
+		if sameContentFile(candidate, base) && fh.mergePeerContent(candidate, base) {
+			fh.adoptPeerBase(proto.Clone(candidate).(*filer_pb.Entry))
+			fh.advanceEntryVersion(candidateTsNs, 0)
+		}
+		return
+	}
 	// Dirty pages overlay content, so only a content change invalidates them:
 	// a metadata-only event (chmod, touch, or a committed copy's own event
-	// against an approximate base) leaves them valid. A dirty handle likewise
-	// keeps its diverged entry unless foreign content supersedes it.
-	contentChanged := base == nil || !sameEntryContent(candidate, base)
-	if contentChanged {
+	// against an approximate base) leaves them valid.
+	if base == nil || !sameEntryContent(candidate, base) {
 		fh.dirtyPages.Destroy()
 		fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
 	}
-	if contentChanged || !fh.dirtyMetadata {
-		fh.SetEntry(candidate)
-	}
+	fh.SetEntry(candidate)
 	fh.baseEntry.Store(proto.Clone(candidate).(*filer_pb.Entry))
 	fh.advanceEntryVersion(candidateTsNs, 0)
 	return
+}
+
+// cachedEntrySince returns the meta cache's entry at path when its directory is
+// cached and the entry is no older than tsNs.
+func (wfs *WFS) cachedEntrySince(path util.FullPath, tsNs int64) (*filer.Entry, int64, bool) {
+	dir, _ := path.DirAndName()
+	if !wfs.metaCache.IsDirectoryCached(util.FullPath(dir)) {
+		return nil, 0, false
+	}
+	entry, versionTsNs, err := wfs.metaCache.FindEntry(context.Background(), path)
+	if err != nil || entry == nil || versionTsNs < tsNs {
+		return nil, 0, false
+	}
+	return entry, versionTsNs, true
+}
+
+// followSurvivingLink drops a hard link name another client deleted and
+// keeps the handle on a name of the inode this mount still knows, reporting
+// false when it knows none.
+func (wfs *WFS) followSurvivingLink(fh *FileHandle, removed util.FullPath) bool {
+	survivor, ok := wfs.inodeToPath.RemoveAlias(removed)
+	if ok {
+		fh.RememberPath(survivor)
+	}
+	return ok
 }
 
 func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {

@@ -42,12 +42,21 @@ type VolumeServer struct {
 	whiteList         []string
 	currentMaster     pb.ServerAddress
 	currentMasterLock sync.RWMutex
-	pulsePeriod       time.Duration
-	dataCenter        string
-	rack              string
-	store             *storage.Store
-	guard             *security.Guard
-	grpcDialOption    grpc.DialOption
+	// confirmedLeaderOnce records that a heartbeat stream was ever answered
+	// by a leader; before first registration the retry loop reconnects
+	// promptly instead of pacing a full pulse.
+	confirmedLeaderOnce atomic.Bool
+	pulsePeriod         time.Duration
+	dataCenter          string
+	rack                string
+	store               *storage.Store
+	guard               *security.Guard
+	grpcDialOption      grpc.DialOption
+
+	// leaderLostAt is when a stream a leader had answered last ended, in Unix
+	// nanoseconds. For a pulse after that the loop also reconnects promptly:
+	// a master that just dropped the stream is usually restarting.
+	leaderLostAt atomic.Int64
 
 	needleMapKind                 storage.NeedleMapKind
 	ldbTimout                     int64
@@ -68,6 +77,11 @@ type VolumeServer struct {
 	// stop the handler; this keeps a retry from racing it on the same
 	// volume files.
 	ecDecodesInFlight sync.Map
+	// A copy claims its volume's guard, so mounts and configures either
+	// register before the copy's registration recheck (and abort it) or see
+	// the claim and refuse. Entries are never removed: a guard handed out
+	// while one side waits must stay the same mutex.
+	volumeCopyGuards sync.Map
 }
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
@@ -93,6 +107,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	ldbTimeout int64,
 	allowUntrustedRemoteEndpoints bool,
 	diskProbeConfig stats.DiskIOProbeConfig,
+	syncBatch storage.SyncBatchOption,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -148,8 +163,10 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	vs.checkWithMaster()
 
 	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, id, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, diskTags, ldbTimeout, diskProbeConfig)
+	vs.store.SetVolumeLoadGuard(vs.volumeLoadGuard)
 	vs.store.MasterFn = vs.getCurrentMaster
-	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
+	vs.store.SetSyncBatchOption(syncBatch)
+	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec, v.GetString("jwt.signing.previous_key"), v.GetString("jwt.signing.read.previous_key"))
 
 	handleStaticResources(adminMux)
 	adminMux.HandleFunc("/status", requestIDMiddleware(vs.statusHandler))
@@ -203,12 +220,7 @@ func (vs *VolumeServer) Reload() {
 	util.LoadConfiguration("security", false)
 	v := util.GetViper()
 	vs.guard.UpdateWhiteList(append(vs.whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...))
-	vs.guard.UpdateSigningKeys(
-		v.GetString("jwt.signing.key"),
-		v.GetInt("jwt.signing.expires_after_seconds"),
-		v.GetString("jwt.signing.read.key"),
-		v.GetInt("jwt.signing.read.expires_after_seconds"),
-	)
+	vs.guard.ReloadSigningKeys("jwt.signing")
 }
 
 // Returns whether a volume server is in maintenance (i.e. read-only) mode.

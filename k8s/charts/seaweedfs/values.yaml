@@ -45,6 +45,18 @@ global:
           volumeRead: 0
           filerWrite: 0
           filerRead: 0
+    # Serve the volume servers' HTTP port over TLS with the chart's volume
+    # certificate, and make every chart component reach them over HTTPS
+    # ([https.volume] and [https.client] in security.toml). Requires
+    # enableSecurity and is not supported with allInOne. Clients outside the
+    # chart (weed mount, the CSI driver) need their own [https.client].
+    # The volume servers do not ask for client certificates, because kubelet
+    # probes cannot present one; JWT signing keeps authorizing volume access.
+    # [https.client] also sends the admin UI's HTTP lookups on masters and
+    # S3 over HTTPS, which their plain listeners refuse, so the UI can miss
+    # volume public URLs and refuse SSE-S3 vector buckets.
+    volumeHttps:
+      enabled: false
     # we will use this serviceAccountName for all ClusterRoles/ClusterRoleBindings
     serviceAccountName: "seaweedfs"
     serviceAccountAnnotations: {}
@@ -73,6 +85,17 @@ global:
       #   secretKeyRef:
       #     name: seaweedfs-signing-key
       #     key: signingKey
+
+# Deploy every namespaced object into this existing namespace instead of the
+# release one. Changing it on an installed release moves regular namespaced
+# objects only: claims and the data behind them are left behind or deleted,
+# hook resources stay in the old namespace, and the generated S3 and DB
+# Secrets are not recreated — migrate claims, copy the Secrets, and clean up
+# the old hook resources by hand first. The default hostPath storage is
+# node-local as well: stop the old workloads and plan the hostPath data
+# migration, or the new pods can come up empty on other nodes or share the
+# same directories concurrently.
+namespaceOverride: ""
 
 image:
   registry: ""
@@ -740,9 +763,6 @@ filer:
   # encrypt data on volume servers
   encryptVolumeData: false
 
-  # Whether proxy or redirect to volume server during file GET request
-  redirectOnRead: false
-
   # Limit sub dir listing size (default 100000)
   dirListLimit: 100000
 
@@ -1062,6 +1082,10 @@ filer:
     httpsPort: 0
     # Suffix of the host name, {bucket}.{domainName}
     domainName: ""
+    # Seconds the gateway keeps serving after SIGTERM while its health checks
+    # return 503 (see s3.preStopSeconds). Added to the filer pod's 60s
+    # termination grace period.
+    preStopSeconds: 0
     # enable user & permission to s3 (need to inject to all services)
     enableAuth: false
     # set to the name of an existing kubernetes Secret with the s3 json config file
@@ -1075,12 +1099,16 @@ filer:
     # You may specify buckets to be created during the install or upgrade process.
     # Buckets may be exposed publicly by setting `anonymousRead` to `true`
     # ttl format: [1-255][m|h|d|w|M|y] (e.g., 7d)
+    # replication (e.g., 001) and disk (e.g., ssd) apply to writes into the bucket
+    # removing ttl, replication or disk later keeps the stored rule; set a new value instead
     # objectLock enables S3 Object Lock (irreversible, forces versioning)
     # versioning: Enabled or Suspended (or bool true/false)
     # createBuckets:
     #   - name: bucket-a
     #     anonymousRead: true
     #     ttl: 7d
+    #     replication: "001"
+    #     disk: ssd
     #     objectLock: true
     #     versioning: Enabled
     #   - name: bucket-b
@@ -1106,8 +1134,17 @@ s3:
   #     maxUnavailable: 0
   #     maxSurge: 25%
   updateStrategy: {}
-  # Time the s3 pod is given to shut down, including any preStop hook
+  # Time the s3 pod is given to shut down, including any preStop hook.
+  # With preStopSeconds set, it must be at least preStopSeconds + 15 (the
+  # in-flight request drain), or the chart refuses to render. A lifecycle
+  # preStop hook runs before SIGTERM, so add its duration on top; the chart
+  # cannot tell how long an exec hook takes. preStopSeconds replaces a
+  # preStop sleep hook.
   terminationGracePeriodSeconds: 10
+  # Seconds the gateway keeps serving after SIGTERM while its health checks
+  # return 503, so the pod leaves the Service endpoints before it stops
+  # listening. 0 stops at once.
+  preStopSeconds: 0
   bindAddress: 0.0.0.0
   port: 8333
   # add additional https port
@@ -1157,12 +1194,16 @@ s3:
   # You may specify buckets to be created during the install or upgrade process.
   # Buckets may be exposed publicly by setting `anonymousRead` to `true`
   # ttl format: [1-255][m|h|d|w|M|y] (e.g., 7d)
+  # replication (e.g., 001) and disk (e.g., ssd) apply to writes into the bucket
+  # removing ttl, replication or disk later keeps the stored rule; set a new value instead
   # objectLock enables S3 Object Lock (irreversible, forces versioning)
   # versioning: Enabled or Suspended (or bool true/false)
   # createBuckets:
   #   - name: bucket-a
   #     anonymousRead: true
   #     ttl: 7d
+  #     replication: "001"
+  #     disk: ssd
   #     objectLock: true
   #     versioning: Enabled
   #   - name: bucket-b
@@ -1302,7 +1343,8 @@ s3:
 
   # Lifecycle hooks for the s3 container. A preStop sleep lets the pod leave
   # the Service endpoints before it receives SIGTERM; keep it shorter than
-  # terminationGracePeriodSeconds.
+  # terminationGracePeriodSeconds. s3.preStopSeconds does the same from
+  # inside the gateway and also fails its health checks.
   # ref: https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/
   # Example:
   # lifecycle:
@@ -1725,6 +1767,60 @@ admin:
   serviceMonitor:
     annotations: {}
 
+vector:
+  enabled: false
+  imageOverride: null
+  replicas: 1
+  port: 8090
+  metricsPort: 0
+  masters: ""
+  readCacheMB: 512
+  nprobes: null
+  extraArgs: []
+  extraEnvironmentVars: {}
+  podLabels: {}
+  podAnnotations: {}
+  annotations: {}
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations: []
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: [amd64, arm64]
+  resources: {}
+  podSecurityContext: {}
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+  serviceMonitor:
+    annotations: {}
+  createBuckets: []
+  bucketHook:
+    podSecurityContext:
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+    image: amazon/aws-cli:2.39.6
+    endpoint: ""
+    region: us-east-1
+    credentialsSecret: ""
+    accessKeyKey: AWS_ACCESS_KEY_ID
+    secretKeyKey: AWS_SECRET_ACCESS_KEY
+    sessionTokenKey: AWS_SESSION_TOKEN
+    caBundleSecret: ""
+    caBundleKey: tls.crt
+    resources: {}
+
 worker:
   enabled: false
   imageOverride: null
@@ -1736,6 +1832,14 @@ worker:
 
   # The lance_* jobs run in their own container, /usr/bin/weed-worker.
   # amd64/arm64 only; pin mixed clusters with worker.affinity/nodeSelector.
+  # It keeps tables through the filers the masters list and reads
+  # security.toml. The Lance namespace knows it by a token derived from
+  # jwt.filer_signing.key, which the chart renders only with
+  # global.seaweedfs.securityConfig.jwtSigning.filerWrite: true. When S3 has
+  # identities, set it, or the namespace lists the worker no tables and the
+  # lance_* jobs find nothing to do. It also makes the filer accept only signed
+  # HTTP writes, so clients writing to the filer's HTTP API directly need a JWT
+  # signed with that key.
 
   # Lance namespace URL override; empty derives it from s3.lancePort.
   namespaceUrl: ""
@@ -1815,6 +1919,10 @@ worker:
     limits:
       cpu: "2"
       memory: "2Gi"
+
+  # Resources for the worker-lance sidecar. Falls back to worker.resources if unset.
+  lanceResources: {}
+
   tolerations: ""
   nodeSelector: ""
   priorityClassName: ""
@@ -1929,16 +2037,21 @@ allInOne:
     # The s3-secret.yaml template only reads from .Values.s3.credentials.
     # See: s3.credentials.admin.accessKey, s3.credentials.read.accessKey
     auditLogConfig: null  # S3 audit log configuration (null inherits from s3.auditLogConfig)
+    preStopSeconds: null  # Seconds to keep serving after SIGTERM, added to the pod's 60s grace period (null inherits from s3.preStopSeconds, 0 disables)
     trafficDistribution: null  # Service traffic distribution (e.g., "PreferClose"); auto-converts to "PreferSameZone" on k8s >=1.35
     # You may specify buckets to be created during the install process.
     # Buckets may be exposed publicly by setting `anonymousRead` to `true`
     # ttl format: [1-255][m|h|d|w|M|y] (e.g., 7d)
+    # replication (e.g., 001) and disk (e.g., ssd) apply to writes into the bucket
+    # removing ttl, replication or disk later keeps the stored rule; set a new value instead
     # objectLock enables S3 Object Lock (irreversible, forces versioning)
     # versioning: Enabled or Suspended (or bool true/false)
     # createBuckets:
     #   - name: bucket-a
     #     anonymousRead: true
     #     ttl: 7d
+    #     replication: "001"
+    #     disk: ssd
     #     objectLock: true
     #     versioning: Enabled
     #   - name: bucket-b
@@ -2227,6 +2340,9 @@ certificates:
     # seaweedfs-master-cert, seaweedfs-filer-cert, etc. Can see any statefulset definition to see secret names
     enabled: false
 
+# Labels added to the metadata of every object, except pods and volumeClaimTemplates.
+# A map, or a template string rendering to one.
+commonLabels: {}
 # Labels to be added to all the created pods
 podLabels: {}
 # Annotations to be added to all the created pods

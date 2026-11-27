@@ -14,13 +14,14 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "seaweedfs.componentName" (list $ $volumeName) }}
-  namespace: {{ $.Release.Namespace }}
+  namespace: {{ include "seaweedfs.namespace" $ | quote }}
   labels:
     app.kubernetes.io/name: {{ template "seaweedfs.name" $ }}
     helm.sh/chart: {{ $.Chart.Name }}-{{ $.Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/instance: {{ $.Release.Name }}
     app.kubernetes.io/component: {{ $volumeName }}
+    {{- with include "seaweedfs.commonLabels" $ }}{{ . | nindent 4 }}{{ end }}
 {{- if $volume.annotations }}
   annotations:
     {{- toYaml $volume.annotations | nindent 4 }}
@@ -54,6 +55,7 @@ spec:
       {{- with $volume.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       {{- if $volume.affinity }}
       affinity:
@@ -152,9 +154,11 @@ spec:
             - name: {{ $key }}
             {{- if kindIs "string" $value }}
               value: {{ tpl $value $ | quote }}
-            {{- else }}
+            {{- else if kindIs "map" $value }}
               valueFrom:
                 {{ toYaml $value | nindent 16 | trim }}
+            {{- else if not (kindIs "invalid" $value) }}
+              value: {{ toJson $value | quote }}
             {{- end -}}
             {{- end }}
           command:
@@ -218,7 +222,7 @@ spec:
                 -fileSizeLimitMB={{ $volume.fileSizeLimitMB }} \
                 {{- end }}
                 -minFreeSpacePercent={{ $volume.minFreeSpacePercent }} \
-                -ip=${POD_NAME}.{{ include "seaweedfs.componentName" (list $ $volumeName) }}.{{ $.Release.Namespace }} \
+                -ip=${POD_NAME}.{{ include "seaweedfs.componentName" (list $ $volumeName) }}.{{ include "seaweedfs.namespace" $ }} \
                 -compactionMBps={{ $volume.compactionMBps }} \
                 -master={{ include "seaweedfs.masterServerArg" $ }} \
                 {{- range $volume.extraArgs }}
@@ -278,7 +282,7 @@ spec:
             httpGet:
               path: {{ $volume.readinessProbe.httpGet.path }}
               port: {{ $volume.port }}
-              scheme: {{ $volume.readinessProbe.httpGet.scheme }}
+              scheme: {{ if include "seaweedfs.volumeHttps" $ }}HTTPS{{ else }}{{ $volume.readinessProbe.httpGet.scheme }}{{ end }}
             initialDelaySeconds: {{ $volume.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ $volume.readinessProbe.periodSeconds }}
             successThreshold: {{ $volume.readinessProbe.successThreshold }}
@@ -290,7 +294,7 @@ spec:
             httpGet:
               path: {{ $volume.livenessProbe.httpGet.path }}
               port: {{ $volume.port }}
-              scheme: {{ $volume.livenessProbe.httpGet.scheme }}
+              scheme: {{ if include "seaweedfs.volumeHttps" $ }}HTTPS{{ else }}{{ $volume.livenessProbe.httpGet.scheme }}{{ end }}
             initialDelaySeconds: {{ $volume.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ $volume.livenessProbe.periodSeconds }}
             successThreshold: {{ $volume.livenessProbe.successThreshold }}
@@ -367,8 +371,8 @@ spec:
      {{- end }}
      {{- if include "seaweedfs.securityConfigEnabled" $ }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" $ }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" $ }}-security-config
      {{- end }}
      {{- if $.Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert

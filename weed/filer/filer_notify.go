@@ -19,6 +19,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/notification"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
@@ -29,6 +30,8 @@ func (f *Filer) NotifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 
 func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) *filer_pb.SubscribeMetadataResponse {
 	if metadataEventsSuppressed(ctx) {
+		// The entry's stamp stays in flight for the covering event the
+		// caller emits itself (the rename handler does).
 		return nil
 	}
 
@@ -44,6 +47,10 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 	// println("fullpath:", fullpath)
 
 	if strings.HasPrefix(fullpath, SystemLogDir) {
+		// No event covers this write: release its stamp.
+		if newEntry != nil {
+			f.metaLogInflight.release(newEntry.CommitTsNs)
+		}
 		return nil
 	}
 	foundSelf := false
@@ -56,25 +63,24 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 		signatures = append(signatures, f.Signature)
 	}
 
-	event := f.newMetadataEvent(oldEntry, newEntry, deleteChunks, isFromOtherCluster, signatures)
+	event := f.newMetadataEvent(oldEntry, newEntry, deleteChunks, isFromOtherCluster, signatures, f.stampOf(newEntry))
 	// Clear the stamp after the buffer append below - deliberately also on
 	// append failure (see the metaLogInflight comment).
 	defer f.metaLogInflight.done(event.TsNs)
 	eventNotification := event.EventNotification
 
-	if notification.Queue != nil {
-		glog.V(3).Infof("notifying entry update %v", fullpath)
-		if err := notification.Queue.SendMessage(fullpath, eventNotification); err != nil {
-			// throw message
-			glog.Error(err)
+	if !isNotificationWebhooksConf(oldEntry, newEntry) {
+		if notification.Queue != nil {
+			glog.V(3).Infof("notifying entry update %v", fullpath)
+			if err := notification.Queue.SendMessage(fullpath, eventNotification); err != nil {
+				// throw message
+				glog.Error(err)
+			}
 		}
+		f.sendToNotificationWebhooks(fullpath, eventNotification)
 	}
 
 	f.logMetaEvent(ctx, event)
-	// Record the commit timestamp so a peer replay ordered by the entry lock
-	// this mutation may still be under sees the local change, including as a
-	// tombstone after the entry itself is gone.
-	f.noteCommittedEvent(event)
 	if sink := metadataEventSinkFromContext(ctx); sink != nil {
 		sink.Record(event)
 	}
@@ -134,6 +140,28 @@ func (t *metaLogInflight) done(tsNs int64) {
 	}
 }
 
+// inFlight reports whether tsNs is a pre-commit stamp still awaiting its
+// buffer append — how an event adopts the stamp an entry carries.
+func (t *metaLogInflight) inFlight(tsNs int64) bool {
+	t.Lock()
+	defer t.Unlock()
+	return t.stamped[tsNs] > 0
+}
+
+// release drops a stamp whose event will never be appended.
+func (t *metaLogInflight) release(tsNs int64) {
+	if tsNs == 0 {
+		return
+	}
+	t.Lock()
+	defer t.Unlock()
+	if t.stamped[tsNs] <= 1 {
+		delete(t.stamped, tsNs)
+	} else {
+		t.stamped[tsNs]--
+	}
+}
+
 // minTsNs returns the oldest in-flight stamp, or 0 when nothing is in flight.
 func (t *metaLogInflight) minTsNs() int64 {
 	t.Lock()
@@ -180,11 +208,16 @@ func (f *Filer) LocalFlushedThroughTsNs(nowNs int64) int64 {
 }
 
 // LocalDeliveredThroughTsNs caps a delivery-freshness claim (an idle
-// heartbeat's timestamp) by the oldest in-flight stamp: a stamped-but-
-// unappended event has not been streamed to anyone, and a peer aggregator
-// turns the claim into its delivery low-watermark.
+// heartbeat's timestamp, a listing snapshot) by the oldest in-flight stamp: a
+// stamped-but-unappended event has not been streamed to anyone, nor is its
+// write certain to be visible yet, and a peer aggregator turns the claim into
+// its delivery low-watermark.
 func (f *Filer) LocalDeliveredThroughTsNs(nowNs int64) int64 {
-	return f.metaLogInflight.claimThrough(nowNs)
+	claim := f.metaLogInflight.claimThrough(nowNs)
+	// export how far this filer's delivery claim trails the clock (peer
+	// aggregators turn the claim into their delivery low-watermark)
+	stats.FilerMetaDeliveryClaimAgeSeconds.Set(float64(nowNs-claim) / 1e9)
+	return claim
 }
 
 // StampMetaLogInflightForTest and DoneMetaLogInflightForTest let tests in
@@ -197,7 +230,41 @@ func (f *Filer) DoneMetaLogInflightForTest(tsNs int64) {
 	f.metaLogInflight.done(tsNs)
 }
 
-func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) *filer_pb.SubscribeMetadataResponse {
+// stampEntryCommitTsNs assigns the mutation's event timestamp to the entry
+// pre-write so the emitted event and stored version carry the same commit
+// time. The stamp stays in flight until the event appends; a write no event
+// covers must release it via releaseEntryCommitTsNs.
+func (f *Filer) stampEntryCommitTsNs(entry *Entry) int64 {
+	tsNs := f.metaLogInflight.stamp()
+	entry.CommitTsNs = tsNs
+	return tsNs
+}
+
+// releaseEntryCommitTsNs drops a stamp no event will adopt.
+func (f *Filer) releaseEntryCommitTsNs(tsNs int64) {
+	f.metaLogInflight.release(tsNs)
+}
+
+// StampEntryCommitTsNs/ReleaseEntryCommitTsNs expose the lifecycle to the
+// filer server's mutation paths.
+func (f *Filer) StampEntryCommitTsNs(entry *Entry) int64 {
+	return f.stampEntryCommitTsNs(entry)
+}
+
+func (f *Filer) ReleaseEntryCommitTsNs(tsNs int64) {
+	f.metaLogInflight.release(tsNs)
+}
+
+// stampOf returns the event's timestamp: the entry's in-flight stamp, or a
+// fresh one for events with no newly stamped entry (deletes).
+func (f *Filer) stampOf(newEntry *Entry) int64 {
+	if newEntry != nil && f.metaLogInflight.inFlight(newEntry.CommitTsNs) {
+		return newEntry.CommitTsNs
+	}
+	return f.metaLogInflight.stamp()
+}
+
+func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32, tsNs int64) *filer_pb.SubscribeMetadataResponse {
 	if oldEntry == nil && newEntry == nil {
 		return nil
 	}
@@ -224,20 +291,35 @@ func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFrom
 			Signatures:         signatures,
 		},
 		// In flight until appended to the local log buffer (see metaLogInflight).
-		TsNs: f.metaLogInflight.stamp(),
+		TsNs:         tsNs,
+		MutationTsNs: tsNs,
+	}
+}
+
+// notifyRenameTarget wakes the subscribers of a move's destination directory,
+// which the partition key (the source directory) does not cover.
+func notifyRenameTarget(logBuffer *log_buffer.LogBuffer, event *filer_pb.SubscribeMetadataResponse) {
+	if target := filer_pb.MetadataEventTargetDirectory(event); target != event.Directory {
+		logBuffer.NotifySubscribers([]byte(target))
 	}
 }
 
 func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetadataResponse) {
 	data, err := proto.Marshal(event)
 	if err != nil {
-		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %+v: %v", event, err)
+		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
 		return
 	}
 
-	if err := f.LocalMetaLogBuffer.AddDataToBuffer([]byte(event.Directory), data, event.TsNs); err != nil {
+	tsNs, err := f.LocalMetaLogBuffer.AddDataToBufferAndGetTs([]byte(event.Directory), data, event.TsNs)
+	if err != nil {
 		glog.Errorf("failed to add data to log buffer for %s: %v", event.Directory, err)
+		return
 	}
+	notifyRenameTarget(f.LocalMetaLogBuffer, event)
+	// The in-memory copy now carries the position the stream assigns it, the
+	// same value subscribers will see delivered.
+	event.TsNs = tsNs
 
 }
 

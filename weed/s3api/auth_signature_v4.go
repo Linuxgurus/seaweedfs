@@ -25,7 +25,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
-	"io"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -46,15 +46,14 @@ import (
 )
 
 func (iam *IdentityAccessManagement) reqSignatureV4Verify(r *http.Request) (*Identity, s3err.ErrorCode) {
-	switch {
-	case isRequestSignatureV4(r):
-		identity, _, errCode := iam.doesSignatureMatch(r)
-		return identity, errCode
-	case isRequestPresignedSignatureV4(r):
-		identity, _, errCode := iam.doesPresignedSignatureMatch(r)
+	if !isRequestSignatureV4(r) && !isRequestPresignedSignatureV4(r) {
+		return nil, s3err.ErrAccessDenied
+	}
+	identity, _, _, authInfo, errCode := iam.verifyV4Signature(r, false)
+	if errCode != s3err.ErrNone {
 		return identity, errCode
 	}
-	return nil, s3err.ErrAccessDenied
+	return identity, bindSignedPayload(r, authInfo.HashedPayload)
 }
 
 // Constants specific to this file
@@ -74,22 +73,19 @@ func streamHashRequestBody(r *http.Request, sizeLimit int64) (string, error) {
 		return emptySHA256, nil
 	}
 
-	limitedReader := io.LimitReader(r.Body, sizeLimit)
-	hasher := sha256.New()
-	var bodyBuffer bytes.Buffer
-
-	// Use io.Copy with an io.MultiWriter to hash and buffer the body simultaneously.
-	if _, err := io.Copy(io.MultiWriter(hasher, &bodyBuffer), limitedReader); err != nil {
+	body, err := readRequestBody(r, sizeLimit)
+	if err != nil {
 		return "", err
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(bodyBuffer.Bytes()))
+	(&signedPayloadBody{data: bytes.NewReader(body)}).wrap(&r.Body)
 
-	if bodyBuffer.Len() == 0 {
+	if len(body) == 0 {
 		return emptySHA256, nil
 	}
 
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // getContentSha256Cksum retrieves the "x-amz-content-sha256" header value.
@@ -374,35 +370,29 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 	if trustedPeer {
 		forwardedPrefix = r.Header.Get("X-Forwarded-Prefix")
 	}
+	// 9. Candidate paths: the escaped path as sent, then the decoded path that
+	// an S3 client encodes once when signing; each with the forwarded prefix first.
+	signaturePaths := []string{pathForSignature}
+	if decodedPath, decodeErr := url.PathUnescape(pathForSignature); decodeErr == nil && decodedPath != pathForSignature {
+		signaturePaths = append(signaturePaths, decodedPath)
+	}
+	if forwardedPrefix != "" {
+		prefixedPaths := make([]string, 0, 2*len(signaturePaths))
+		for _, p := range signaturePaths {
+			prefixedPaths = append(prefixedPaths, buildPathWithForwardedPrefix(forwardedPrefix, p))
+		}
+		signaturePaths = append(prefixedPaths, signaturePaths...)
+	}
 	var matchedHost string
+hostCandidates:
 	for i, hostCandidate := range extractHostHeaderCandidates(r, iam.externalHost) {
 		if i > 0 && !replaceSignedHostHeader(extractedSignedHeaders, hostCandidate) {
 			break
 		}
-
-		// 9. Verify with the X-Forwarded-Prefix path first
-		if forwardedPrefix != "" {
-			cleanedPath := buildPathWithForwardedPrefix(forwardedPrefix, pathForSignature)
-			calculatedSignature, errCode = verify(cleanedPath)
-			if errCode == s3err.ErrNone {
+		for _, p := range signaturePaths {
+			if calculatedSignature, errCode = verify(p); errCode == s3err.ErrNone {
 				matchedHost = hostCandidate
-				break
-			}
-		}
-
-		// 10. Verify with the original path
-		calculatedSignature, errCode = verify(pathForSignature)
-		if errCode == s3err.ErrNone {
-			matchedHost = hostCandidate
-			break
-		}
-
-		// 11. Retry with decoded path if signature used raw path encoding
-		if decodedPath, decodeErr := url.PathUnescape(pathForSignature); decodeErr == nil && decodedPath != pathForSignature {
-			calculatedSignature, errCode = verify(decodedPath)
-			if errCode == s3err.ErrNone {
-				matchedHost = hostCandidate
-				break
+				break hostCandidates
 			}
 		}
 	}
@@ -412,6 +402,9 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 		// catalog's vended sessions name it (never a key re-read from the request).
 		// Recorded before the retarget check so that refusal names it too.
 		s3_constants.RecordAccessKeyId(r.Context(), cred.AccessKey)
+		if found {
+			s3_constants.RecordStoredAccessKeyId(r.Context(), cred.AccessKey, cred.SecretKey)
+		}
 		if signedBucket, ok := bucketFromVirtualHost(matchedHost, iam.domain); ok {
 			if routedBucket, _ := s3_constants.GetBucketAndObject(r); routedBucket != "" && routedBucket != signedBucket {
 				glog.V(2).Infof("reject %s %s: signed host %q implies bucket %q but routed to %q",
@@ -496,6 +489,19 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 		return nil, nil, s3err.ErrExpiredToken
 	}
 
+	// A session the table catalog vended for a static access key is bound to
+	// that key, as a role session is bound to its role's ID: deleting or
+	// deactivating the key, or deleting or disabling its identity, ends the
+	// session at its next request instead of at its expiry. Sessions minted
+	// before the binding existed carry only the audit field and stay unbound.
+	if sessionInfo.IdentityProvider == icebergVendedCredentialsProvider && sessionInfo.BoundAccessKeyId != "" {
+		if errCode := iam.vendedSessionKeyLive(sessionInfo.ExternalUserId, sessionInfo.BoundAccessKeyId, sessionInfo.BoundAccessKeyFingerprint); errCode != s3err.ErrNone {
+			glog.V(2).Infof("vended STS session %s: identity %q or the access key it was vended for is gone, disabled or inactive",
+				sessionInfo.SessionId, sessionInfo.ExternalUserId)
+			return nil, nil, errCode
+		}
+	}
+
 	// Validate required credential fields
 	if sessionInfo.Credentials.SecretAccessKey == "" {
 		glog.Warningf("STS service returned empty SecretAccessKey in credentials")
@@ -523,6 +529,20 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 	claims := make(map[string]interface{}, len(sessionInfo.RequestContext))
 	for k, v := range sessionInfo.RequestContext {
 		claims[k] = v
+	}
+	// Token attributes reach the request context; only the bearer path asserts trusted issuers.
+	delete(claims, "seaweed:oidc-issuers")
+	// The session's user is the one it was issued to, never a claim the
+	// identity provider forwarded.
+	if sessionInfo.ExternalUserId != "" {
+		claims["aws:username"] = sessionInfo.ExternalUserId
+	} else {
+		delete(claims, "aws:username")
+	}
+	if sessionInfo.ParentUser != "" {
+		claims["aws:userid"] = sessionInfo.ParentUser
+	} else {
+		delete(claims, "aws:userid")
 	}
 
 	// Key the principal on the OIDC subject so a session resolves to the same
@@ -552,6 +572,38 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 	glog.V(2).Infof("Successfully validated STS session token for principal: %s, assumed role user: %s",
 		sessionInfo.Principal, sessionInfo.AssumedRoleUser)
 	return identity, cred, s3err.ErrNone
+}
+
+// vendedSessionKeyLive answers ErrNone while owner is a known, enabled
+// identity holding accessKey as an active, unexpired credential, and
+// ErrInvalidAccessKeyID (as for an unknown key) otherwise. A fingerprint set
+// at mint time must still match, so a key re-created under the same id does
+// not revive sessions the deleted original had carried. One map lookup under
+// the read lock.
+func (iam *IdentityAccessManagement) vendedSessionKeyLive(owner, accessKey, fingerprint string) s3err.ErrorCode {
+	if owner == "" || accessKey == "" {
+		return s3err.ErrInvalidAccessKeyID
+	}
+	fingerprintKey := iam.stsSigningKey()
+	iam.m.RLock()
+	defer iam.m.RUnlock()
+	identity, ok := iam.nameToIdentity[owner]
+	if !ok || identity == nil || identity.Disabled {
+		return s3err.ErrInvalidAccessKeyID
+	}
+	for _, credential := range identity.Credentials {
+		if credential == nil || credential.AccessKey != accessKey {
+			continue
+		}
+		if credential.Status == iamAccessKeyStatusInactive || credential.isCredentialExpired() {
+			return s3err.ErrInvalidAccessKeyID
+		}
+		if fingerprint != "" && s3_constants.StoredCredentialFingerprint(fingerprintKey, accessKey, credential.SecretKey) != fingerprint {
+			return s3err.ErrInvalidAccessKeyID
+		}
+		return s3err.ErrNone
+	}
+	return s3err.ErrInvalidAccessKeyID
 }
 
 // calculateAndVerifySignature contains the core logic for creating the canonical request,
@@ -613,8 +665,12 @@ func extractV4AuthInfoFromHeader(r *http.Request) (*v4AuthInfo, s3err.ErrorCode)
 
 	hashedPayload := getContentSha256Cksum(r)
 	if signV4Values.Credential.scope.service != "s3" && hashedPayload == emptySHA256 && r.Body != nil {
+		sizeLimit := s3_constants.GetRequestBodyLimitFromContext(r, iamRequestBodyLimit)
 		var hashErr error
-		hashedPayload, hashErr = streamHashRequestBody(r, iamRequestBodyLimit)
+		hashedPayload, hashErr = streamHashRequestBody(r, sizeLimit)
+		if errors.Is(hashErr, errRequestBodyTooLarge) {
+			return nil, s3err.ErrEntityTooLarge
+		}
 		if hashErr != nil {
 			return nil, s3err.ErrInternalError
 		}
@@ -874,6 +930,7 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(ctx context.Cont
 		return nil, s3err.ErrSignatureDoesNotMatch
 	}
 	s3_constants.RecordAccessKeyId(ctx, cred.AccessKey)
+	s3_constants.RecordStoredAccessKeyId(ctx, cred.AccessKey, cred.SecretKey)
 	return identity, s3err.ErrNone
 }
 
@@ -1076,19 +1133,29 @@ func bucketFromVirtualHost(host, domainConfig string) (string, bool) {
 	if domainConfig == "" {
 		return "", false
 	}
-	h := host
+	host = strings.ToLower(host)
+	hostWithoutPort := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
-		h = hh
+		hostWithoutPort = hh
 	}
-	h = strings.ToLower(h)
+	// The router matches a domain that names a port against the full host:port.
+	hostFor := func(domain string) string {
+		if strings.Contains(domain, ":") {
+			return host
+		}
+		return hostWithoutPort
+	}
 	pathStyleDomains, virtualHostDomains := classifyDomainNames(strings.Split(domainConfig, ","))
 	for _, domain := range pathStyleDomains {
-		if h == strings.ToLower(strings.TrimSpace(domain)) {
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		if hostFor(domain) == domain {
 			return "", false
 		}
 	}
 	for _, domain := range virtualHostDomains {
-		suffix := "." + strings.ToLower(strings.TrimSpace(domain))
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		h := hostFor(domain)
+		suffix := "." + domain
 		if strings.HasSuffix(h, suffix) {
 			bucket := h[:len(h)-len(suffix)]
 			if bucket != "" {

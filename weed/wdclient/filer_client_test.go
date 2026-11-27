@@ -1,13 +1,20 @@
 package wdclient
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func newTestFilerClient(addrs ...pb.ServerAddress) *FilerClient {
@@ -18,6 +25,7 @@ func newTestFilerClient(addrs ...pb.ServerAddress) *FilerClient {
 	return &FilerClient{
 		filerAddresses: addrs,
 		filerHealth:    health,
+		vidMapClient:   newVidMapClient(nil, "", 0),
 	}
 }
 
@@ -101,6 +109,86 @@ func TestApplyDiscoveredFilersNoChangeIsNoop(t *testing.T) {
 
 	if fc.filerHealth[0] != originalHealthA || fc.filerHealth[1] != originalHealthB {
 		t.Errorf("no-op refresh should not reallocate health entries")
+	}
+}
+
+func TestApplyDiscoveredFilersKeepsFilerListedWithGrpcPort(t *testing.T) {
+	local := pb.ServerAddress("10.0.0.1:8888")
+	registered := pb.ServerAddress("10.0.0.1:8888.18888")
+	peers := []pb.ServerAddress{"10.0.0.2:8888.18888", "10.0.0.3:8888.18888"}
+
+	for i := 0; i < 200; i++ {
+		fc := newTestFilerClient(local)
+		health := fc.filerHealth[0]
+		fc.applyDiscoveredFilers(map[pb.ServerAddress]struct{}{
+			registered: {},
+			peers[0]:   {},
+			peers[1]:   {},
+		})
+
+		if got := fc.GetCurrentFiler(); got != registered {
+			t.Fatalf("current filer = %s, want %s", got, registered)
+		}
+		if fc.filerHealth[0] != health {
+			t.Fatalf("local filer lost its health entry")
+		}
+		if got := filerAddressList(fc); len(got) != 3 {
+			t.Fatalf("expected 3 filers, got %v", got)
+		}
+	}
+}
+
+func TestApplyDiscoveredFilersAdoptsAddressForm(t *testing.T) {
+	a := pb.ServerAddress("10.0.0.1:8888")
+	b := pb.ServerAddress("10.0.0.2:8888.18888")
+
+	fc := newTestFilerClient(a, b)
+	atomic.StoreInt32(&fc.filerIndex, 1)
+	fc.applyDiscoveredFilers(map[pb.ServerAddress]struct{}{
+		"10.0.0.1:8888.18888": {},
+		b:                     {},
+	})
+
+	got := filerAddressList(fc)
+	if len(got) != 2 || got[0] != "10.0.0.1:8888.18888" || got[1] != b {
+		t.Fatalf("expected [10.0.0.1:8888.18888 %s], got %v", b, got)
+	}
+	if idx := atomic.LoadInt32(&fc.filerIndex); idx != 1 {
+		t.Errorf("filerIndex = %d, want 1", idx)
+	}
+	fc.RecordFilerFailure(a)
+	if atomic.LoadInt32(&fc.filerHealth[0].failureCount) != 1 {
+		t.Errorf("failure recorded under the old address form was dropped")
+	}
+}
+
+func TestApplyDiscoveredFilersPrunesFilerWithOtherGrpcPort(t *testing.T) {
+	old := pb.ServerAddress("10.0.0.1:8888")
+	moved := pb.ServerAddress("10.0.0.1:8888.19999")
+
+	fc := newTestFilerClient(old)
+	fc.applyDiscoveredFilers(map[pb.ServerAddress]struct{}{moved: {}})
+
+	if got := filerAddressList(fc); len(got) != 1 || got[0] != moved {
+		t.Fatalf("expected [%s], got %v", moved, got)
+	}
+}
+
+func TestOnPeerUpdateMatchesFilerListedWithGrpcPort(t *testing.T) {
+	local := pb.ServerAddress("10.0.0.1:8888")
+	registered := pb.ServerAddress("10.0.0.1:8888.18888")
+	peer := pb.ServerAddress("10.0.0.2:8888.18888")
+
+	fc := newTestFilerClient(local)
+	fc.OnPeerUpdate(filerUpdate(registered, true), time.Now())
+	if got := filerAddressList(fc); len(got) != 1 || got[0] != registered {
+		t.Fatalf("expected [%s] after the join, got %v", registered, got)
+	}
+
+	fc.OnPeerUpdate(filerUpdate(peer, true), time.Now())
+	fc.OnPeerUpdate(filerUpdate(registered, false), time.Now())
+	if got := filerAddressList(fc); len(got) != 1 || got[0] != peer {
+		t.Fatalf("expected [%s] after the leave, got %v", peer, got)
 	}
 }
 
@@ -275,4 +363,329 @@ func TestOnPeerUpdateRejoinBumpsGeneration(t *testing.T) {
 	if got := filerAddressList(fc); len(got) != 1 || got[0] != old {
 		t.Fatalf("rejoined filer was pruned by an in-flight snapshot: %v", got)
 	}
+}
+
+// stallingFiler answers LookupVolume only when the call is abandoned.
+type stallingFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+}
+
+func (s *stallingFiler) LookupVolume(ctx context.Context, _ *filer_pb.LookupVolumeRequest) (*filer_pb.LookupVolumeResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func startStallingFiler(t *testing.T) pb.ServerAddress {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	filer_pb.RegisterSeaweedFilerServer(grpcServer, &stallingFiler{})
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(grpcServer.Stop)
+
+	_, port, _ := net.SplitHostPort(lis.Addr().String())
+	return pb.ServerAddress(fmt.Sprintf("127.0.0.1:0.%s", port))
+}
+
+// lapsedDeadlineCtx mimics the moment after a caller's deadline has passed but
+// before the runtime marks the context done.
+type lapsedDeadlineCtx struct{ context.Context }
+
+func (lapsedDeadlineCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+func (lapsedDeadlineCtx) Done() <-chan struct{}       { return nil }
+func (lapsedDeadlineCtx) Err() error                  { return nil }
+
+// A caller giving up must not count as a filer failure, the filer's own timeout must.
+func TestLookupVolumeIdsCountsOnlyFilerFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		callerCtx    func() (context.Context, context.CancelFunc)
+		grpcTimeout  time.Duration
+		wantErr      error
+		wantFailures int32
+	}{
+		{
+			name: "caller cancelled",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(50*time.Millisecond, cancel)
+				return ctx, cancel
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.Canceled,
+			wantFailures: 0,
+		},
+		{
+			name: "caller deadline",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 50*time.Millisecond)
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.DeadlineExceeded,
+			wantFailures: 0,
+		},
+		{
+			name: "caller deadline already elapsed",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return lapsedDeadlineCtx{context.Background()}, func() {}
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.DeadlineExceeded,
+			wantFailures: 0,
+		},
+		{
+			name: "filer timeout",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			grpcTimeout:  50 * time.Millisecond,
+			wantFailures: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc := newTestFilerClient(startStallingFiler(t))
+			fc.grpcDialOption = grpc.WithTransportCredentials(insecure.NewCredentials())
+			fc.grpcTimeout = tt.grpcTimeout
+			fc.maxRetries = 1
+			fc.failureThreshold = 3
+			fc.resetTimeout = time.Minute
+
+			ctx, cancel := tt.callerCtx()
+			defer cancel()
+			_, err := (&filerVolumeProvider{filerClient: fc}).LookupVolumeIds(ctx, []string{"4"})
+
+			if err == nil {
+				t.Fatal("lookup against a stalling filer succeeded")
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
+			}
+			if got := atomic.LoadInt32(&fc.filerHealth[0].failureCount); got != tt.wantFailures {
+				t.Errorf("failureCount = %d, want %d", got, tt.wantFailures)
+			}
+		})
+	}
+}
+
+func TestOnVolumeLocationChangeDropsRetiredServer(t *testing.T) {
+	fc := newTestFilerClient()
+	retired := Location{Url: "retired:8080"}
+	live := Location{Url: "live:8080"}
+	fc.addLocation(7, retired)
+	fc.addLocation(7, live)
+	fc.addLocation(8, retired)
+
+	fc.OnVolumeLocationChange(retired, nil, []uint32{7, 8, 9})
+
+	locations, found := fc.GetLocations(7)
+	if !found || len(locations) != 1 || locations[0].Url != live.Url {
+		t.Errorf("vid 7 kept only the surviving location: found=%v %v", found, locations)
+	}
+	if locations, found := fc.GetLocations(8); found && len(locations) > 0 {
+		t.Errorf("vid 8 lost its last location but stayed cached: %v", locations)
+	}
+}
+
+func TestOnVidMapResetClearsCachedLocations(t *testing.T) {
+	fc := newTestFilerClient()
+	fc.addLocation(7, Location{Url: "live:8080"})
+
+	fc.OnVidMapReset()
+
+	if locations, found := fc.GetLocations(7); found && len(locations) > 0 {
+		t.Errorf("vid 7 survived the reset: %v", locations)
+	}
+}
+
+func TestOnVolumeLocationChangeReaddClearsTombstone(t *testing.T) {
+	retired := Location{Url: "retired:8080"}
+	fc := newTestFilerClient()
+	fc.vidMapClient = newVidMapClient(&testLocationProvider{
+		locations: map[string][]Location{"5": {retired}},
+	}, "", 0)
+	ctx := context.Background()
+
+	fc.OnVolumeLocationChange(retired, nil, []uint32{5})
+	if locations, _ := fc.LookupVolumeIdsWithFallback(ctx, []string{"5"}); len(locations["5"]) > 0 {
+		t.Fatalf("removed location still served: %v", locations)
+	}
+
+	fc.OnVolumeLocationChange(retired, []uint32{5}, nil)
+	locations, err := fc.LookupVolumeIdsWithFallback(ctx, []string{"5"})
+	if err != nil || len(locations["5"]) != 1 || locations["5"][0].Url != retired.Url {
+		t.Fatalf("re-added location not served again: %v, err %v", locations, err)
+	}
+}
+
+func hookedFilerClient(mc *MasterClient, provider VolumeLocationProvider) *FilerClient {
+	fc := newTestFilerClient()
+	fc.vidMapClient = newVidMapClient(provider, "", 0)
+	mc.SetOnVolumeLocationChangeFn(fc.OnVolumeLocationChange)
+	mc.SetOnVidMapResetFn(fc.OnVidMapReset)
+	return fc
+}
+
+func expectServed(t *testing.T, fc *FilerClient, vid string, want ...Location) {
+	t.Helper()
+	locations, err := fc.LookupVolumeIdsWithFallback(context.Background(), []string{vid})
+	got := locations[vid]
+	if len(want) == 0 {
+		if len(got) != 0 {
+			t.Fatalf("volume %s still served from %v", vid, got)
+		}
+		return
+	}
+	if err != nil || len(got) != len(want) {
+		t.Fatalf("volume %s served from %v, err %v, want %v", vid, got, err, want)
+	}
+	for i := range want {
+		if got[i].Url != want[i].Url {
+			t.Fatalf("volume %s served from %v, want %v", vid, got, want)
+		}
+	}
+}
+
+// ec.decode mounts the regular copy on a shard server before the shards come
+// off it, so the later shard removal must leave that copy servable.
+func TestDecodedCopyOutlivesShardRemoval(t *testing.T) {
+	a := Location{Url: "a:8080"}
+	b := Location{Url: "b:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {a, b}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	pushVolumeLocation(mc, a.Url, nil, nil, []uint32{5}, nil)
+	pushVolumeLocation(mc, b.Url, nil, nil, []uint32{5}, nil)
+	expectServed(t, fc, "5", a, b)
+
+	pushVolumeLocation(mc, a.Url, []uint32{5}, nil, nil, nil)
+	pushVolumeLocation(mc, b.Url, nil, nil, nil, []uint32{5})
+	pushVolumeLocation(mc, a.Url, nil, nil, nil, []uint32{5})
+
+	provider.locations["5"] = []Location{a, b}
+	expectServed(t, fc, "5", a)
+}
+
+// ec.encode registers the shards before the regular copy is deleted from the
+// same server, so the server stays a read candidate for the ec volume.
+func TestShardServerOutlivesRegularRemoval(t *testing.T) {
+	a := Location{Url: "a:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {a}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	pushVolumeLocation(mc, a.Url, []uint32{5}, nil, nil, nil)
+	expectServed(t, fc, "5", a)
+
+	pushVolumeLocation(mc, a.Url, nil, nil, []uint32{5}, nil)
+	pushVolumeLocation(mc, a.Url, nil, []uint32{5}, nil, nil)
+
+	expectServed(t, fc, "5", a)
+}
+
+// The filer caches shard servers like regular copies, so the last shard
+// leaving a server retires it from the cache too.
+func TestRetiredShardServerLeavesCache(t *testing.T) {
+	a := Location{Url: "a:8080"}
+	b := Location{Url: "b:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {a, b}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	pushVolumeLocation(mc, a.Url, nil, nil, []uint32{5}, nil)
+	pushVolumeLocation(mc, b.Url, nil, nil, []uint32{5}, nil)
+	expectServed(t, fc, "5", a, b)
+
+	pushVolumeLocation(mc, a.Url, nil, nil, nil, []uint32{5})
+
+	if cached, _ := fc.GetLocations(5); len(cached) != 1 || cached[0].Url != b.Url {
+		t.Fatalf("cache holds %v, want only %v", cached, b)
+	}
+	fc.InvalidateCache("5,01")
+	expectServed(t, fc, "5", b)
+}
+
+// A volume moved to another server while the old one stays up: the old
+// server would proxy the read and succeed, so no failed read would ever
+// evict it. The pushed removal has to.
+func TestMovedVolumeLeavesOldServer(t *testing.T) {
+	old := Location{Url: "old:8080"}
+	moved := Location{Url: "new:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {old}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	pushVolumeLocation(mc, old.Url, []uint32{5}, nil, nil, nil)
+	expectServed(t, fc, "5", old)
+
+	pushVolumeLocation(mc, moved.Url, []uint32{5}, nil, nil, nil)
+	pushVolumeLocation(mc, old.Url, nil, []uint32{5}, nil, nil)
+
+	provider.locations["5"] = []Location{old, moved}
+	expectServed(t, fc, "5", moved)
+}
+
+// A server back at the same URL after a master reconnect is re-told as an
+// add, which lifts the fence its earlier removal left.
+func TestReconnectReplayLiftsFence(t *testing.T) {
+	a := Location{Url: "a:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {a}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	pushVolumeLocation(mc, a.Url, []uint32{5}, nil, nil, nil)
+	pushVolumeLocation(mc, a.Url, nil, []uint32{5}, nil, nil)
+	expectServed(t, fc, "5")
+
+	mc.resetVidMap()
+	pushVolumeLocation(mc, a.Url, []uint32{5}, nil, nil, nil)
+
+	expectServed(t, fc, "5", a)
+}
+
+// A gateway that reconnects to a new leader drops its cache and refills it
+// from a filer that may still answer with the old leader's view, a server
+// that died with it included. The new leader never knew that server, so it
+// never pushes its removal; its re-told adds are what replace the refill.
+func TestLeaderChangeAddsReplaceStaleRefill(t *testing.T) {
+	dead := Location{Url: "dead:8080"}
+	live := Location{Url: "live:8080"}
+	other := Location{Url: "other:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {dead, live}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	fc.masterClient = mc
+	pushVolumeLocation(mc, dead.Url, []uint32{5}, nil, nil, nil)
+	pushVolumeLocation(mc, live.Url, []uint32{5}, nil, nil, nil)
+
+	mc.resetVidMap()
+	expectServed(t, fc, "5", dead, live)
+
+	pushVolumeLocation(mc, live.Url, []uint32{5}, nil, nil, nil)
+	expectServed(t, fc, "5", live)
+
+	pushVolumeLocation(mc, other.Url, []uint32{5}, nil, nil, nil)
+	expectServed(t, fc, "5", live, other)
+}
+
+// A master add that lands between a lookup's second cache check and its query
+// to a filer that has not caught up must not be undone by that filer's answer.
+func TestConfirmDuringLookupIsNotUndone(t *testing.T) {
+	dead := Location{Url: "dead:8080"}
+	live := Location{Url: "live:8080"}
+	provider := &testLocationProvider{locations: map[string][]Location{"5": {dead, live}}}
+	mc := moveClient()
+	fc := hookedFilerClient(mc, provider)
+	fc.masterClient = mc
+	mc.resetVidMap()
+
+	afterLookupRecheck = func() {
+		afterLookupRecheck = nil
+		pushVolumeLocation(mc, live.Url, []uint32{5}, nil, nil, nil)
+	}
+	t.Cleanup(func() { afterLookupRecheck = nil })
+	if _, err := fc.LookupVolumeIdsWithFallback(context.Background(), []string{"5"}); err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+
+	expectServed(t, fc, "5", live)
 }

@@ -42,6 +42,8 @@ type FilerBackupOptions struct {
 	timeAgo             *time.Duration
 	retentionDays       *int
 	initialSnapshot     *bool
+	concurrency         *int
+	s3FlattenVersions   *bool
 }
 
 var (
@@ -65,6 +67,8 @@ func init() {
 	filerBackupOptions.disableErrorRetry = cmdFilerBackup.Flag.Bool("disableErrorRetry", false, "disables errors retry, only logs will print")
 	filerBackupOptions.ignore404Error = cmdFilerBackup.Flag.Bool("ignore404Error", true, "ignore 404 errors from filer")
 	filerBackupOptions.initialSnapshot = cmdFilerBackup.Flag.Bool("initialSnapshot", false, "before subscribing to metadata updates, walk the live filer tree under -filerPath and seed the destination, then subscribe from the walk-start timestamp so concurrent changes are still captured. Runs on every start when -timeAgo is 0 and overwrites the saved checkpoint, so it also re-seeds a reinitialized destination. Remove it once the backup is caught up, otherwise it re-walks the whole tree on each restart.")
+	filerBackupOptions.concurrency = cmdFilerBackup.Flag.Int("concurrency", DefaultConcurrencyLimit, "the maximum number of files that will be backed up concurrently.")
+	filerBackupOptions.s3FlattenVersions = cmdFilerBackup.Flag.Bool("s3.flattenVersions", false, "mirror the current S3 view of versioned buckets: under each <key>.versions directory only the latest version is written to <key>, a latest delete marker or the removal of the last version deletes <key> when -doDeleteFiles is set, and version files are not mirrored individually")
 }
 
 var cmdFilerBackup = &Command{
@@ -105,10 +109,12 @@ func runFilerBackup(cmd *Command, args []string) bool {
 
 	clientId := util.RandomInt32()
 	var clientEpoch int32
+	var resumeTsNs int64
 
 	for {
 		clientEpoch++
-		err := doFilerBackup(grpcDialOption, &filerBackupOptions, reExcludeFileName, excludeFileNames, excludePathPatterns, clientId, clientEpoch)
+		var err error
+		resumeTsNs, err = doFilerBackup(grpcDialOption, &filerBackupOptions, reExcludeFileName, excludeFileNames, excludePathPatterns, clientId, clientEpoch, resumeTsNs)
 		if err != nil {
 			glog.Errorf("backup from %s: %v", *filerBackupOptions.filer, err)
 			time.Sleep(1747 * time.Millisecond)
@@ -120,12 +126,12 @@ const (
 	BackupKeyPrefix = "backup."
 )
 
-func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOptions, reExcludeFileName *regexp.Regexp, excludeFileNames []*wildcard.WildcardMatcher, excludePathPatterns []*wildcard.WildcardMatcher, clientId int32, clientEpoch int32) error {
+func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOptions, reExcludeFileName *regexp.Regexp, excludeFileNames []*wildcard.WildcardMatcher, excludePathPatterns []*wildcard.WildcardMatcher, clientId int32, clientEpoch int32, resumeTsNs int64) (int64, error) {
 
 	// find data sink
 	dataSink := findSink(util.GetViper())
 	if dataSink == nil {
-		return fmt.Errorf("no data sink configured in replication.toml")
+		return 0, fmt.Errorf("no data sink configured in replication.toml")
 	}
 
 	sourceFiler := pb.ServerAddress(*backupOption.filer)
@@ -137,16 +143,22 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 
 	// get start time for the data sink
 	startFrom := time.Unix(0, 0)
-	sinkId, legacySinkId := backupCheckpointIds(sourcePath, dataSink)
+	sinkId, legacySinkId := backupCheckpointIds(sourcePath, dataSink, *backupOption.s3FlattenVersions)
 	runSnapshot := *backupOption.initialSnapshot && timeAgo == 0
-	if timeAgo == 0 {
+	if resumeTsNs > 0 {
+		// The previous attempt pinned where it stopped — a failed event's
+		// timestamp or the processed watermark — which can sit behind both the
+		// persisted checkpoint and a recomputed -timeAgo window.
+		startFrom = time.Unix(0, resumeTsNs)
+		glog.V(0).Infof("resuming previous attempt at %v", startFrom)
+	} else if timeAgo == 0 {
 		if runSnapshot {
 			// snapshot below sets the start point; no checkpoint read needed
 			glog.V(0).Infof("initialSnapshot requested — walking live tree before subscribing")
 		} else {
 			lastOffsetTsNs, err := getOffsetWithFallback(grpcDialOption, sourceFiler, BackupKeyPrefix, sinkId, BackupKeyPrefix, legacySinkId)
 			if err != nil {
-				glog.V(0).Infof("starting from %v (offset read failed: %v)", startFrom, err)
+				return 0, fmt.Errorf("read backup offset: %w", err)
 			} else if lastOffsetTsNs > 0 {
 				startFrom = time.Unix(0, lastOffsetTsNs)
 				glog.V(0).Infof("resuming from %v", startFrom)
@@ -166,29 +178,44 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		sourceFiler.ToGrpcAddress(),
 		sourcePath,
 		*backupOption.proxyByFiler); err != nil {
-		return fmt.Errorf("filersource initialization failed: %v", err)
+		return resumeTsNs, fmt.Errorf("filersource initialization failed: %v", err)
 	}
 
 	if err := repl_util.InitializeSSEForReplication(filerSource); err != nil {
-		return fmt.Errorf("SSE initialization failed: %v", err)
+		return resumeTsNs, fmt.Errorf("SSE initialization failed: %v", err)
 	}
 	dataSink.SetSourceFiler(filerSource)
+
+	var flattener *s3VersionFlattener
+	if *backupOption.s3FlattenVersions {
+		flattener = &s3VersionFlattener{
+			filerSource:         filerSource,
+			dataSink:            dataSink,
+			sourcePath:          sourcePath,
+			targetPath:          targetPath,
+			doDeleteFiles:       *backupOption.doDeleteFiles,
+			excludePaths:        excludePaths,
+			reExcludeFileName:   reExcludeFileName,
+			excludeFileNames:    excludeFileNames,
+			excludePathPatterns: excludePathPatterns,
+		}
+	}
 
 	// Walk and seed the live tree, then subscribe from the walk-start watermark:
 	// replaying the event log alone misses entries created-then-deleted before
 	// the walk. The watermark overwrites any stale checkpoint, re-seeding a wiped
 	// destination.
 	if runSnapshot {
-		snapshotTsNs, err := runInitialSnapshot(sourceFiler.ToGrpcAddress(), filerSource, sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.ignore404Error)
+		snapshotTsNs, err := runInitialSnapshot(sourceFiler.ToGrpcAddress(), filerSource, sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.ignore404Error, flattener)
 		if err != nil {
-			return fmt.Errorf("initial snapshot: %w", err)
+			return 0, fmt.Errorf("initial snapshot: %w", err)
 		}
 		// The walk can take hours on large trees; retry the tiny KV write a
 		// handful of times before giving up so a flaky filer KV doesn't force
 		// the whole walk to repeat on the next retry loop iteration.
 		if err := persistSnapshotOffset(grpcDialOption, sourceFiler, sinkId, snapshotTsNs); err != nil {
 			glog.Errorf("initialSnapshot: FAILED to persist offset %d for sinkId %d after retries: %v — the next retry will redo the full walk", snapshotTsNs, sinkId, err)
-			return fmt.Errorf("persist initial snapshot offset: %w", err)
+			return 0, fmt.Errorf("persist initial snapshot offset: %w", err)
 		}
 		startFrom = time.Unix(0, snapshotTsNs)
 		// walk once per process; retries resume from the persisted checkpoint
@@ -196,11 +223,22 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		glog.V(0).Infof("initialSnapshot done; subscribing from %v", startFrom)
 	}
 
+	generated := genProcessFunction(sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.doDeleteFiles, debug)
+	if flattener != nil {
+		inner := generated
+		generated = func(resp *filer_pb.SubscribeMetadataResponse) error {
+			defer flattener.lockFor(resp)()
+			if handled, err := flattener.process(resp); handled {
+				return err
+			}
+			return inner(resp)
+		}
+	}
+
 	var processEventFn func(*filer_pb.SubscribeMetadataResponse) error
 	if *backupOption.ignore404Error {
-		processEventFnGenerated := genProcessFunction(sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.doDeleteFiles, debug)
 		processEventFn = func(resp *filer_pb.SubscribeMetadataResponse) error {
-			err := processEventFnGenerated(resp)
+			err := generated(resp)
 			if err == nil {
 				return nil
 			}
@@ -215,12 +253,77 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 			return err
 		}
 	} else {
-		processEventFn = genProcessFunction(sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.doDeleteFiles, debug)
+		processEventFn = generated
 	}
 
-	processEventFnWithOffset := pb.AddOffsetFunc(processEventFn, 3*time.Second, func(counter int64, lastTsNs int64) error {
-		glog.V(0).Infof("backup %s progressed to %v %0.2f/sec", sourceFiler, time.Unix(0, lastTsNs), float64(counter)/float64(3))
-		return setOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, sinkId, lastTsNs)
+	if *backupOption.disableErrorRetry {
+		// TrivialOnError semantics: log the failure and advance. Left to the
+		// processor a permanent failure would pin the checkpoint and replay
+		// forever, which is the opposite of what this flag asks for.
+		inner := processEventFn
+		processEventFn = func(resp *filer_pb.SubscribeMetadataResponse) error {
+			if err := inner(resp); err != nil {
+				glog.Errorf("process %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(resp), filer_pb.MetadataEventTargetFullPath(resp), resp.TsNs, err)
+			}
+			return nil
+		}
+	}
+
+	// Serial event handling caps throughput at one fetch+write at a time, so a
+	// busy source keeps outrunning the backup. The metadata processor fans
+	// events out while serializing same-path and subtree-barrier conflicts,
+	// and the checkpoint only advances on the contiguous processed watermark.
+	concurrency := *backupOption.concurrency
+	if concurrency < 1 || concurrency > 1024 {
+		glog.Warningf("invalid concurrency value %d, using default: %d", concurrency, DefaultConcurrencyLimit)
+		concurrency = DefaultConcurrencyLimit
+	}
+	processor := NewMetadataProcessor(processEventFn, concurrency, startFrom.UnixNano())
+
+	// AddOffsetFunc only checkpoints while events arrive; persist the
+	// completed watermark on a ticker too so work finishing on a quiet
+	// stream does not sit uncheckpointed until the next event.
+	var lastPersistedTsNs atomic.Int64
+	lastPersistedTsNs.Store(-1)
+	stopPersist := make(chan struct{})
+	persistDone := make(chan struct{})
+	go func() {
+		defer close(persistDone)
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		persist := func() {
+			if ts := resumeTsNsFor(processor); ts != lastPersistedTsNs.Load() {
+				if err := setOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, sinkId, ts); err == nil {
+					lastPersistedTsNs.Store(ts)
+				} else {
+					glog.Warningf("persist backup offset: %v", err)
+				}
+			}
+		}
+		for {
+			select {
+			case <-stopPersist:
+				persist()
+				return
+			case <-ticker.C:
+				persist()
+			}
+		}
+	}()
+
+	var lastLogTsNs = time.Now().UnixNano()
+	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		processor.AddSyncJob(resp)
+		return nil
+	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
+		offsetTsNs := processor.processedTsWatermark.Load()
+		if offsetTsNs == 0 {
+			return nil
+		}
+		now := time.Now().UnixNano()
+		glog.V(0).Infof("backup %s received %0.2f events/sec, processed through %v", sourceFiler, float64(counter)/(float64(now-lastLogTsNs)/1e9), time.Unix(0, offsetTsNs))
+		lastLogTsNs = now
+		return nil
 	})
 
 	if dataSink.IsIncremental() && *filerBackupOptions.retentionDays > 0 {
@@ -256,9 +359,29 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		StartTsNs:              startFrom.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         eventErrorType,
+		GetResumeTsNs: func() int64 {
+			return resumeTsNsFor(processor)
+		},
+		Resubscribe: processor.ResubscribeCh(),
 	}
 
-	return pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)
+	err := pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)
+	// Jobs admitted before the stream ended keep running; drain them so the
+	// retry loop's replay cannot race an older write past a newer one.
+	processor.Drain()
+	close(stopPersist)
+	// setOffset has no context, so a stalled checkpoint RPC must not hold the
+	// retry loop: bound the wait and let a late write land in the background.
+	select {
+	case <-persistDone:
+	case <-time.After(30 * time.Second):
+		glog.Warningf("backup %s offset checkpoint did not finish in 30s; reconnecting anyway", sourceFiler)
+	}
+	// Resume the next attempt at the floored watermark — never recompute a
+	// position that skips events. The floor sits one tick below the earliest
+	// failure and stays there even when a redelivery clears the pin, so
+	// events dropped while the processor was stopped still replay.
+	return resumeTsNsFor(processor), err
 
 }
 
@@ -274,9 +397,16 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 //
 // NUL joins the fields because it cannot occur in a path or a configuration
 // value, so distinct field tuples cannot concatenate to the same hash input.
-func backupCheckpointIds(sourcePath string, dataSink sink.ReplicationSink) (sinkId, legacySinkId int32) {
-	sinkId = int32(util.HashStringToLong(sourcePath + "\x00" + dataSink.GetName() + "\x00" + dataSink.GetDestinationIdentity()))
-	legacySinkId = int32(util.HashStringToLong(dataSink.GetName() + dataSink.GetSinkToDirectory()))
+// The flattening mode is part of the identity too: resuming a checkpoint taken
+// in the other mode would skip the flattened re-seed and leave mirrored
+// version files behind, so a mode change must restart the snapshot.
+func backupCheckpointIds(sourcePath string, dataSink sink.ReplicationSink, flattenVersions bool) (sinkId, legacySinkId int32) {
+	mode := ""
+	if flattenVersions {
+		mode = "\x00flatten"
+	}
+	sinkId = int32(util.HashStringToLong(sourcePath + "\x00" + dataSink.GetName() + "\x00" + dataSink.GetDestinationIdentity() + mode))
+	legacySinkId = int32(util.HashStringToLong(dataSink.GetName() + dataSink.GetSinkToDirectory() + mode))
 	return
 }
 
@@ -395,6 +525,7 @@ func runInitialSnapshot(
 	excludePathPatterns []*wildcard.WildcardMatcher,
 	dataSink sink.ReplicationSink,
 	ignore404Error bool,
+	flattener *s3VersionFlattener,
 ) (int64, error) {
 	// Metadata events are stamped server-side, so the backup host clock may be
 	// ahead of the filer's. Take `now - 1min` as the subscription watermark so
@@ -435,6 +566,28 @@ func runInitialSnapshot(
 
 		if !util.IsEqualOrUnder(source, sourcePath) {
 			return nil
+		}
+
+		if flattener != nil {
+			if insideVersionsDir(parent) && strings.HasPrefix(entry.Name, "v_") {
+				return nil
+			}
+			if entry.IsDirectory && isVersionsDirName(entry.Name) {
+				// Seed only the version the pointer names; every other version
+				// file is skipped by the check above.
+				err := flattener.applyLatest(parentPath.Child(entry.Name), entry, true, nil)
+				if err != nil && ignore404Error {
+					if isIgnorable404(err) {
+						glog.V(0).Infof("initialSnapshot: versions dir %s moved on, ignore it: %s", sourceKey, err.Error())
+						return nil
+					}
+					if isSourceLookupError(err) && filersink.SourceSupersedes(ctx, filerSource, sourceKey, filersink.EntryMtimeNs(entry)) {
+						glog.V(0).Infof("initialSnapshot: source superseded %s mid-walk, skip it: %s", sourceKey, err.Error())
+						return nil
+					}
+				}
+				return err
+			}
 		}
 
 		targetKey := initialSnapshotTargetKey(dataSink, targetPath, sourcePath, sourceKey, entry)

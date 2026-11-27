@@ -102,6 +102,25 @@ func (cp *ConfigPersistence) ApplyMaintenanceConfigFromToml(v TomlConfig) error 
 		ecConf.StrictPlacement = v.GetBool(k)
 		ecChanged = true
 	}
+	if k := "maintenance.erasure_coding.free_slots_deadband"; v.IsSet(k) {
+		ecConf.FreeSlotsDeadband = v.GetInt(k)
+		if ecConf.FreeSlotsDeadband < 0 {
+			ecConf.FreeSlotsDeadband = 0
+		} else if ecConf.FreeSlotsDeadband > 100000 {
+			ecConf.FreeSlotsDeadband = 100000
+		}
+		ecChanged = true
+	}
+	if k := "maintenance.erasure_coding.max_shard_transfers"; v.IsSet(k) {
+		n := v.GetInt(k)
+		if n < 0 {
+			n = 0
+		} else if n > math.MaxInt32 {
+			n = math.MaxInt32
+		}
+		ecConf.MaxShardTransfers = &n
+		ecChanged = true
+	}
 
 	if !maintenanceChanged && !vacuumChanged && !balanceChanged && !ecChanged {
 		return nil
@@ -223,16 +242,29 @@ var pluginConfigSections = []pluginConfigSection{
 		jobType: "erasure_coding",
 		prefix:  "maintenance.erasure_coding",
 		workerKeys: map[string]func(v TomlConfig, key string) *plugin_pb.ConfigValue{
-			"fullness_ratio":    doubleValue,
-			"quiet_for_seconds": int64Value,
-			"min_size_mb":       int64Value,
-			"preferred_tags":    stringListValue,
-			"replica_placement": stringValue,
-			"strict_placement":  boolValue,
+			"fullness_ratio":      doubleValue,
+			"quiet_for_seconds":   int64Value,
+			"min_size_mb":         int64Value,
+			"preferred_tags":      stringListValue,
+			"replica_placement":   stringValue,
+			"strict_placement":    boolValue,
+			"free_slots_deadband": int64Value,
+			"max_shard_transfers": int64Value,
 		},
 		// workers read collection_filter from the admin values, not the worker values
 		adminKeys: map[string]func(v TomlConfig, key string) *plugin_pb.ConfigValue{
 			"collection_filter": stringValue,
+		},
+	},
+	{
+		// s3_lifecycle has no worker config form; its knobs are admin values
+		jobType: "s3_lifecycle",
+		prefix:  "maintenance.s3_lifecycle",
+		adminKeys: map[string]func(v TomlConfig, key string) *plugin_pb.ConfigValue{
+			"meta_log_retention_days":    int64Value,
+			"walker_interval_minutes":    int64Value,
+			"cluster_deletes_per_second": int64Value,
+			"cluster_deletes_burst":      int64Value,
 		},
 	},
 }

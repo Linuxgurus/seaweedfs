@@ -50,6 +50,9 @@ func (store *AbstractSqlStore) CanDropWholeBucket() bool {
 	return store.SupportBucketTable && !store.SkipDDL
 }
 func (store *AbstractSqlStore) OnBucketCreation(bucket string) {
+	if !isValidBucket(bucket) {
+		return
+	}
 	store.dbsLock.Lock()
 	defer store.dbsLock.Unlock()
 
@@ -61,6 +64,9 @@ func (store *AbstractSqlStore) OnBucketCreation(bucket string) {
 	store.dbs[bucket] = true
 }
 func (store *AbstractSqlStore) OnBucketDeletion(bucket string) {
+	if !isValidBucket(bucket) {
+		return
+	}
 	store.dbsLock.Lock()
 	defer store.dbsLock.Unlock()
 
@@ -81,6 +87,15 @@ type TxOrDB interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 }
+
+// IsolatesTransactions: entry and KV calls take the sql.Tx their context
+// carries (getTxOrDB, kvDB), and the database keeps a transaction's writes to
+// itself until its commit. Bucket tables are created and dropped outside it.
+func (store *AbstractSqlStore) IsolatesTransactions() bool {
+	return true
+}
+
+var _ filer.IsolatingTransactionStore = (*AbstractSqlStore)(nil)
 
 func (store *AbstractSqlStore) BeginTransaction(ctx context.Context) (context.Context, error) {
 	tx, err := store.DB.BeginTx(ctx, &sql.TxOptions{
@@ -422,6 +437,7 @@ func (store *AbstractSqlStore) ListDirectoryPrefixedEntries(ctx context.Context,
 	}
 	defer rows.Close()
 
+	stoppedEarly := false
 	for rows.Next() {
 		var name string
 		var data []byte
@@ -446,9 +462,19 @@ func (store *AbstractSqlStore) ListDirectoryPrefixedEntries(ctx context.Context,
 		}
 
 		if !resEachEntryFunc {
+			stoppedEarly = true
 			break
 		}
 
+	}
+	// rows.Next also returns false when the result set fails partway, for
+	// example on a lost connection; that must not read as the end of the
+	// directory. A listing the callback stopped on purpose has no such error
+	// to report (rows.Err would return a canceled context's error instead).
+	if err == nil && !stoppedEarly {
+		if rowsErr := rows.Err(); rowsErr != nil {
+			err = fmt.Errorf("list %s: %w", dirPath, rowsErr)
+		}
 	}
 
 	return lastFileName, err

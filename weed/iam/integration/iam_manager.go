@@ -53,12 +53,9 @@ type IAMManager struct {
 	oidcRetryAgain bool
 	// oidcRefreshMu serializes refreshes from reading the store to handing
 	// STS the result, so an older snapshot cannot replace a newer one.
-	oidcRefreshMu sync.Mutex
-	// oidcManagedProviders caches providers refreshOIDCProvidersFrom built,
-	// keyed by record identity, so an unchanged record reuses its provider:
-	// rebuilding would drop the provider's consumed-token (jti) replay cache
-	// and let an already-used token be presented again. Guarded by
-	// oidcRefreshMu.
+	// oidcManagedProviders caches the provider built per stored record so a
+	// refresh reuses unchanged providers and keeps their JWKS cache.
+	oidcRefreshMu        sync.Mutex
 	oidcManagedProviders map[string]*oidcManagedProvider
 	oidcAuditSink        OIDCProviderAuditSink
 	revocationStore      SessionRevocationStore
@@ -953,10 +950,6 @@ func (m *IAMManager) refreshOIDCProvidersFrom(ctx context.Context, store OIDCPro
 		m.oidcManagedProviders = make(map[string]*oidcManagedProvider)
 	}
 	seen := make(map[string]struct{}, len(records))
-	// Records for one issuer with identical validation settings share a single
-	// provider — and with it the consumed-token (jti) replay store — so a token
-	// spent through one account's record stays spent through the other's too.
-	sharedProviders := make(map[string]*oidc.OIDCProvider)
 	for _, rec := range records {
 		if rec == nil || rec.URL == "" {
 			continue
@@ -967,25 +960,10 @@ func (m *IAMManager) refreshOIDCProvidersFrom(ctx context.Context, store OIDCPro
 		}
 		seen[key] = struct{}{}
 		fingerprint := oidcProviderFingerprint(rec)
-		configFingerprint := oidcProviderConfigFingerprint(rec)
-		var provider *oidc.OIDCProvider
 		cached := m.oidcManagedProviders[key]
-		if shared, ok := sharedProviders[configFingerprint]; ok {
-			provider = shared
-			if cached != nil && cached.provider != nil && cached.provider != shared {
-				// The record's own provider is superseded; its consumed
-				// tokens move to the shared store so none reopen for replay.
-				shared.MergeReplayStateFrom(cached.provider)
-			}
-			m.oidcManagedProviders[key] = &oidcManagedProvider{fingerprint: fingerprint, provider: provider}
-			if cached != nil && cached.provider != nil && cached.provider != shared && !m.oidcProviderStillReferenced(cached.provider) {
-				if err := cached.provider.Shutdown(ctx); err != nil {
-					glog.Warningf("shutdown superseded OIDC provider %s: %v", rec.ARN, err)
-				}
-			}
-		} else if cached != nil && cached.fingerprint == fingerprint {
+		var provider *oidc.OIDCProvider
+		if cached != nil && cached.fingerprint == fingerprint {
 			provider = cached.provider
-			sharedProviders[configFingerprint] = provider
 		} else {
 			var err error
 			provider, err = buildOIDCProviderFromRecord(rec)
@@ -994,20 +972,7 @@ func (m *IAMManager) refreshOIDCProvidersFrom(ctx context.Context, store OIDCPro
 				glog.Warningf("skip refreshing OIDC provider %s: %v", rec.ARN, err)
 				continue
 			}
-			if cached != nil && cached.provider != nil {
-				// The rebuild must keep rejecting tokens the replaced
-				// provider consumed; carry its replay store over, then stop
-				// its cleanup worker so only the new one sweeps the store —
-				// unless another record still references that provider.
-				provider.AdoptReplayStateFrom(cached.provider)
-			}
-			sharedProviders[configFingerprint] = provider
 			m.oidcManagedProviders[key] = &oidcManagedProvider{fingerprint: fingerprint, provider: provider}
-			if cached != nil && cached.provider != nil && !m.oidcProviderStillReferenced(cached.provider) {
-				if err := cached.provider.Shutdown(ctx); err != nil {
-					glog.Warningf("shutdown replaced OIDC provider %s: %v", rec.ARN, err)
-				}
-			}
 		}
 		// Multiple records may share an issuer when each is scoped to a
 		// different account; STS picks the right one at validation time
@@ -1017,16 +982,9 @@ func (m *IAMManager) refreshOIDCProvidersFrom(ctx context.Context, store OIDCPro
 			Provider:  provider,
 		})
 	}
-	for key, managed := range m.oidcManagedProviders {
+	for key := range m.oidcManagedProviders {
 		if _, ok := seen[key]; !ok {
 			delete(m.oidcManagedProviders, key)
-			// A removed record's provider may be shared by records that are
-			// still present; shut it down only when nothing references it.
-			if managed.provider != nil && !m.oidcProviderStillReferenced(managed.provider) {
-				if err := managed.provider.Shutdown(ctx); err != nil {
-					glog.Warningf("shutdown removed OIDC provider %s: %v", key, err)
-				}
-			}
 		}
 	}
 	m.stsService.SetIAMManagedOIDCProviders(byIssuer)
@@ -1038,17 +996,6 @@ func (m *IAMManager) refreshOIDCProvidersFrom(ctx context.Context, store OIDCPro
 type oidcManagedProvider struct {
 	fingerprint string
 	provider    *oidc.OIDCProvider
-}
-
-// oidcProviderStillReferenced reports whether any managed record still points
-// at the provider, so a shared provider is not shut down with a removed record.
-func (m *IAMManager) oidcProviderStillReferenced(provider *oidc.OIDCProvider) bool {
-	for _, managed := range m.oidcManagedProviders {
-		if managed.provider == provider {
-			return true
-		}
-	}
-	return false
 }
 
 // oidcProviderFingerprint identifies the record content a provider was built
@@ -1063,21 +1010,6 @@ func oidcProviderFingerprint(rec *OIDCProviderRecord) string {
 		AllowedPrincipalTagKeys []string
 		PolicyClaim             string
 	}{rec.ARN, rec.AccountID, rec.URL, rec.ClientIDs, rec.Thumbprints, rec.AllowedPrincipalTagKeys, rec.PolicyClaim})
-	sum := sha256.Sum256(key)
-	return hex.EncodeToString(sum[:])
-}
-
-// oidcProviderConfigFingerprint identifies the validation settings a provider
-// is built from — everything buildOIDCProviderFromRecord consumes except the
-// record's name — so records that differ only in identity reuse one provider.
-func oidcProviderConfigFingerprint(rec *OIDCProviderRecord) string {
-	key, _ := json.Marshal(&oidc.OIDCConfig{
-		Issuer:                  rec.URL,
-		ClientIDs:               rec.ClientIDs,
-		Thumbprints:             rec.Thumbprints,
-		AllowedPrincipalTagKeys: rec.AllowedPrincipalTagKeys,
-		PolicyClaim:             rec.PolicyClaim,
-	})
 	sum := sha256.Sum256(key)
 	return hex.EncodeToString(sum[:])
 }
@@ -1740,10 +1672,16 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 
 	// Parse principal ARN to extract details for context variables (e.g. ${aws:username})
 	arnInfo := utils.ParsePrincipalARN(request.Principal)
-	if arnInfo.RoleName != "" {
-		// For assumed roles, AWS docs say aws:username IS the role name.
-		// However, for user isolation in these tests, we typically map the session name (the user who assumed the role) to aws:username.
-		// arn:aws:sts::account:assumed-role/RoleName/SessionName
+	if arnInfo.RoleName != "" && strings.HasPrefix(request.Principal, "arn:aws:sts::") {
+		// An assumed-role ARN ends in the session name the caller chose; the
+		// session's user is the one it was issued to.
+		if sessionInfo != nil && sessionInfo.ExternalUserId != "" {
+			evalCtx.RequestContext["aws:username"] = sessionInfo.ExternalUserId
+		} else {
+			delete(evalCtx.RequestContext, "aws:username")
+		}
+		evalCtx.RequestContext["aws:userid"] = arnInfo.RoleName
+	} else if arnInfo.RoleName != "" {
 		awsUsername := arnInfo.RoleName
 		if idx := strings.LastIndex(request.Principal, "/"); idx != -1 && idx < len(request.Principal)-1 {
 			awsUsername = request.Principal[idx+1:]
@@ -2082,6 +2020,27 @@ func (m *IAMManager) validateTrustPolicyForWebIdentity(ctx context.Context, role
 func (m *IAMManager) validateTrustPolicyForCredentials(ctx context.Context, roleDef *RoleDefinition, request *sts.AssumeRoleWithCredentialsRequest) error {
 	if roleDef.TrustPolicy == nil {
 		return fmt.Errorf("role has no trust policy")
+	}
+
+	requestContext := map[string]interface{}{
+		"aws:FederatedProvider": request.ProviderName,
+	}
+	if request.DurationSeconds != nil {
+		requestContext["sts:DurationSeconds"] = *request.DurationSeconds
+	}
+	result, err := m.policyEngine.EvaluateTrustPolicy(ctx, roleDef.TrustPolicy, &policy.EvaluationContext{
+		Principal:      request.Username,
+		Action:         sts.ActionAssumeRoleWithCredentials,
+		Resource:       roleDef.RoleArn,
+		RequestContext: requestContext,
+	})
+	if err != nil {
+		return fmt.Errorf("trust policy evaluation failed: %w", err)
+	}
+	for _, match := range result.MatchingStatements {
+		if match.Effect == policy.EffectDeny {
+			return fmt.Errorf("trust policy denies credential assumption for provider: %s", request.ProviderName)
+		}
 	}
 
 	// Check if trust policy allows credential assumption for the specific provider

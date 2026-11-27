@@ -45,6 +45,12 @@ type LockClient struct {
 	// snapshot) but short enough that a write fails instead of hanging
 	// forever.
 	noLockServerRetryPeriod time.Duration
+
+	// lockRpcTimeout bounds a single DistributedLock attempt: a ring member
+	// reachable from the masters but not from this filer would otherwise
+	// block an attempt on the TCP connect timeout, far past
+	// noLockServerRetryPeriod.
+	lockRpcTimeout time.Duration
 }
 
 func NewLockClient(grpcDialOption grpc.DialOption, seedFiler pb.ServerAddress) *LockClient {
@@ -55,6 +61,7 @@ func NewLockClient(grpcDialOption grpc.DialOption, seedFiler pb.ServerAddress) *
 		seedFiler:               seedFiler,
 		priorWindow:             5 * time.Second,
 		noLockServerRetryPeriod: 15 * time.Second,
+		lockRpcTimeout:          10 * time.Second,
 	}
 }
 
@@ -175,7 +182,7 @@ func (lc *LockClient) NewShortLivedLock(key string, owner string) (lock *LiveLoc
 		self:           owner,
 		lc:             lc,
 	}
-	if err := lock.retryUntilLocked(5 * time.Second); err != nil {
+	if err := lock.retryUntilLocked(5*time.Second, 0); err != nil {
 		glog.Warningf("create lock %s: %v", key, err)
 		return nil
 	}
@@ -187,6 +194,17 @@ func (lc *LockClient) NewShortLivedLock(key string, owner string) (lock *LiveLoc
 // synchronous acquisition of NewShortLivedLock with the auto-renewal of
 // StartLongLivedLock. Release with Stop().
 func (lc *LockClient) NewBlockingLongLivedLock(key, owner string, lockTTL time.Duration) *LiveLock {
+	lock, err := lc.NewBlockingLongLivedLockWithin(key, owner, lockTTL, 0)
+	if err != nil {
+		glog.Warningf("create lock %s: %v", key, err)
+		return nil
+	}
+	return lock
+}
+
+// NewBlockingLongLivedLockWithin is NewBlockingLongLivedLock that gives up once
+// another owner has held the lock for maxWait. Zero waits without bound.
+func (lc *LockClient) NewBlockingLongLivedLockWithin(key, owner string, lockTTL, maxWait time.Duration) (*LiveLock, error) {
 	if lockTTL == 0 {
 		lockTTL = lock_manager.LiveLockTTL
 	}
@@ -200,10 +218,8 @@ func (lc *LockClient) NewBlockingLongLivedLock(key, owner string, lockTTL time.D
 		lc:             lc,
 		lockTTL:        lockTTL,
 	}
-	// Block until acquired
-	if err := lock.retryUntilLocked(lockTTL); err != nil {
-		glog.Warningf("create lock %s: %v", key, err)
-		return nil
+	if err := lock.retryUntilLocked(lockTTL, maxWait); err != nil {
+		return nil, err
 	}
 	// Start renewal goroutine using a ticker for interruptible sleep
 	lock.renewalDone = make(chan struct{})
@@ -224,7 +240,7 @@ func (lc *LockClient) NewBlockingLongLivedLock(key, owner string, lockTTL time.D
 			}
 		}
 	}()
-	return lock
+	return lock, nil
 }
 
 // StartLongLivedLock starts a goroutine to lock the key and returns immediately.
@@ -303,40 +319,84 @@ func (lc *LockClient) StartLongLivedLock(key string, owner string, onLockOwnerCh
 // several seconds): when a holder on another mount releases the lock, the
 // waiter must pick it up promptly, otherwise cross-mount write handoff stalls
 // long enough to time out clients.
-func (lock *LiveLock) retryUntilLocked(lockDuration time.Duration) error {
-	var unavailableSince time.Time
-	for lock.renewToken == "" {
-		err := lock.AttemptToLock(lockDuration)
+func (lock *LiveLock) retryUntilLocked(lockDuration, maxWait time.Duration) error {
+	started := time.Now()
+	// The retry window bounds the attempts against one route: the clock
+	// starts before the first attempt and each attempt gets what is left
+	// of it. A spent window on a non-seed target falls back to the seed
+	// filer — which can forward to the real owner — and that route gets
+	// its own window, so a reachable fallback is always tried.
+	unavailableSince := time.Now()
+	// The seed route gets one fresh window per acquisition: the seed can
+	// redirect back to a dead primary via LockHostMovedTo, and refilling the
+	// window on every return to the seed would make that cycle unbounded.
+	seedRetried := false
+	var err error
+	for {
+		attemptTimeout := lock.lc.lockRpcTimeout
+		if remaining := lock.lc.noLockServerRetryPeriod - time.Since(unavailableSince); remaining < attemptTimeout {
+			if remaining <= 0 {
+				if lock.hostFiler.Equals(lock.lc.seedFiler) || seedRetried {
+					if err == nil {
+						err = fmt.Errorf("lock %s: no lock server granted within %s", lock.key, lock.lc.noLockServerRetryPeriod)
+					}
+					return err
+				}
+				glog.V(0).Infof("LOCK: no response within %s for key=%s filer=%s, falling back to seed filer=%s",
+					lock.lc.noLockServerRetryPeriod, lock.key, lock.hostFiler, lock.lc.seedFiler)
+				lock.hostFiler = lock.lc.seedFiler
+				seedRetried = true
+				unavailableSince = time.Now()
+				continue
+			}
+			attemptTimeout = remaining
+		}
+		hostBefore := lock.hostFiler
+		var granted bool
+		granted, err = lock.attemptToLockWithin(lockDuration, attemptTimeout)
 		if err == nil {
-			unavailableSince = time.Time{}
+			if granted {
+				return nil
+			}
+			// A clean LockHostMovedTo redirect returns no error and no
+			// verdict; it must still count against the window, or a redirect
+			// cycle between ring-disagreeing filers retries forever.
 			continue
 		}
 		glog.V(1).Infof("create lock %s: %v", lock.key, err)
 		if strings.Contains(err.Error(), "lock already owned") {
 			// Ordinary contention: a reachable server holds the lock, so
-			// waiting is the point and has no bound.
-			unavailableSince = time.Time{}
+			// waiting is the point and is bounded only by maxWait.
+			if maxWait > 0 && time.Since(started) >= maxWait {
+				return err
+			}
+			unavailableSince = time.Now()
 			continue
 		}
 		// Anything else — "no lock server found", a dead ring member refusing
-		// connections — is a systemic fault waiting cannot fix; give up once
-		// it persists past the retry period.
-		if unavailableSince.IsZero() {
+		// connections — is a systemic fault waiting cannot fix. A failed
+		// attempt that fell back to the seed route gets a fresh window for
+		// it; a server redirect stays inside the current one.
+		if !seedRetried && lock.hostFiler.Equals(lock.lc.seedFiler) && !hostBefore.Equals(lock.lc.seedFiler) {
+			seedRetried = true
 			unavailableSince = time.Now()
-		} else if time.Since(unavailableSince) > lock.lc.noLockServerRetryPeriod {
-			return err
 		}
 	}
-	return nil
 }
 
 func (lock *LiveLock) AttemptToLock(lockDuration time.Duration) error {
+	_, err := lock.attemptToLockWithin(lockDuration, lock.lc.lockRpcTimeout)
+	return err
+}
+
+func (lock *LiveLock) attemptToLockWithin(lockDuration, attemptTimeout time.Duration) (granted bool, err error) {
 	glog.V(4).Infof("LOCK: AttemptToLock key=%s owner=%s", lock.key, lock.self)
-	errorMessage, err := lock.doLock(lockDuration)
+	sentAt := time.Now()
+	errorMessage, granted, err := lock.doLock(lockDuration, attemptTimeout)
 	if err != nil {
 		glog.V(1).Infof("LOCK: doLock failed for key=%s: %v", lock.key, err)
 		time.Sleep(time.Second)
-		return err
+		return false, err
 	}
 	if errorMessage != "" {
 		if strings.Contains(errorMessage, "lock already owned") {
@@ -345,14 +405,24 @@ func (lock *LiveLock) AttemptToLock(lockDuration time.Duration) error {
 			glog.V(2).Infof("LOCK: doLock returned error message for key=%s: %s", lock.key, errorMessage)
 		}
 		time.Sleep(time.Second)
-		return fmt.Errorf("%v", errorMessage)
+		return false, fmt.Errorf("%v", errorMessage)
+	}
+	if !granted {
+		// A bare LockHostMovedTo redirect carries no verdict: nothing was
+		// acquired, so leave isLocked as it is and keep the same ~1s cadence
+		// as other retries.
+		time.Sleep(time.Second)
+		return false, nil
 	}
 	if atomic.LoadInt32(&lock.isLocked) == 0 {
 		// Only log when transitioning from unlocked to locked
 		glog.V(1).Infof("LOCK: Successfully acquired key=%s owner=%s", lock.key, lock.self)
 	}
+	// The server counts the lease from when it got the request, so a lease
+	// counted from the send never outlives the one the server holds.
+	atomic.StoreInt64(&lock.expireAtNs, sentAt.Add(lockDuration.Truncate(time.Second)).UnixNano())
 	atomic.StoreInt32(&lock.isLocked, 1)
-	return nil
+	return true, nil
 }
 
 func (lock *LiveLock) StopShortLivedLock() error {
@@ -363,7 +433,9 @@ func (lock *LiveLock) StopShortLivedLock() error {
 		atomic.StoreInt32(&lock.isLocked, 0)
 	}()
 	return pb.WithFilerClient(false, 0, lock.hostFiler, lock.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		_, err := client.DistributedUnlock(context.Background(), &filer_pb.UnlockRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), lock.lc.lockRpcTimeout)
+		defer cancel()
+		_, err := client.DistributedUnlock(ctx, &filer_pb.UnlockRequest{
 			Name:       lock.key,
 			RenewToken: lock.renewToken,
 		})
@@ -409,7 +481,7 @@ func (lock *LiveLock) Stop() error {
 	return lock.StopShortLivedLock()
 }
 
-func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, err error) {
+func (lock *LiveLock) doLock(lockDuration, attemptTimeout time.Duration) (errorMessage string, granted bool, err error) {
 	glog.V(4).Infof("LOCK: doLock calling DistributedLock - key=%s filer=%s owner=%s",
 		lock.key, lock.hostFiler, lock.self)
 
@@ -417,7 +489,11 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 	previousOwner := lock.owner
 
 	err = pb.WithFilerClient(false, 0, lock.hostFiler, lock.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		resp, err := client.DistributedLock(context.Background(), &filer_pb.LockRequest{
+		// Bound each attempt: a ring member that is reachable from the masters
+		// but not from this filer would otherwise block on the connect timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		defer cancel()
+		resp, err := client.DistributedLock(ctx, &filer_pb.LockRequest{
 			Name:          lock.key,
 			SecondsToLock: int64(lockDuration.Seconds()),
 			RenewToken:    lock.renewToken,
@@ -426,16 +502,25 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 		})
 		glog.V(4).Infof("LOCK: DistributedLock response - key=%s err=%v", lock.key, err)
 		if err == nil && resp != nil {
-			lock.renewToken = resp.RenewToken
+			// Only a verdict replaces the token: a grant carries the new
+			// token, a rejection carries an error. A bare LockHostMovedTo
+			// redirect answers neither and must not drop a held token —
+			// the next attempt can still renew with it on the new host.
+			granted = resp.Error == "" && resp.RenewToken != ""
+			if resp.RenewToken != "" || resp.Error != "" {
+				lock.renewToken = resp.RenewToken
+			}
 			if resp.Generation > 0 {
 				atomic.StoreInt64(&lock.generation, resp.Generation)
 			}
 			lock.consecutiveFailures = 0 // Reset failure counter on success
 			glog.V(4).Infof("LOCK: Got renewToken for key=%s", lock.key)
 		} else {
-			//this can be retried. Need to remember the last valid renewToken
-			lock.renewToken = ""
-			glog.V(1).Infof("LOCK: Cleared renewToken for key=%s (err=%v)", lock.key, err)
+			// The request may have renewed the lease server-side before its
+			// response was lost: the last token can still be valid, so the
+			// next attempt retries with it. A definitive rejection clears it
+			// through the response's empty RenewToken.
+			glog.V(1).Infof("LOCK: no response for key=%s (err=%v)", lock.key, err)
 		}
 		if resp != nil {
 			errorMessage = resp.Error
@@ -469,7 +554,6 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 				lock.consecutiveFailures, lock.key, lock.hostFiler, lock.lc.seedFiler)
 			lock.hostFiler = lock.lc.seedFiler
 			lock.consecutiveFailures = 0
-			lock.renewToken = ""
 		}
 	}
 
@@ -486,7 +570,9 @@ func (lock *LiveLock) Generation() int64 {
 	return atomic.LoadInt64(&lock.generation)
 }
 
-// IsLocked returns true if this instance currently holds the lock
+// IsLocked returns true if this instance currently holds the lock and the
+// lease of its last grant or renewal has not run out, so a renewal that
+// stalled past the lease does not read as still holding it.
 func (lock *LiveLock) IsLocked() bool {
-	return atomic.LoadInt32(&lock.isLocked) == 1
+	return atomic.LoadInt32(&lock.isLocked) == 1 && time.Now().UnixNano() < atomic.LoadInt64(&lock.expireAtNs)
 }

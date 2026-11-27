@@ -1,16 +1,28 @@
 {{- include "seaweedfs.compat" . -}}
 {{- if .Values.allInOne.enabled }}
+{{- if include "seaweedfs.volumeHttps" . }}
+{{- fail "global.seaweedfs.volumeHttps is not supported with allInOne: its volume server registers by pod IP, which the volume certificate cannot name" }}
+{{- end }}
+{{- $s3PreStopSeconds := 0 }}
+{{- if .Values.allInOne.s3.enabled }}
+{{- $s3PreStopSeconds = .Values.allInOne.s3.preStopSeconds }}
+{{- if kindIs "invalid" $s3PreStopSeconds }}
+{{- $s3PreStopSeconds = .Values.s3.preStopSeconds }}
+{{- end }}
+{{- $s3PreStopSeconds = $s3PreStopSeconds | int }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "seaweedfs.fullname" . }}-all-in-one
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "seaweedfs.namespace" . | quote }}
   labels:
     app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: seaweedfs-all-in-one
+    {{- with include "seaweedfs.commonLabels" $ }}{{ . | nindent 4 }}{{ end }}
   {{- if .Values.allInOne.annotations }}
   annotations:
     {{- toYaml .Values.allInOne.annotations | nindent 4 }}
@@ -40,12 +52,12 @@ spec:
       {{- $podAnnotations := mergeOverwrite (deepCopy (.Values.podAnnotations | default dict)) (.Values.allInOne.podAnnotations | default dict) }}
       {{- $existingS3ConfigSecret := or .Values.allInOne.s3.existingConfigSecret .Values.s3.existingConfigSecret .Values.filer.s3.existingConfigSecret }}
       {{- if $existingS3ConfigSecret }}
-      {{- $configSecret := (lookup "v1" "Secret" .Release.Namespace $existingS3ConfigSecret) | default dict }}
+      {{- $configSecret := (lookup "v1" "Secret" (include "seaweedfs.namespace" .) $existingS3ConfigSecret) | default dict }}
       {{- $_ := set $podAnnotations "checksum/s3config" ($configSecret | toYaml | sha256sum) }}
       {{- else }}
       {{- $_ := set $podAnnotations "checksum/s3config" (include "seaweedfs.s3.configChecksum" .) }}
       {{- end }}
-      {{- $_ := set $podAnnotations "checksum/master-config" (include (print .Template.BasePath "/master/master-configmap.yaml") . | sha256sum) }}
+      {{- $_ := set $podAnnotations "checksum/master-config" (include "seaweedfs.master.configChecksum" .) }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
     spec:
@@ -63,7 +75,7 @@ spec:
         {{- tpl .Values.allInOne.tolerations . | nindent 8 }}
       {{- end }}
       {{- include "seaweedfs.imagePullSecrets" . | nindent 6 }}
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: {{ add 60 (max $s3PreStopSeconds 0) }}
       enableServiceLinks: false
       {{- if .Values.allInOne.priorityClassName }}
       priorityClassName: {{ .Values.allInOne.priorityClassName | quote }}
@@ -118,9 +130,11 @@ spec:
             - name: {{ $key }}
               {{- if kindIs "string" $value }}
               value: {{ tpl $value $ | quote }}
-              {{- else }}
+              {{- else if kindIs "map" $value }}
               valueFrom:
                 {{ toYaml $value | nindent 16 }}
+              {{- else if not (kindIs "invalid" $value) }}
+              value: {{ toJson $value | quote }}
               {{- end }}
             {{- end }}
             {{- end }}
@@ -256,6 +270,9 @@ spec:
               {{- $auditLogConfig := .Values.allInOne.s3.auditLogConfig | default .Values.s3.auditLogConfig }}
               {{- if $auditLogConfig }}
               -s3.auditLogConfig=/etc/sw/s3/s3_auditLogConfig.json \
+              {{- end }}
+              {{- if gt $s3PreStopSeconds 0 }}
+              -s3.preStopSeconds={{ $s3PreStopSeconds }} \
               {{- end }}
               {{- end }}
               {{- if .Values.allInOne.sftp.enabled }}
@@ -490,8 +507,8 @@ spec:
             name: {{ include "seaweedfs.fullname" . }}-master-config
         {{- if include "seaweedfs.securityConfigEnabled" . }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" . }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-security-config
         {{- end }}
         {{- if .Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert

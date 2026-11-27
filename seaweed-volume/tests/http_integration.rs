@@ -110,7 +110,9 @@ fn build_test_state(
         vacuum_commit_slots: None,
         vacuum_commits_waiting: std::sync::atomic::AtomicU32::new(0),
         is_heartbeating: std::sync::atomic::AtomicBool::new(true),
+        ec_lifecycle_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
         ec_decode_tail_notify: tokio::sync::Notify::new(),
         has_master: false,
@@ -482,8 +484,8 @@ async fn delete_then_get_returns_404() {
     );
 }
 
-// Go answers both with 500 and an error containing "volume N is read only"
-// (the write behind "failed to write to local disk: ").
+// Go and Rust return 409 for read-only upload refusals;
+// the delete still returns 500.
 #[tokio::test]
 async fn write_and_delete_on_read_only_volume_say_is_read_only() {
     let (state, _tmp) = test_state();
@@ -520,7 +522,14 @@ async fn write_and_delete_on_read_only_volume_say_is_read_only() {
         .oneshot(request("POST", b"refused"))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-seaweed-write-outcome")
+            .and_then(|value| value.to_str().ok()),
+        Some("refused-before-append")
+    );
     let error = error_of(body_bytes(response).await);
     assert!(error.contains("volume 1 is read only"), "{error}");
 
@@ -1340,11 +1349,11 @@ async fn non_ascii_fid_and_ttl_are_rejected_not_panicked() {
 
 #[tokio::test]
 async fn write_queue_upload_returns_same_etag_as_direct_write() {
-    use seaweed_volume::server::write_queue::WriteQueue;
+    use seaweed_volume::server::write_queue::{SyncBatchOption, WriteQueue};
 
     let (direct_state, _direct_tmp) = test_state();
     let (queued_state, _queued_tmp) = test_state();
-    let wq = WriteQueue::new(queued_state.clone(), 128);
+    let wq = WriteQueue::new(queued_state.clone(), 128, SyncBatchOption::default());
     let _ = queued_state.write_queue.set(wq);
 
     let compressible = "seaweedfs ".repeat(200).into_bytes();
@@ -1426,4 +1435,121 @@ async fn write_queue_upload_returns_same_etag_as_direct_write() {
         etags.push(response.headers()["ETag"].to_str().unwrap().to_string());
     }
     assert_eq!(etags[1], etags[0], "unchanged upload ETag differs");
+}
+
+// ============================================================================
+// A Range over a compressed needle is answered from the decoded bytes
+// ============================================================================
+
+#[tokio::test]
+async fn range_with_accept_gzip_on_compressed_needle_serves_decoded_bytes() {
+    let (state, _tmp) = test_state();
+    let uri = "/1/03637037d6/notes.txt";
+    let plain: Vec<u8> = (0..400)
+        .flat_map(|i| format!("line {i:06}: the quick brown fox\n").into_bytes())
+        .collect();
+
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::from(plain.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let read = |range: Option<&str>| {
+        let mut request = Request::builder()
+            .uri(uri)
+            .header("Accept-Encoding", "gzip");
+        if let Some(range) = range {
+            request = request.header("Range", range);
+        }
+        build_admin_router(state.clone()).oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    // The whole read passes the stored gzip through, so its length is the compressed size.
+    let response = read(None).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Content-Encoding"], "gzip");
+    let compressed_len = body_bytes(response).await.len();
+    assert!(compressed_len < plain.len() / 4);
+
+    for (start, end) in [(10, 69), (compressed_len + 10, compressed_len + 69)] {
+        let response = read(Some(&format!("bytes={start}-{end}"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(response.headers().get("Content-Encoding").is_none());
+        assert_eq!(
+            response.headers()["Content-Range"],
+            format!("bytes {start}-{end}/{}", plain.len()).as_str()
+        );
+        assert_eq!(body_bytes(response).await, &plain[start..=end]);
+    }
+}
+
+// ============================================================================
+// HEAD of a compressed needle reports the length the matching GET would send
+// ============================================================================
+
+#[tokio::test]
+async fn head_on_compressed_needle_reports_served_length() {
+    let (state, _tmp) = test_state();
+    let uri = "/1/04637037d6/notes.txt";
+    let plain: Vec<u8> = (0..400)
+        .flat_map(|i| format!("line {i:06}: the quick brown fox\n").into_bytes())
+        .collect();
+
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::from(plain.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let send = |method: &str, accept_gzip: bool, range: Option<&str>| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if accept_gzip {
+            request = request.header("Accept-Encoding", "gzip");
+        }
+        if let Some(range) = range {
+            request = request.header("Range", range);
+        }
+        build_admin_router(state.clone()).oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    let response = send("GET", true, None).await.unwrap();
+    let compressed_len = body_bytes(response).await.len();
+    assert!(compressed_len < plain.len() / 4);
+
+    for (accept_gzip, range, encoding, length) in [
+        (false, None, None, plain.len()),
+        (true, None, Some("gzip"), compressed_len),
+        (true, Some("bytes=0-9"), None, plain.len()),
+    ] {
+        let response = send("HEAD", accept_gzip, range).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Encoding")
+                .map(|v| v.to_str().unwrap()),
+            encoding,
+            "accept_gzip={accept_gzip} range={range:?}"
+        );
+        assert_eq!(
+            response.headers()["Content-Length"],
+            length.to_string().as_str(),
+            "accept_gzip={accept_gzip} range={range:?}"
+        );
+    }
 }

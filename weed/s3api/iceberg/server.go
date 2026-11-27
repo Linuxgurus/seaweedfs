@@ -73,6 +73,14 @@ func NewServer(filerClient FilerClient, authenticator S3Authenticator) *Server {
 	if authenticator != nil {
 		manager.SetDefaultAllow(authenticator.DefaultAllow())
 	}
+	if checker, ok := authenticator.(interface{ IsConfiguredAccountID(string) bool }); ok {
+		manager.SetLocalAccountChecker(checker.IsConfiguredAccountID)
+	}
+	if source, ok := authenticator.(interface {
+		TrustedOIDCIssuers(context.Context) []string
+	}); ok {
+		manager.SetTrustedIssuerSource(source.TrustedOIDCIssuers)
+	}
 	return &Server{
 		filerClient:   filerClient,
 		tablesManager: manager,
@@ -269,10 +277,11 @@ func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
 		// The auth scheme is case-insensitive (RFC 7235), matching
 		// authenticateBearer below.
 		if strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "bearer ") {
-			if identityName, identity, accessKey, ok := s.authenticateBearerKey(r); ok {
+			if identityName, identity, accessKey, secretKey, ok := s.authenticateBearerKey(r); ok {
 				ctx := r.Context()
 				ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
 				ctx = s3_constants.SetAccessKeyIdInContext(ctx, accessKey)
+				ctx = s3_constants.SetStoredAccessKeyIdInContext(ctx, accessKey, secretKey)
 				if identity != nil {
 					ctx = s3_constants.SetIdentityInContext(ctx, identity)
 				}

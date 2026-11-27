@@ -12,6 +12,7 @@ import (
 // onMetadataChangeEvent is triggered after filer processed change events from local or remote filers
 func (f *Filer) onMetadataChangeEvent(event *filer_pb.SubscribeMetadataResponse) {
 	f.maybeReloadFilerConfiguration(event)
+	f.maybeReloadNotificationWebhooks(event)
 	f.maybeReloadRemoteStorageConfigurationAndMapping(event)
 	f.onBucketEvents(event)
 	f.onEmptyFolderCleanupEvents(event)
@@ -99,7 +100,7 @@ func (f *Filer) maybeReloadFilerConfiguration(event *filer_pb.SubscribeMetadataR
 		return
 	}
 
-	glog.V(0).Infof("processing %v", event)
+	glog.V(0).Infof("processing %s ts_ns=%d", event.Directory, event.TsNs)
 	if entry.Name == FilerConfName {
 		f.reloadFilerConfiguration(entry)
 	}

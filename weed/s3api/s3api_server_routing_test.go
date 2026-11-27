@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/cors"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/stretchr/testify/assert"
@@ -440,5 +443,225 @@ func TestRouting_BucketRouteMatchesAnyHost(t *testing.T) {
 				t.Fatalf("route matched but reported error: %v", match.MatchErr)
 			}
 		})
+	}
+}
+
+// TestRouting_BucketRootPreflightUsesBucketCORS is a regression test: a
+// path-style preflight for the bucket root without a trailing
+// slash must be evaluated against the bucket CORS rules like /bucket/, not
+// answered from the global AllowedOrigins. Service-level paths keep the
+// global answer, and virtual-host routing is unchanged.
+func TestRouting_BucketRootPreflightUsesBucketCORS(t *testing.T) {
+	const (
+		bucket        = "cors-bucket"
+		allowedOrigin = "https://app.example.com"
+		foreignOrigin = "https://untrusted.example"
+	)
+	pathStyleBucketPaths := []string{"/" + bucket, "/" + bucket + "/", "/" + bucket + "?list-type=2", "/" + bucket + "/key"}
+
+	cases := []struct {
+		name         string
+		domainName   string
+		host         string
+		bucketPaths  []string // evaluated against the bucket CORS rules
+		servicePaths []string // answered from the global AllowedOrigins
+	}{
+		{
+			name:         "path-style",
+			host:         "10.0.0.5:8333",
+			bucketPaths:  pathStyleBucketPaths,
+			servicePaths: []string{"/", "/status", "/healthz", "/readyz"},
+		},
+		{
+			name:         "path-style domain",
+			domainName:   "s3.example.com,api.s3.example.com",
+			host:         "api.s3.example.com",
+			bucketPaths:  pathStyleBucketPaths,
+			servicePaths: []string{"/status", "/healthz", "/readyz"},
+		},
+		{
+			name:        "virtual-host domain",
+			domainName:  "s3.example.com,api.s3.example.com",
+			host:        bucket + ".s3.example.com",
+			bucketPaths: []string{"/", "/?list-type=2", "/key", "/status"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s3a := setupRoutingTestServer(t)
+			s3a.option.DomainName = tc.domainName
+			s3a.option.AllowedOrigins = []string{"*"}
+			s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+			s3a.bucketConfigCache.Set(bucket, &BucketConfig{
+				Name: bucket,
+				CORS: &cors.CORSConfiguration{CORSRules: []cors.CORSRule{{
+					AllowedOrigins: []string{allowedOrigin},
+					AllowedMethods: []string{http.MethodGet, http.MethodPut},
+					AllowedHeaders: []string{"*"},
+				}}},
+			})
+			router := mux.NewRouter()
+			s3a.registerRouter(router)
+
+			preflight := func(path, origin string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodOptions, "http://"+tc.host+path, nil)
+				req.Header.Set("Origin", origin)
+				req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+				rr := httptest.NewRecorder()
+				router.ServeHTTP(rr, req)
+				return rr
+			}
+
+			for _, path := range tc.bucketPaths {
+				rr := preflight(path, foreignOrigin)
+				assert.Equal(t, http.StatusForbidden, rr.Code, "foreign origin on %s", path)
+				assert.Empty(t, rr.Header().Get("Access-Control-Allow-Origin"), "foreign origin on %s", path)
+
+				rr = preflight(path, allowedOrigin)
+				assert.Equal(t, http.StatusOK, rr.Code, "allowed origin on %s", path)
+				assert.Equal(t, allowedOrigin, rr.Header().Get("Access-Control-Allow-Origin"), "allowed origin on %s", path)
+			}
+
+			for _, path := range tc.servicePaths {
+				rr := preflight(path, foreignOrigin)
+				assert.Equal(t, http.StatusOK, rr.Code, "service-level %s", path)
+				assert.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"), "service-level %s", path)
+			}
+		})
+	}
+}
+
+// Write covers a bucket's objects, not its configuration: an identity holding
+// Write on the bucket is refused lifecycle writes, while Admin on the bucket or
+// a policy granting s3:PutLifecycleConfiguration passes. The bucket is
+// negatively cached, so a request that gets past authorization ends at the
+// handler's NoSuchBucket.
+func TestRouting_BucketLifecycleWritesNeedAdmin(t *testing.T) {
+	const bucket = "config-bucket"
+	configFile := filepath.Join(t.TempDir(), "s3.json")
+	require.NoError(t, os.WriteFile(configFile, []byte(`{
+  "identities": [
+    {"name":"writer","credentials":[{"accessKey":"WRITERKEY","secretKey":"writersecret"}],"actions":["Read:`+bucket+`","Write:`+bucket+`","List:`+bucket+`","Tagging:`+bucket+`"]},
+    {"name":"bucketadmin","credentials":[{"accessKey":"BUCKETADMINKEY","secretKey":"bucketadminsecret"}],"actions":["Admin:`+bucket+`"]},
+    {"name":"lifecycler","credentials":[{"accessKey":"LIFECYCLERKEY","secretKey":"lifecyclersecret"}],"policyNames":["LifecyclePolicy"]}
+  ],
+  "policies": [
+    {"name":"LifecyclePolicy","content":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutLifecycleConfiguration\"],\"Resource\":[\"arn:aws:s3:::`+bucket+`\"]}]}"}
+  ]
+}`), 0600))
+
+	s3a := setupRoutingTestServer(t)
+	s3a.iam = NewIdentityAccessManagementWithStore(&S3ApiServerOption{Config: configFile}, nil, "memory")
+	require.True(t, s3a.iam.isEnabled())
+	s3a.cb = &CircuitBreaker{s3a: s3a}
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	s3a.bucketConfigCache.SetNegativeCache(bucket)
+	router := mux.NewRouter()
+	s3a.registerRouter(router)
+
+	send := func(accessKey, secretKey, method, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "http://localhost:8333/"+bucket+"?lifecycle", strings.NewReader(body))
+		creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
+		_, err := v4.NewSigner(creds).Sign(req, strings.NewReader(body), "s3", "us-east-1", time.Now())
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		return rr
+	}
+
+	const lifecycleXML = `<LifecycleConfiguration><Rule><ID>r</ID><Status>Enabled</Status><Filter><Prefix>p/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`
+	for _, tc := range []struct {
+		method, body string
+	}{
+		{http.MethodPut, lifecycleXML},
+		{http.MethodDelete, ""},
+	} {
+		rr := send("WRITERKEY", "writersecret", tc.method, tc.body)
+		assert.Equal(t, http.StatusForbidden, rr.Code, "writer %s", tc.method)
+		assert.Contains(t, rr.Body.String(), "AccessDenied", "writer %s", tc.method)
+
+		for _, key := range [][2]string{{"BUCKETADMINKEY", "bucketadminsecret"}, {"LIFECYCLERKEY", "lifecyclersecret"}} {
+			rr = send(key[0], key[1], tc.method, tc.body)
+			assert.Equal(t, http.StatusNotFound, rr.Code, "%s %s", key[0], tc.method)
+			assert.Contains(t, rr.Body.String(), "NoSuchBucket", "%s %s", key[0], tc.method)
+		}
+	}
+}
+
+func TestRouting_BucketCorsAndVersioningWritesNeedTheirActions(t *testing.T) {
+	const bucket = "config-bucket"
+	configFile := filepath.Join(t.TempDir(), "s3.json")
+	require.NoError(t, os.WriteFile(configFile, []byte(`{
+  "identities": [
+    {"name":"writer","credentials":[{"accessKey":"WRITERKEY","secretKey":"writersecret"}],"actions":["Read:`+bucket+`","Write:`+bucket+`","List:`+bucket+`","Tagging:`+bucket+`"]},
+    {"name":"bucketadmin","credentials":[{"accessKey":"BUCKETADMINKEY","secretKey":"bucketadminsecret"}],"actions":["Admin:`+bucket+`"]},
+    {"name":"corsputter","credentials":[{"accessKey":"CORSPUTKEY","secretKey":"corsputsecret"}],"actions":["PutBucketCors:`+bucket+`"]},
+    {"name":"corsdeleter","credentials":[{"accessKey":"CORSDELKEY","secretKey":"corsdelsecret"}],"actions":["DeleteBucketCors:`+bucket+`"]},
+    {"name":"versioner","credentials":[{"accessKey":"VERSIONERKEY","secretKey":"versionersecret"}],"actions":["PutBucketVersioning:`+bucket+`"]},
+    {"name":"policyuser","credentials":[{"accessKey":"POLICYUSERKEY","secretKey":"policyusersecret"}],"policyNames":["ConfigPolicy"]}
+  ],
+  "policies": [
+    {"name":"ConfigPolicy","content":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutBucketCors\",\"s3:DeleteBucketCors\",\"s3:PutBucketVersioning\"],\"Resource\":[\"arn:aws:s3:::`+bucket+`\"]}]}"}
+  ]
+}`), 0600))
+
+	s3a := setupRoutingTestServer(t)
+	s3a.iam = NewIdentityAccessManagementWithStore(&S3ApiServerOption{Config: configFile}, nil, "memory")
+	require.True(t, s3a.iam.isEnabled())
+	s3a.cb = &CircuitBreaker{s3a: s3a}
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	s3a.bucketConfigCache.SetNegativeCache(bucket)
+	router := mux.NewRouter()
+	s3a.registerRouter(router)
+
+	send := func(accessKey, secretKey, method, query, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "http://localhost:8333/"+bucket+"?"+query, strings.NewReader(body))
+		creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
+		_, err := v4.NewSigner(creds).Sign(req, strings.NewReader(body), "s3", "us-east-1", time.Now())
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		return rr
+	}
+
+	const corsXML = `<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`
+	const versioningXML = `<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`
+	singleActionKeys := map[string]string{"CORSPUTKEY": "corsputsecret", "CORSDELKEY": "corsdelsecret", "VERSIONERKEY": "versionersecret"}
+	for _, tc := range []struct {
+		method, query, body, allowedKey string
+	}{
+		{http.MethodPut, "cors", corsXML, "CORSPUTKEY"},
+		{http.MethodDelete, "cors", "", "CORSDELKEY"},
+		{http.MethodPut, "versioning", versioningXML, "VERSIONERKEY"},
+	} {
+		denied := [][2]string{{"WRITERKEY", "writersecret"}}
+		allowed := [][2]string{{"BUCKETADMINKEY", "bucketadminsecret"}, {"POLICYUSERKEY", "policyusersecret"}}
+		for key, secret := range singleActionKeys {
+			if key == tc.allowedKey {
+				allowed = append(allowed, [2]string{key, secret})
+			} else {
+				denied = append(denied, [2]string{key, secret})
+			}
+		}
+		for _, key := range denied {
+			rr := send(key[0], key[1], tc.method, tc.query, tc.body)
+			assert.Equal(t, http.StatusForbidden, rr.Code, "%s %s ?%s", key[0], tc.method, tc.query)
+			assert.Contains(t, rr.Body.String(), "AccessDenied", "%s %s ?%s", key[0], tc.method, tc.query)
+		}
+		for _, key := range allowed {
+			rr := send(key[0], key[1], tc.method, tc.query, tc.body)
+			assert.Equal(t, http.StatusNotFound, rr.Code, "%s %s ?%s", key[0], tc.method, tc.query)
+			assert.Contains(t, rr.Body.String(), "NoSuchBucket", "%s %s ?%s", key[0], tc.method, tc.query)
+		}
+	}
+
+	for policyAction, identityAction := range map[string]string{
+		"s3:PutBucketCors":       s3_constants.ACTION_PUT_BUCKET_CORS,
+		"s3:DeleteBucketCors":    s3_constants.ACTION_DELETE_BUCKET_CORS,
+		"s3:PutBucketVersioning": s3_constants.ACTION_PUT_BUCKET_VERSIONING,
+	} {
+		assert.Equal(t, identityAction, iamMapToStatementAction(policyAction), policyAction)
+		assert.Equal(t, policyAction, "s3:"+iamMapToIdentitiesAction(identityAction), identityAction)
 	}
 }

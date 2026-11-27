@@ -7,7 +7,6 @@ package s3api
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -21,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
@@ -216,14 +216,23 @@ func collectBucketUsageFromTopology(t *master_pb.TopologyInfo, collectionName st
 }
 
 // calculateClusterCapacity sums up the total and available capacity of the entire cluster.
+// Slot counts are an admission bound, not a capacity measurement — -max can
+// be set higher than the volumes a disk actually fills — so a disk that
+// reports physical counters is capped by them.
 func calculateClusterCapacity(t *master_pb.TopologyInfo, volumeSizeLimitMb uint64) (total, available int64) {
 	volumeSize := int64(volumeSizeLimitMb) * 1024 * 1024
 	for _, dc := range t.DataCenterInfos {
 		for _, r := range dc.RackInfos {
 			for _, dn := range r.DataNodeInfos {
 				for _, disk := range dn.DiskInfos {
-					total += int64(disk.MaxVolumeCount) * volumeSize
-					available += int64(disk.FreeVolumeCount) * volumeSize
+					slotTotal := int64(disk.MaxVolumeCount) * volumeSize
+					slotFree := int64(disk.FreeVolumeCount) * volumeSize
+					if disk.DiskTotalBytes > 0 {
+						slotTotal = min(slotTotal, int64(disk.DiskTotalBytes))
+						slotFree = min(slotFree, int64(disk.DiskFreeBytes))
+					}
+					total += slotTotal
+					available += slotFree
 				}
 			}
 		}
@@ -250,8 +259,7 @@ func (s3a *S3ApiServer) handleSOSAPIGetObject(w http.ResponseWriter, r *http.Req
 	}
 
 	// Calculate ETag from content
-	hash := md5.Sum(xmlData)
-	etag := hex.EncodeToString(hash[:])
+	etag := hex.EncodeToString(util.Md5(xmlData))
 
 	// Set ETag header manually as ServeContent doesn't calculate it automatically
 	w.Header().Set("ETag", "\""+etag+"\"")
@@ -282,8 +290,7 @@ func (s3a *S3ApiServer) handleSOSAPIHeadObject(w http.ResponseWriter, r *http.Re
 	}
 
 	// Calculate ETag from content
-	hash := md5.Sum(xmlData)
-	etag := hex.EncodeToString(hash[:])
+	etag := hex.EncodeToString(util.Md5(xmlData))
 
 	// Set response headers (no body for HEAD)
 	w.Header().Set("Content-Type", "application/xml")

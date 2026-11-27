@@ -42,6 +42,8 @@ type stubFilerStore struct {
 	kvDeleteErr     error
 	kvGetHook       func(key []byte)
 	deleteErrByPath map[string]error
+	updateErr       error
+	deleteFolderErr error
 }
 
 func newStubFilerStore() *stubFilerStore {
@@ -102,6 +104,9 @@ func (s *stubFilerStore) KvDelete(_ context.Context, key []byte) error {
 func (s *stubFilerStore) DeleteFolderChildren(_ context.Context, dirPath util.FullPath) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deleteFolderErr != nil {
+		return s.deleteFolderErr
+	}
 	prefix := string(dirPath) + "/"
 	for k := range s.entries {
 		if strings.HasPrefix(k, prefix) {
@@ -113,7 +118,7 @@ func (s *stubFilerStore) DeleteFolderChildren(_ context.Context, dirPath util.Fu
 func (s *stubFilerStore) listDirectoryChildNames(dirPath util.FullPath, startFileName string, includeStartFile bool, namePrefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	var names []string
 	for k := range s.entries {
 		if !strings.HasPrefix(k, dirPrefix) {
@@ -140,7 +145,7 @@ func (s *stubFilerStore) getEntry(path string) *Entry {
 }
 func (s *stubFilerStore) ListDirectoryEntries(_ context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc ListEachEntryFunc) (string, error) {
 	names := s.listDirectoryChildNames(dirPath, startFileName, includeStartFile, "")
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	lastFileName := ""
 	for i, name := range names {
 		if int64(i) >= limit {
@@ -160,7 +165,7 @@ func (s *stubFilerStore) ListDirectoryEntries(_ context.Context, dirPath util.Fu
 }
 func (s *stubFilerStore) ListDirectoryPrefixedEntries(_ context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc ListEachEntryFunc) (string, error) {
 	names := s.listDirectoryChildNames(dirPath, startFileName, includeStartFile, prefix)
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	lastFileName := ""
 	for i, name := range names {
 		if int64(i) >= limit {
@@ -192,6 +197,9 @@ func (s *stubFilerStore) InsertEntry(_ context.Context, entry *Entry) error {
 func (s *stubFilerStore) UpdateEntry(_ context.Context, entry *Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.updateErr != nil {
+		return s.updateErr
+	}
 	s.entries[string(entry.FullPath)] = entry
 	return nil
 }
@@ -206,7 +214,7 @@ func (s *stubFilerStore) FindEntry(_ context.Context, p util.FullPath) (*Entry, 
 		return nil, err
 	}
 	if e, ok := s.entries[string(p)]; ok {
-		return e, nil
+		return e.ShallowClone(), nil
 	}
 	return nil, filer_pb.ErrNotFound
 }
@@ -329,13 +337,22 @@ func newTestFiler(t *testing.T, store *stubFilerStore, rs *FilerRemoteStorage) *
 		LocalMetaLogBuffer: log_buffer.NewLogBuffer("test", time.Minute,
 			func(*log_buffer.LogBuffer, time.Time, time.Time, []byte, int64, int64) {}, nil, func() {}),
 	}
+	// A live LogBuffer keeps its flush loops and their multi-buffer pool
+	// reachable; without this the package's filers pin gigabytes on 32-bit.
+	t.Cleanup(func() {
+		f.LocalMetaLogBuffer.ShutdownLogBuffer()
+		f.LocalMetaLogBuffer.WaitForShutdown()
+	})
 	return f
 }
 
 // registerStubMaker registers a stub RemoteStorageClientMaker for the given
 // type string and returns a cleanup function that restores the previous maker.
+// Both empty the client cache, so a rerun with the same configuration builds
+// a client from this stub instead of reusing the previous run's.
 func registerStubMaker(t *testing.T, storageType string, client remote_storage.RemoteStorageClient) func() {
 	t.Helper()
+	remote_storage.ResetRemoteStorageClients()
 	prev := remote_storage.RemoteStorageClientMakers[storageType]
 	remote_storage.RemoteStorageClientMakers[storageType] = &stubClientMaker{client: client}
 	return func() {
@@ -344,6 +361,7 @@ func registerStubMaker(t *testing.T, storageType string, client remote_storage.R
 		} else {
 			delete(remote_storage.RemoteStorageClientMakers, storageType)
 		}
+		remote_storage.ResetRemoteStorageClients()
 	}
 }
 
@@ -551,7 +569,7 @@ func TestDeleteEntryMetaAndData_EmptyFolderUnderMountKeepsRemotePrefix(t *testin
 	dirPath := util.FullPath("/buckets/mybucket/dir")
 	putDirEntry(store, string(dirPath))
 
-	require.NoError(t, f.DeleteEntryMetaAndData(context.Background(), dirPath, false, false, false, false, nil, 0))
+	require.NoError(t, f.DeleteEntryMetaAndData(context.Background(), dirPath, false, false, false, false, nil, time.Time{}))
 
 	assert.Empty(t, stub.removeCalls, "an empty local folder must not remove its remote prefix")
 	assert.Nil(t, store.getEntry(string(dirPath)))
@@ -728,6 +746,48 @@ func TestMaybeLazyFetchFromRemote_ContextGuardPreventsRecursion(t *testing.T) {
 	assert.Equal(t, 0, countingStub.statCalls, "guard should prevent StatFile from being called")
 }
 
+func TestCreateEntry_SkipsTheLazyFetchInsideAStoreTransaction(t *testing.T) {
+	const storageType = "stub_lazy_tx"
+	countingStub := &countingRemoteClient{
+		stubRemoteClient: stubRemoteClient{
+			statResult: &filer_pb.RemoteEntry{RemoteMtime: 1, RemoteSize: 1},
+		},
+	}
+	f, store := newMountedTestFiler(t, storageType, countingStub, 0)
+	putDirEntry(store, "/buckets/mybucket/dir")
+	// the stub opens no transaction of its own; the filer marks it anyway
+	txCtx, err := f.BeginTransaction(context.Background())
+	require.NoError(t, err)
+
+	// a create inside the transaction: its lookup does not consult the
+	// remote, the entry is inserted as given
+	created := &Entry{FullPath: "/buckets/mybucket/dir/a.txt", Attr: Attr{Mode: 0644, Mtime: time.Now(), Crtime: time.Now()}}
+	require.NoError(t, f.CreateEntry(txCtx, created, nil, false, false, nil, false, f.MaxFilenameLength))
+	assert.Equal(t, 0, countingStub.statCalls, "a create inside a transaction must not consult the remote")
+	got, err := f.FindEntry(txCtx, "/buckets/mybucket/dir/a.txt")
+	require.NoError(t, err)
+	assert.False(t, got.IsInRemoteOnly())
+
+	// a read inside the transaction keeps the fetch: a target the filer only
+	// holds on the remote is still seen by a rename's target check
+	entry, err := f.FindEntry(txCtx, "/buckets/mybucket/dir/b.txt")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.True(t, entry.IsInRemoteOnly())
+	assert.NotZero(t, countingStub.statCalls)
+
+	// an exclusive create inside the transaction still sees the remote object
+	excl := &Entry{FullPath: "/buckets/mybucket/dir/c.txt", Attr: Attr{Mode: 0644, Mtime: time.Now(), Crtime: time.Now()}}
+	err = f.CreateEntry(txCtx, excl, nil, true, false, nil, false, f.MaxFilenameLength)
+	assert.ErrorIs(t, err, filer_pb.ErrEntryAlreadyExists)
+
+	// outside a transaction a create still consults the remote
+	statCalls := countingStub.statCalls
+	plain := &Entry{FullPath: "/buckets/mybucket/dir/d.txt", Attr: Attr{Mode: 0644, Mtime: time.Now(), Crtime: time.Now()}}
+	require.NoError(t, f.CreateEntry(context.Background(), plain, nil, false, false, nil, false, f.MaxFilenameLength))
+	assert.Greater(t, countingStub.statCalls, statCalls)
+}
+
 func TestMaybeLazyFetchFromRemote_GuardedClientRejectsEndpoint(t *testing.T) {
 	const storageType = "stub_lazy_guarded"
 	countingStub := &countingRemoteClient{
@@ -818,7 +878,7 @@ func TestDeleteEntryMetaAndData_GuardedClientRejectsRemoteBackedFile(t *testing.
 		return nil, fmt.Errorf("reject remote endpoint")
 	}
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.Error(t, err, "guarded rejection should block the remote-backed delete")
 	assert.Len(t, stub.deleteCalls, 0, "guarded rejection should not reach the remote")
 }
@@ -854,7 +914,7 @@ func TestDeleteEntryMetaAndData_GuardedClientAllowsLocalOnlyFile(t *testing.T) {
 		return nil, fmt.Errorf("reject remote endpoint")
 	}
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.NoError(t, err, "local-only file should delete despite a rejected mount endpoint")
 	_, findErr := store.FindEntry(context.Background(), filePath)
 	require.ErrorIs(t, findErr, filer_pb.ErrNotFound, "local metadata should be deleted")
@@ -921,7 +981,7 @@ func TestDeleteEntryMetaAndData_RemoteOnlyFileDeletesRemoteAndMetadata(t *testin
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.NoError(t, err)
 
 	_, findErr := store.FindEntry(context.Background(), filePath)
@@ -961,7 +1021,7 @@ func TestDeleteEntryMetaAndData_IsFromOtherClusterSkipsRemoteDelete(t *testing.T
 	f := newTestFiler(t, store, rs)
 
 	// isFromOtherCluster=true simulates a replicated delete from another filer
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, true, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, true, nil, time.Time{})
 	require.NoError(t, err)
 
 	// Local metadata should be deleted
@@ -1018,7 +1078,7 @@ func TestDeleteEntryMetaAndData_UnmountedDirectorySkipsRemoteDelete(t *testing.T
 	_, remoteLoc = f.RemoteStorage.FindMountDirectory(filePath)
 	require.Nil(t, remoteLoc)
 
-	require.NoError(t, f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, true, false, nil, 0))
+	require.NoError(t, f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, true, false, nil, time.Time{}))
 	require.Len(t, stub.deleteCalls, 0)
 	require.Len(t, stub.removeCalls, 0)
 }
@@ -1051,7 +1111,7 @@ func TestDeleteEntryMetaAndData_RemoteOnlyFileNotUnderMountSkipsRemoteDelete(t *
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, stub.deleteCalls, 0)
 }
@@ -1079,7 +1139,7 @@ func TestDeleteEntryMetaAndData_RemoteMountWithoutClientResolutionKeepsMetadata(
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.Error(t, err)
 	require.ErrorContains(t, err, "resolve remote storage client")
 	require.ErrorContains(t, err, string(filePath))
@@ -1118,7 +1178,7 @@ func TestDeleteEntryMetaAndData_LocalDeleteFailurePreservesMetadata(t *testing.T
 	store.deleteErrByPath[string(filePath)] = errors.New("simulated local delete failure")
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.Error(t, err)
 	require.ErrorContains(t, err, "filer store delete")
 	require.Len(t, stub.deleteCalls, 1)
@@ -1157,7 +1217,7 @@ func TestDeleteEntryMetaAndData_RemoteDeleteNotFoundStillDeletesMetadata(t *test
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.NoError(t, err)
 	_, findErr := store.FindEntry(context.Background(), filePath)
 	require.ErrorIs(t, findErr, filer_pb.ErrNotFound)
@@ -1191,7 +1251,7 @@ func TestDeleteEntryMetaAndData_RemoteDeleteErrorKeepsMetadata(t *testing.T) {
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), filePath, false, false, false, false, nil, time.Time{})
 	require.Error(t, err)
 	stored, findErr := store.FindEntry(context.Background(), filePath)
 	require.NoError(t, findErr)
@@ -1272,7 +1332,7 @@ func TestDeleteEntryMetaAndData_RecursiveFolderDeleteRemotesChildren(t *testing.
 	}
 	f := newTestFiler(t, store, rs)
 
-	err := f.DeleteEntryMetaAndData(context.Background(), dirPath, true, false, false, false, nil, 0)
+	err := f.DeleteEntryMetaAndData(context.Background(), dirPath, true, false, false, false, nil, time.Time{})
 	require.NoError(t, err)
 
 	// Child file should have been deleted from remote

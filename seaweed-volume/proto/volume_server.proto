@@ -147,6 +147,7 @@ service VolumeServer {
 message BatchDeleteRequest {
     repeated string file_ids = 1;
     bool skip_cookie_check = 2;
+    bool fsync = 3;
 }
 
 message BatchDeleteResponse {
@@ -230,9 +231,23 @@ message VolumeSyncStatusResponse {
 message VolumeIncrementalCopyRequest {
     uint32 volume_id = 1;
     uint64 since_ns = 2;
+    // The backup's index position and last entry. When set, the replica
+    // resumes by entry position instead of by its own append_at_ns stamp,
+    // which differs across replicas for the same needle.
+    uint64 entry_count = 3;
+    uint64 last_needle_key = 4;
+    uint32 last_needle_cookie = 5;
+    int32 last_needle_size = 6;
+    // FNV-1a checksum of the (key, size) of every local index entry,
+    // verifying the whole prefix since replica record order can differ.
+    uint64 entries_hash = 7;
 }
 message VolumeIncrementalCopyResponse {
     bytes file_content = 1;
+    // Index rows after the copy's entry_count, verbatim. A remote-tier
+    // tombstone is an index-only row with no .dat record, so it can only
+    // reach the backup through this stream.
+    bytes idx_content = 2;
 }
 
 message VolumeMountRequest {
@@ -456,6 +471,7 @@ message VolumeEcShardsGenerateResponse {
 message VolumeEcShardsRebuildRequest {
     uint32 volume_id = 1;
     string collection = 2;
+    bool unsafe_ignore_sidecar = 3; // bypass the bitrot-sidecar fail-closed guard (operator override; distinct from ec.rebuild -force)
 }
 message VolumeEcShardsRebuildResponse {
     repeated uint32 rebuilt_shard_ids = 1;
@@ -471,6 +487,7 @@ message VolumeEcShardsCopyRequest {
     bool copy_vif_file = 7;
     uint32 disk_id = 8;  // Target disk ID for storing EC shards
     bool copy_ecsum_file = 9; // copy the bitrot checksum sidecar (.ecsum) when present; tolerant of a missing source (no-op), since this non-2PC path has no Prepare backstop
+    string disk_type = 11; // with disk_id 0, pick only among disks of this type; empty means any
 }
 message VolumeEcShardsCopyResponse {
 }

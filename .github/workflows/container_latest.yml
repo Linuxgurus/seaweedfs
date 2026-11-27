@@ -30,6 +30,11 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.event.inputs.image_tag || github.run_id }}
+  cancel-in-progress: false
+  queue: max
+
 permissions:
   contents: read
   security-events: write
@@ -61,7 +66,7 @@ jobs:
 
   # ── Pre-build the Rust binaries natively ────────────────────────────
   build-rust-binaries:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -69,31 +74,21 @@ jobs:
             arch: amd64
           - target: aarch64-unknown-linux-musl
             arch: arm64
-            cross: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # The checkout above is the source ref, which may predate these
+      # actions; take them from master, the ref this fallback runs from.
+      - name: Set up the musl target
+        uses: seaweedfs/seaweedfs/.github/actions/rust-musl-target@master
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl tools (amd64)
-        if: ${{ !matrix.cross }}
-        run: sudo apt-get install -y musl-tools
-
-      - name: Install cross-compilation tools (arm64)
-        if: matrix.cross
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          # Disable glibc fortify source — its __memcpy_chk etc. symbols don't exist in musl
-          echo "CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE" >> "$GITHUB_ENV"
+          target: ${{ matrix.target }}
 
       - name: Cache cargo registry and target
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v6
         with:
           path: |
@@ -101,7 +96,8 @@ jobs:
             ~/.cargo/git
             seaweed-volume/target
             seaweed-worker/target/${{ matrix.target }}/release
-          key: rust-docker-${{ matrix.target }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-worker/Cargo.lock') }}
+            seaweed-vector/target/${{ matrix.target }}/release
+          key: rust-docker-${{ matrix.target }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-worker/Cargo.lock', 'seaweed-vector/Cargo.lock') }}
           restore-keys: |
             rust-docker-${{ matrix.target }}-
 
@@ -142,6 +138,17 @@ jobs:
           cargo build --release -p weed-lance-worker --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/weed-worker ../weed-worker-${{ matrix.arch }}
 
+      - name: Build the vector engine
+        run: |
+          # An older source_ref predates the engine; its image goes without one.
+          if [ ! -f seaweed-vector/crates/server/Cargo.toml ]; then
+            echo "No vector engine in this source ref"
+            exit 0
+          fi
+          cd seaweed-vector
+          cargo build --release -p weed-vector-server --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/weed-vector ../weed-vector-${{ matrix.arch }}
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -150,6 +157,7 @@ jobs:
             weed-volume-large-disk-${{ matrix.arch }}
             weed-volume-normal-${{ matrix.arch }}
             weed-worker-${{ matrix.arch }}
+            weed-vector-${{ matrix.arch }}
 
   build:
     needs: [setup, build-rust-binaries]
@@ -164,10 +172,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
+      - name: Clean up stale FUSE mounts
+        uses: seaweedfs/seaweedfs/.github/actions/cleanup-stale-fuse-mounts@master
+
       - name: Free Disk Space
         run: |
           echo "Available disk space before cleanup:"
-          df -h
+          timeout 15 df -h || true
           # Remove pre-installed tools
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           # Clean package managers
@@ -179,7 +190,7 @@ jobs:
           [ -d ~/.cache/go-build ] && rm -rf ~/.cache/go-build || true
           [ -d /go/pkg ] && rm -rf /go/pkg || true
           echo "Available disk space after cleanup:"
-          df -h
+          timeout 15 df -h || true
       
       - name: Configure variant
         id: config
@@ -219,8 +230,17 @@ jobs:
               echo "Placed pre-built Rust worker for ${arch}"
             fi
           done
+          mkdir -p docker/weed-vector-prebuilt
+          for arch in amd64 arm64; do
+            src="./rust-bins/weed-vector-${arch}"
+            if [ -f "$src" ]; then
+              cp "$src" "docker/weed-vector-prebuilt/weed-vector-${arch}"
+              echo "Placed pre-built vector engine for ${arch}"
+            fi
+          done
           ls -la docker/weed-volume-prebuilt/
           ls -la docker/weed-worker-prebuilt/
+          ls -la docker/weed-vector-prebuilt/
 
       - name: Docker meta
         id: docker_meta
@@ -250,13 +270,13 @@ jobs:
           buildkitd-config: /tmp/buildkitd.toml
       - name: Login to Docker Hub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Login to GHCR
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -304,7 +324,7 @@ jobs:
           fi
       - name: Login to GHCR
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -344,8 +364,17 @@ jobs:
               echo "Placed pre-built Rust worker for ${arch}"
             fi
           done
+          mkdir -p docker/weed-vector-prebuilt
+          for arch in amd64 arm64; do
+            src="./rust-bins/weed-vector-${arch}"
+            if [ -f "$src" ]; then
+              cp "$src" "docker/weed-vector-prebuilt/weed-vector-${arch}"
+              echo "Placed pre-built vector engine for ${arch}"
+            fi
+          done
           ls -la docker/weed-volume-prebuilt/
           ls -la docker/weed-worker-prebuilt/
+          ls -la docker/weed-vector-prebuilt/
       - name: Create BuildKit config for local scan build
         if: needs.setup.outputs.publish != 'true'
         run: |
@@ -405,7 +434,7 @@ jobs:
           output: trivy-results.sarif
           exit-code: '0'
       - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4.39.0
+        uses: github/codeql-action/upload-sarif@v4.39.3
         if: always()
         with:
           sarif_file: trivy-results.sarif
@@ -472,12 +501,12 @@ jobs:
             ghcr.io/chrislusf/seaweedfs
           tags: type=raw,value=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag || 'latest' }},suffix=${{ steps.config.outputs.tag_suffix }}
       - name: Login to Docker Hub
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Login to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}

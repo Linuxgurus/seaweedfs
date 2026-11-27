@@ -62,7 +62,7 @@ func TestMarkVolumeReadonlyCanDelete(t *testing.T) {
 
 	_, err = store.WriteVolumeNeedle(vid, newRandomNeedle(3), true, false)
 	require.Error(t, err, "writes must be rejected")
-	_, err = store.DeleteVolumeNeedle(vid, n1)
+	_, err = store.DeleteVolumeNeedle(vid, n1, false)
 	require.NoError(t, err, "deletes must still land")
 
 	store.Close()
@@ -74,14 +74,14 @@ func TestMarkVolumeReadonlyCanDelete(t *testing.T) {
 
 	_, err = store2.WriteVolumeNeedle(vid, newRandomNeedle(4), true, false)
 	require.Error(t, err, "writes must stay rejected after restart")
-	_, err = store2.DeleteVolumeNeedle(vid, n2)
+	_, err = store2.DeleteVolumeNeedle(vid, n2, false)
 	require.NoError(t, err, "deletes must still land after restart")
 
 	// Downgrading to plain readonly clears the canDelete flag.
 	require.NoError(t, store2.MarkVolumeReadonly(vid, false, true))
 	require.True(t, v2.noWriteOrDelete)
 	require.False(t, v2.noWriteCanDelete)
-	_, err = store2.DeleteVolumeNeedle(vid, n2)
+	_, err = store2.DeleteVolumeNeedle(vid, n2, false)
 	require.Error(t, err, "plain readonly must reject deletes")
 
 	// -writable clears the state again.
@@ -110,13 +110,13 @@ func TestMarkVolumeReadonlyCanDelete_AfterReadonlyBoot(t *testing.T) {
 	v := store2.GetVolume(vid)
 	require.NotNil(t, v)
 	require.True(t, v.noWriteOrDelete)
-	_, err = store2.DeleteVolumeNeedle(vid, n)
+	_, err = store2.DeleteVolumeNeedle(vid, n, false)
 	require.Error(t, err, "plain readonly must reject deletes")
 
 	require.NoError(t, store2.MarkVolumeReadonly(vid, true, true))
 	require.False(t, v.noWriteOrDelete)
 	require.True(t, v.noWriteCanDelete)
-	_, err = store2.DeleteVolumeNeedle(vid, n)
+	_, err = store2.DeleteVolumeNeedle(vid, n, false)
 	require.NoError(t, err, "deletes must land once canDelete is set")
 	store2.Close()
 }
@@ -151,4 +151,45 @@ func TestMountVolumeAnnouncesReadOnlyState(t *testing.T) {
 			require.Equal(t, tc.canDelete, message.ReadOnlyCanDelete)
 		})
 	}
+}
+
+// After a restart a canDelete volume is served from .sdx; its deletes must
+// still move the counters volume.deleteEmpty and vacuum read, and land them
+// where the next reload would.
+func TestMarkVolumeReadonlyCanDelete_CountsDeletesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := newSingleDirStore(t, dir)
+	const vid = needle.VolumeId(13)
+	require.NoError(t, store.AddVolume(vid, "", NeedleMapInMemory, "000", "", 0, needle.GetCurrentVersion(), 0, types.HardDriveType, 0))
+
+	needles := []*needle.Needle{newRandomNeedle(1), newRandomNeedle(2), newRandomNeedle(3)}
+	for _, n := range needles {
+		_, err := store.WriteVolumeNeedle(vid, n, true, false)
+		require.NoError(t, err)
+	}
+	require.NoError(t, store.MarkVolumeReadonly(vid, true, true))
+	store.Close()
+
+	store2 := newSingleDirStore(t, dir)
+	v := store2.GetVolume(vid)
+	require.NotNil(t, v)
+	require.IsType(t, &SortedFileNeedleMap{}, v.nm)
+	for _, n := range needles {
+		_, err := store2.DeleteVolumeNeedle(vid, n, false)
+		require.NoError(t, err)
+	}
+	counters := func(v *Volume) [4]uint64 {
+		return [4]uint64{v.FileCount(), v.DeletedCount(), v.ContentSize(), v.DeletedSize()}
+	}
+	afterDeletes := counters(v)
+	require.Equal(t, uint64(len(needles)), afterDeletes[0])
+	require.Equal(t, afterDeletes[0], afterDeletes[1], "an emptied volume must report every file deleted")
+	require.Equal(t, afterDeletes[2], afterDeletes[3])
+	store2.Close()
+
+	store3 := newSingleDirStore(t, dir)
+	v3 := store3.GetVolume(vid)
+	require.NotNil(t, v3)
+	require.Equal(t, afterDeletes, counters(v3))
+	store3.Close()
 }

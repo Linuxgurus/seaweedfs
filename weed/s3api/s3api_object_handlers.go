@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
@@ -288,8 +289,37 @@ func isCanceledStreamingError(err error) bool {
 	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }
 
-func shouldWriteStreamingErrorResponse(err error) bool {
-	return err != nil && !isCanceledStreamingError(err)
+// writeStreamErrorResponse answers a stream failure unless the stream already
+// wrote a response. A canceled error is answered too: the idle timeout and a
+// shared lookup canceled by another request both cancel it while the client is
+// still connected, and returning silently would send that client an empty 200.
+// A client that has gone away never sees the write; it is answered
+// ClientDisconnected so that an aborted download does not count as a 5xx.
+func writeStreamErrorResponse(w http.ResponseWriter, r *http.Request, err error) {
+	var streamErr *StreamError
+	if errors.As(err, &streamErr) && streamErr.ResponseWritten {
+		return
+	}
+	if errors.Is(err, util_http.ErrTooManyRequests) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
+		return
+	}
+	if isCanceledStreamingError(err) && util.ClientGone(r.Context()) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrClientDisconnected)
+		return
+	}
+	s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+}
+
+// logCanceledStream logs a canceled stream at V(3) when the request context is
+// canceled too, since that is usually the client leaving, and as a warning when
+// only shared work was canceled under a live request.
+func logCanceledStream(r *http.Request, caller, bucket, object string, err error) {
+	if r.Context().Err() != nil {
+		glog.V(3).Infof("%s: request canceled while streaming %s/%s: %v", caller, bucket, object, err)
+		return
+	}
+	glog.Warningf("%s: streaming %s/%s canceled under a live request: %v", caller, bucket, object, err)
 }
 
 func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
@@ -339,6 +369,8 @@ func removeDuplicateSlashes(object string) string {
 
 // hasChildren checks if a path has any child objects (is a directory with contents).
 // On unexpected errors, it logs and conservatively returns true to avoid hiding entries.
+// It answers the listing, where keeping an entry is the safe side; HEAD of a 0-byte
+// file asks zeroByteFileHasChildren instead, which fails the other way.
 //
 // This helper function is used to distinguish implicit directories from regular files or empty directories.
 // An implicit directory is one that exists only because it has children, not because it was explicitly created.
@@ -348,10 +380,6 @@ func removeDuplicateSlashes(object string) string {
 //   - Returns true if any child exists, false otherwise
 //   - Efficient: only fetches one entry to minimize overhead
 //
-// Used by HeadObjectHandler to implement AWS S3-compatible implicit directory behavior:
-//   - If a 0-byte object or directory has children → it's an implicit directory → HEAD returns 404
-//   - If a 0-byte object or directory has no children → it's empty → HEAD returns 200
-//
 // Examples:
 //
 //	hasChildren("bucket", "dataset") where "dataset/file.txt" exists → true
@@ -359,6 +387,46 @@ func removeDuplicateSlashes(object string) string {
 //
 // Performance: ~1-5ms per call (one gRPC LIST request with Limit=1)
 func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) bool {
+	found, err := s3a.probeChildren(ctx, bucket, prefix)
+	if err != nil {
+		glog.V(1).Infof("hasChildren: list entries failed for %s/%s: %v", bucket, strings.TrimPrefix(prefix, "/"), err)
+		return true
+	}
+	return found
+}
+
+// zeroByteFileHasChildren reports whether a regular 0-byte file has children, which
+// makes HEAD answer it as an implicit directory (404) so clients like s3fs fall back
+// to LIST:
+//   - If the 0-byte file has children → it's an implicit directory → HEAD returns 404
+//   - If it has no children → it's an empty file → HEAD returns 200
+//
+// The file was just found, so a probe that fails is no evidence of children, and a
+// 404 would tell the client an existing object is gone: a copy tool that HEADs the
+// key it just wrote then reports the copy as failed. A failed probe therefore
+// answers false and HEAD serves the file. One way the probe fails is a request
+// context canceled while the client still waits for the answer: net/http cancels
+// a connection's context when its background read fails, and a keep-alive
+// connection whose read deadline expired during a long, silent request goes on
+// serving later requests with that canceled context.
+func (s3a *S3ApiServer) zeroByteFileHasChildren(ctx context.Context, bucket, object string) bool {
+	found, err := s3a.probeChildren(ctx, bucket, object)
+	if err != nil {
+		glog.V(1).Infof("HEAD %s/%s: child probe failed, serving the 0-byte file: %v", bucket, strings.TrimPrefix(object, "/"), err)
+		return false
+	}
+	return found
+}
+
+// probeChildren lists at most one child of prefix. A prefix the filer does not
+// know has no children.
+func (s3a *S3ApiServer) probeChildren(ctx context.Context, bucket, prefix string) (bool, error) {
+	// With the context already ended every filer of the failover walk would fail
+	// at once and be counted as a failed filer; there is nothing to ask.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	// Clean up prefix: remove leading slashes
 	cleanPrefix := strings.TrimPrefix(prefix, "/")
 
@@ -377,13 +445,12 @@ func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) 
 	}, "", true, 1)
 
 	if err == nil {
-		return found
+		return found, nil
 	}
 	if errors.Is(err, filer_pb.ErrNotFound) {
-		return false
+		return false, nil
 	}
-	glog.V(1).Infof("hasChildren: list entries failed for %s/%s: %v", bucket, cleanPrefix, err)
-	return true
+	return false, err
 }
 
 // isBareDirectory reports whether entry is a directory carrying no object data of its own.
@@ -416,7 +483,6 @@ func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.E
 		return nil, false, nil // Not a directory object
 	}
 
-	bucketDir := s3a.bucketDir(bucket)
 	cleanObject := strings.TrimSuffix(object, "/")
 
 	if cleanObject == "" {
@@ -424,7 +490,7 @@ func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.E
 	}
 
 	// Check if directory exists
-	dirEntry, err := s3a.getEntry(bucketDir, cleanObject)
+	dirEntry, err := s3a.getObjectEntryRoutedByKey(bucket, cleanObject)
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) {
 			return nil, true, nil // Directory object requested but doesn't exist
@@ -445,7 +511,12 @@ func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.E
 func (s3a *S3ApiServer) resolveObjectEntry(bucket, object, versionId string) (*filer_pb.Entry, error) {
 	// Check if versioning is configured
 	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
-	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			// Keep filer_pb.ErrNotFound in the error chain so callers that only
+			// check not-found do not misclassify a missing bucket as internal error.
+			return nil, fmt.Errorf("%w: %w", ErrBucketNotFound, err)
+		}
 		glog.Errorf("resolveObjectEntry: error checking versioning config for %s: %v", bucket, err)
 		return nil, err
 	}
@@ -462,8 +533,7 @@ func (s3a *S3ApiServer) resolveObjectEntry(bucket, object, versionId string) (*f
 	}
 
 	// For non-versioned buckets, verify directly
-	bucketDir := s3a.bucketDir(bucket)
-	return s3a.getEntry(bucketDir, object)
+	return s3a.getObjectEntryRoutedByKey(bucket, object)
 }
 
 // serveDirectoryContent serves the content of a directory object directly
@@ -481,20 +551,12 @@ func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Req
 	if r.Method != http.MethodHead && len(entry.Content) == 0 && len(entry.Chunks) > 0 {
 		sseType := s3a.detectPrimarySSEType(entry)
 		if err := s3a.streamFromVolumeServersWithSSE(w, r, entry, sseType, bucket, object, ""); err != nil {
-			var streamErr *StreamError
-			if errors.As(err, &streamErr) && streamErr.ResponseWritten {
-				return
-			}
 			if isCanceledStreamingError(err) {
-				glog.V(3).Infof("serveDirectoryContent: client disconnected while streaming %s/%s: %v", bucket, object, err)
-				return
+				logCanceledStream(r, "serveDirectoryContent", bucket, object, err)
+			} else {
+				glog.Errorf("serveDirectoryContent: failed to stream %s/%s: %v", bucket, object, err)
 			}
-			glog.Errorf("serveDirectoryContent: failed to stream %s/%s: %v", bucket, object, err)
-			if errors.Is(err, util_http.ErrTooManyRequests) {
-				s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
-			} else if shouldWriteStreamingErrorResponse(err) {
-				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			}
+			writeStreamErrorResponse(w, r, err)
 		}
 		return
 	}
@@ -774,7 +836,7 @@ func (s3a *S3ApiServer) processConditionalHeaders(w http.ResponseWriter, r *http
 	}
 
 	result := s3a.checkConditionalHeadersForReads(r, bucket, object)
-	if isAnonymousObjectRead(r) && result.Entry != nil {
+	if result.Entry != nil && (isAnonymousObjectRead(r) || s3a.isVersionFileKey(object, result.Entry.Extended)) {
 		// 304/412 are responses too: authorize before exposing the ETag or the
 		// outcome of a condition on an entry the caller cannot read.
 		if code := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), result.Entry.Extended, handlerName); code != s3err.ErrNone {
@@ -790,14 +852,61 @@ func (s3a *S3ApiServer) processConditionalHeaders(w http.ResponseWriter, r *http
 			w.Header().Set("ETag", result.ETag)
 		}
 
-		if result.ErrorCode == s3err.ErrNoSuchKey || result.ErrorCode == s3err.ErrNoSuchBucket {
-			s3a.writeAnonymousAwareNotFound(w, r, bucket, result.ErrorCode)
-		} else {
-			s3err.WriteErrorResponse(w, r, result.ErrorCode)
-		}
+		s3a.writeConditionalCheckError(w, r, bucket, object, handlerName, result)
 		return result, true // request handled
 	}
 	return result, false // request not handled
+}
+
+// writeConditionalCheckError answers a failed conditional-header check. A
+// missing-key answer still carries the delete marker's headers when the
+// condition failed against one, so a resuming client can tell a deleted key
+// from one that never existed.
+func (s3a *S3ApiServer) writeConditionalCheckError(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string, result ConditionalHeaderResult) {
+	if result.ErrorCode == s3err.ErrNoSuchKey && result.DeleteMarker != nil {
+		s3a.writeDeleteMarkerResponse(w, r, bucket, object, handlerName, result.DeleteMarker, "", "")
+		return
+	}
+	if result.ErrorCode == s3err.ErrNoSuchKey || result.ErrorCode == s3err.ErrNoSuchBucket {
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, result.ErrorCode)
+		return
+	}
+	s3err.WriteErrorResponse(w, r, result.ErrorCode)
+}
+
+// writeDeleteMarkerResponse answers a GET or HEAD that resolved to a delete
+// marker as S3 does: x-amz-delete-marker and the marker's version id, with
+// 404 NoSuchKey for the current version and 405 MethodNotAllowed when the
+// marker itself was requested by versionId. Anonymous reads never get a
+// delete marker (authorizeAnonymousObjectRead), so they keep the plain miss.
+func (s3a *S3ApiServer) writeDeleteMarkerResponse(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string, entry *filer_pb.Entry, markerVersionId, requestedVersionId string) {
+	if isAnonymousObjectRead(r) {
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+		return
+	}
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), entry.Extended, handlerName); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	// The entry's own version id wins: markers written outside the normal PUT
+	// path may lack the attribute yet still carry it in the v_<id> file name.
+	if versionId := versionIdFromEntry(entry); versionId != "" {
+		markerVersionId = versionId
+	}
+	if markerVersionId == "" {
+		markerVersionId = "null"
+	}
+	w.Header().Set(s3_constants.AmzDeleteMarker, "true")
+	w.Header().Set("x-amz-version-id", markerVersionId)
+	if requestedVersionId == "" {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		return
+	}
+	w.Header().Set("Allow", "DELETE")
+	if entry.Attributes != nil {
+		w.Header().Set("Last-Modified", time.Unix(entry.Attributes.Mtime, 0).UTC().Format(http.TimeFormat))
+	}
+	s3err.WriteErrorResponse(w, r, s3err.ErrMethodNotAllowed)
 }
 
 func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request) {
@@ -882,6 +991,18 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 			glog.V(3).Infof("GetObject: requesting specific version %s for %s/%s", versionId, bucket, object)
 			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
 			if err != nil {
+				if versionId == "null" && errors.Is(err, filer_pb.ErrNotFound) {
+					marker, markerErr := s3a.nullDeleteMarkerEntry(bucket, object)
+					if markerErr != nil {
+						glog.Errorf("GetObject: failed to look up null delete marker for %s/%s: %v", bucket, object, markerErr)
+						s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+						return
+					}
+					if marker != nil {
+						s3a.writeDeleteMarkerResponse(w, r, bucket, object, "GetObjectHandler", marker, "null", versionId)
+						return
+					}
+				}
 				glog.Errorf("Failed to get specific version %s: %v", versionId, err)
 				if errors.Is(err, filer_pb.ErrNotFound) {
 					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
@@ -902,7 +1023,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 			versionsDir := normalizedObject + s3_constants.VersionsFolder
 
 			// Quick check (no retries) for .versions/ directory
-			versionsEntry, versionsErr := s3a.getEntry(bucketDir, versionsDir)
+			versionsEntry, versionsErr := s3a.getObjectScopedEntryRoutedByKey(bucket, normalizedObject, bucketDir, versionsDir)
 
 			if versionsErr == nil && versionsEntry != nil {
 				// .versions/ exists, meaning real versions are stored there
@@ -915,7 +1036,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 				}
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
 				// .versions/ doesn't exist (confirmed not found), check regular path for null version
-				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
+				regularEntry, regularErr := s3a.getObjectEntryRoutedByKey(bucket, normalizedObject)
 				// A physical parent or bare-key object is not a trailing-slash null marker.
 				if regularErr == nil && isNullVersionObject(regularEntry, normalizedObject) {
 					// Found object at regular path - this is the null version
@@ -954,7 +1075,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 		// Check if this is a delete marker
 		if entry.Extended != nil {
 			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
-				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				s3a.writeDeleteMarkerResponse(w, r, bucket, object, "GetObjectHandler", entry, targetVersionId, versionId)
 				return
 			}
 		}
@@ -1069,27 +1190,13 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		switch {
 		case isCanceledStreamingError(err):
-			glog.V(3).Infof("GetObjectHandler: client disconnected while streaming %s/%s: %v", bucket, object, err)
-			return
+			logCanceledStream(r, "GetObjectHandler", bucket, object, err)
 		case errors.Is(err, context.DeadlineExceeded):
 			glog.Warningf("GetObjectHandler: deadline exceeded while streaming %s/%s: %v", bucket, object, err)
 		default:
 			glog.Errorf("GetObjectHandler: failed to stream %s/%s from volume servers: %v", bucket, object, err)
 		}
-		// Check if the streaming function already wrote an HTTP response
-		var streamErr *StreamError
-		if errors.As(err, &streamErr) && streamErr.ResponseWritten {
-			// Response already written (headers + status code), don't write again
-			// to avoid "superfluous response.WriteHeader call" and malformed S3 error bodies
-			return
-		}
-		// Response not yet written - safe to write S3 error response
-		// Check if error is due to volume server rate limiting (HTTP 429)
-		if errors.Is(err, util_http.ErrTooManyRequests) {
-			s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
-		} else if shouldWriteStreamingErrorResponse(err) {
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
+		writeStreamErrorResponse(w, r, err)
 		return
 	}
 }
@@ -1158,7 +1265,10 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			if written > 0 {
 				BucketTrafficSent(int64(written), r)
 			}
-			return err
+			if err != nil {
+				return newStreamErrorWithResponse(err)
+			}
+			return nil
 		}
 		// Non-range request for inline content
 		s3a.setResponseHeaders(w, r, entry, totalSize)
@@ -1167,7 +1277,10 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		if written > 0 {
 			BucketTrafficSent(int64(written), r)
 		}
-		return err
+		if err != nil {
+			return newStreamErrorWithResponse(err)
+		}
+		return nil
 	}
 
 	// Get chunks and validate BEFORE setting headers
@@ -1192,7 +1305,10 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 					return newStreamErrorWithResponse(fmt.Errorf("cached entry authorization failed: %v", code))
 				}
 			}
-			if cacheErr == nil && cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 {
+			// Swap only a fill of the resolved generation with matching size;
+			// totalSize, offset and size were computed from the first entry.
+			if cacheErr == nil && cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 &&
+				sameRemoteObject(entry, cachedEntry) && int64(filer.FileSize(cachedEntry)) == totalSize {
 				// Cache completed, use cached chunks
 				chunks = cachedEntry.GetChunks()
 				entry = cachedEntry
@@ -1201,8 +1317,8 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 				// Authoritative: the entry vanished or its remote object is gone
 				return respondObjectGone(w, r, bucket, object, cacheErr)
 			} else {
-				// Client disconnected during the cache wait: report cancellation, not an
-				// error response, so we don't write to a closed connection.
+				// Request canceled during the cache wait: skip the origin and let the
+				// caller answer the cancellation.
 				if ctxErr := r.Context().Err(); ctxErr != nil {
 					return ctxErr
 				}
@@ -2256,7 +2372,7 @@ func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offse
 		return nil, err
 	}
 
-	return resp.Body, nil
+	return &rc{Reader: io.LimitReader(resp.Body, size), Closer: resp.Body}, nil
 }
 
 // getEncryptedStreamFromVolumes gets a raw encrypted data stream from volume
@@ -2401,23 +2517,29 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 	// Set custom headers from entry.Extended (user metadata)
 	// Use direct map assignment to preserve original header casing (matches proxy behavior)
 	if entry.Extended != nil {
+		extAmzPrefixLower := strings.ToLower(s3_constants.ExtAmzPrefix)
+		taggingPrefixLower := strings.ToLower(s3_constants.AmzObjectTaggingPrefix)
 		for k, v := range entry.Extended {
-			// Skip internal SeaweedFS headers
-			if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
-				// Support backward compatibility: migrate old non-canonical format to canonical format
-				// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
-				headerKey := k
-				if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
-					// Normalize to AWS S3 format: "X-Amz-Meta-" prefix with lowercase suffix
-					// AWS S3 returns user metadata with the suffix in lowercase
-					suffix := k[len("x-amz-meta-"):]
-					headerKey = s3_constants.AmzUserMetaPrefix + strings.ToLower(suffix)
-					if glog.V(4) && k != headerKey {
-						glog.Infof("Normalizing user metadata header %q to %q in response", k, headerKey)
-					}
-				}
-				w.Header()[headerKey] = []string{string(v)}
+			// Skip internal SeaweedFS headers, and the stored tag/ACL/lock
+			// metadata that belongs behind its own API (GetObjectTagging,
+			// GetObjectAcl, GetObjectRetention) instead of every reader.
+			lowerKey := strings.ToLower(k)
+			if strings.HasPrefix(lowerKey, "xattr-") || strings.HasPrefix(lowerKey, extAmzPrefixLower) || strings.HasPrefix(lowerKey, taggingPrefixLower) || s3_constants.IsSeaweedFSInternalHeader(lowerKey) {
+				continue
 			}
+			// Support backward compatibility: migrate old non-canonical format to canonical format
+			// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
+			headerKey := k
+			if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
+				// Normalize to AWS S3 format: "X-Amz-Meta-" prefix with lowercase suffix
+				// AWS S3 returns user metadata with the suffix in lowercase
+				suffix := k[len("x-amz-meta-"):]
+				headerKey = s3_constants.AmzUserMetaPrefix + strings.ToLower(suffix)
+				if glog.V(4) && k != headerKey {
+					glog.Infof("Normalizing user metadata header %q to %q in response", k, headerKey)
+				}
+			}
+			w.Header()[headerKey] = []string{string(v)}
 		}
 	}
 
@@ -2559,6 +2681,18 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			glog.V(2).Infof("HeadObject: requesting specific version %s for %s/%s", versionId, bucket, object)
 			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
 			if err != nil {
+				if versionId == "null" && errors.Is(err, filer_pb.ErrNotFound) {
+					marker, markerErr := s3a.nullDeleteMarkerEntry(bucket, object)
+					if markerErr != nil {
+						glog.Errorf("HeadObject: failed to look up null delete marker for %s/%s: %v", bucket, object, markerErr)
+						s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+						return
+					}
+					if marker != nil {
+						s3a.writeDeleteMarkerResponse(w, r, bucket, object, "HeadObjectHandler", marker, "null", versionId)
+						return
+					}
+				}
 				glog.Errorf("Failed to get specific version %s for %s/%s: %v", versionId, bucket, object, err)
 				if errors.Is(err, filer_pb.ErrNotFound) {
 					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
@@ -2579,7 +2713,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			versionsDir := normalizedObject + s3_constants.VersionsFolder
 
 			// Quick check (no retries) for .versions/ directory
-			versionsEntry, versionsErr := s3a.getEntry(bucketDir, versionsDir)
+			versionsEntry, versionsErr := s3a.getObjectScopedEntryRoutedByKey(bucket, normalizedObject, bucketDir, versionsDir)
 
 			if versionsErr == nil && versionsEntry != nil {
 				// .versions/ exists, meaning real versions are stored there
@@ -2592,7 +2726,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				}
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
 				// .versions/ doesn't exist (confirmed not found), check regular path for null version
-				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
+				regularEntry, regularErr := s3a.getObjectEntryRoutedByKey(bucket, normalizedObject)
 				// A physical parent or bare-key object is not a trailing-slash null marker.
 				if regularErr == nil && isNullVersionObject(regularEntry, normalizedObject) {
 					// Found object at regular path - this is the null version
@@ -2631,7 +2765,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 		// Check if this is a delete marker
 		if entry.Extended != nil {
 			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
-				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				s3a.writeDeleteMarkerResponse(w, r, bucket, object, "HeadObjectHandler", entry, targetVersionId, versionId)
 				return
 			}
 		}
@@ -2720,6 +2854,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	//
 	// Edge Cases Handled:
 	//   - Empty files (0-byte, no children) → 200 OK (legitimate empty file)
+	//   - Empty files whose child probe fails → 200 OK (the file exists; a failed probe is no evidence of children)
 	//   - Empty directories (no children) → 404 Not Found (directories are not objects)
 	//   - Explicit directory requests (trailing slash) → 200 OK (handled earlier)
 	//   - Versioned objects → Skip this check (different semantics)
@@ -2740,7 +2875,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			}
 			if isZeroByteFile {
 				// Check if it has children (making it an implicit directory)
-				if s3a.hasChildren(r.Context(), bucket, object) {
+				if s3a.zeroByteFileHasChildren(r.Context(), bucket, object) {
 					// This is an implicit directory with children
 					// Return 404 to force clients (like s3fs) to use LIST-based discovery
 					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
@@ -3554,6 +3689,30 @@ func (s3a *S3ApiServer) doCacheRemoteObject(ctx context.Context, dir, name strin
 	return cachedEntry, err
 }
 
+// doCacheRemoteObjectOnFiler is doCacheRemoteObject against one filer: the
+// entry being cached may live only on the write owner that served the lookup,
+// ahead of peer replication. Callers fall back to doCacheRemoteObject on error.
+func (s3a *S3ApiServer) doCacheRemoteObjectOnFiler(ctx context.Context, filer pb.ServerAddress, dir, name string) (*filer_pb.Entry, error) {
+	if filer == "" {
+		return s3a.doCacheRemoteObject(ctx, dir, name)
+	}
+	var cachedEntry *filer_pb.Entry
+	err := pb.WithFilerClient(false, 0, filer, s3a.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		resp, cacheErr := client.CacheRemoteObjectToLocalCluster(ctx, &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+			Directory: dir,
+			Name:      name,
+		})
+		if cacheErr != nil {
+			return cacheErr
+		}
+		if resp != nil && resp.Entry != nil {
+			cachedEntry = resp.Entry
+		}
+		return nil
+	})
+	return cachedEntry, err
+}
+
 func (s3a *S3ApiServer) buildVersionedRemoteObjectPath(bucket, object, versionId string) (dir, name string) {
 	// versionId names a .versions file, so a value that is not a valid path
 	// segment falls back to the unversioned remote path rather than escaping it.
@@ -3569,6 +3728,19 @@ func (s3a *S3ApiServer) buildVersionedRemoteObjectPath(bucket, object, versionId
 // only check inline since its downstream cannot read from inline Content.
 func cachedEntryHasLocalData(entry *filer_pb.Entry) bool {
 	return entry != nil && (len(entry.GetChunks()) > 0 || len(entry.Content) > 0)
+}
+
+// sameRemoteObject reports whether two entries describe the same remote object
+// generation. A cache response can come back from a filer holding an older
+// generation of the key; it must not replace the resolved entry.
+func sameRemoteObject(src, cached *filer_pb.Entry) bool {
+	srcRemote, cachedRemote := src.GetRemoteEntry(), cached.GetRemoteEntry()
+	if srcRemote == nil || cachedRemote == nil {
+		return srcRemote == cachedRemote
+	}
+	return srcRemote.RemoteETag == cachedRemote.RemoteETag &&
+		srcRemote.RemoteMtime == cachedRemote.RemoteMtime &&
+		srcRemote.RemoteSize == cachedRemote.RemoteSize
 }
 
 // remoteCacheStreamingTimeoutNS bounds (nanoseconds) how long the streaming read
@@ -3616,7 +3788,10 @@ func (s3a *S3ApiServer) cacheRemoteObjectForStreamingWithShortTimeout(r *http.Re
 
 	glog.V(2).Infof("cacheRemoteObjectForStreamingWithShortTimeout: polling cache status for %s/%s (timeout=%v)", dir, name, pollTimeout)
 
-	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	cachedEntry, err := s3a.doCacheRemoteObjectOnFiler(cacheCtx, s3a.routableWriteOwner(bucket, object), dir, name)
+	if err != nil {
+		cachedEntry, err = s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	}
 	if err != nil {
 		// Distinguish transient errors (timeout/cancellation) from permanent errors
 		if cacheCtx.Err() != nil {
@@ -3649,7 +3824,10 @@ func (s3a *S3ApiServer) cacheRemoteObjectForStreaming(r *http.Request, entry *fi
 
 	glog.V(1).Infof("cacheRemoteObjectForStreaming: caching %s/%s (remote size: %d, versionId: %s)", dir, name, entry.RemoteEntry.RemoteSize, versionId)
 
-	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	cachedEntry, err := s3a.doCacheRemoteObjectOnFiler(cacheCtx, s3a.routableWriteOwner(bucket, object), dir, name)
+	if err != nil {
+		cachedEntry, err = s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	}
 	if err != nil {
 		// A bounded-wait timeout (or client disconnect) is not a cache failure:
 		// the filer keeps downloading and the caller maps a nil return to 503.
@@ -3661,7 +3839,7 @@ func (s3a *S3ApiServer) cacheRemoteObjectForStreaming(r *http.Request, entry *fi
 		return nil
 	}
 
-	if cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 {
+	if cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 && sameRemoteObject(entry, cachedEntry) {
 		glog.V(1).Infof("cacheRemoteObjectForStreaming: successfully cached %s/%s (%d chunks)", dir, name, len(cachedEntry.GetChunks()))
 		return cachedEntry
 	}
@@ -3672,8 +3850,9 @@ func (s3a *S3ApiServer) cacheRemoteObjectForStreaming(r *http.Request, entry *fi
 // cacheRemoteObjectForCopy caches a remote-only source before CopyObject /
 // CopyObjectPart reads it; otherwise the copy would write a destination with
 // FileSize > 0 but no chunks/content. Bounded so a stuck cache can't hang
-// the copy. Returns nil if caching failed or produced no local data.
-func (s3a *S3ApiServer) cacheRemoteObjectForCopy(ctx context.Context, bucket, object, versionId string) *filer_pb.Entry {
+// the copy. Returns nil if caching failed, produced no local data, or the
+// fill resolved a different generation than the authorized source.
+func (s3a *S3ApiServer) cacheRemoteObjectForCopy(ctx context.Context, src *filer_pb.Entry, bucket, object, versionId string) *filer_pb.Entry {
 	const cacheTimeout = 30 * time.Second
 	cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
 	defer cancel()
@@ -3682,7 +3861,12 @@ func (s3a *S3ApiServer) cacheRemoteObjectForCopy(ctx context.Context, bucket, ob
 
 	glog.V(1).Infof("cacheRemoteObjectForCopy: caching %s/%s (versionId: %s)", dir, name, versionId)
 
-	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	// An owner-routed source read can return a remote-only entry that has not
+	// replicated to the default filer; cache it on the filer that has it.
+	cachedEntry, err := s3a.doCacheRemoteObjectOnFiler(cacheCtx, s3a.routableWriteOwner(bucket, object), dir, name)
+	if err != nil {
+		cachedEntry, err = s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			glog.Warningf("cacheRemoteObjectForCopy: timeout caching %s/%s after %v", dir, name, cacheTimeout)
@@ -3692,7 +3876,11 @@ func (s3a *S3ApiServer) cacheRemoteObjectForCopy(ctx context.Context, bucket, ob
 		return nil
 	}
 
-	if cachedEntryHasLocalData(cachedEntry) {
+	// A fallback filer can answer for an older generation of the key; only a
+	// fill of the resolved source — same remote generation and size — may
+	// replace it.
+	if cachedEntryHasLocalData(cachedEntry) && sameRemoteObject(src, cachedEntry) &&
+		filer.FileSize(cachedEntry) == filer.FileSize(src) {
 		glog.V(1).Infof("cacheRemoteObjectForCopy: successfully cached %s/%s (chunks=%d, inline=%d)", dir, name, len(cachedEntry.GetChunks()), len(cachedEntry.Content))
 		return cachedEntry
 	}
@@ -3723,7 +3911,10 @@ func (s3a *S3ApiServer) startBackgroundRemoteCache(bucket, object, versionId str
 			glog.V(2).Infof("startBackgroundRemoteCache: caching disabled for %s/%s", dir, name)
 			return
 		}
-		_, err := s3a.doCacheRemoteObject(bgCtx, dir, name)
+		_, err := s3a.doCacheRemoteObjectOnFiler(bgCtx, s3a.routableWriteOwner(bucket, object), dir, name)
+		if err != nil {
+			_, err = s3a.doCacheRemoteObject(bgCtx, dir, name)
+		}
 		if err != nil {
 			glog.V(2).Infof("startBackgroundRemoteCache: cache failed for %s/%s: %v", bucket, object, err)
 		} else {

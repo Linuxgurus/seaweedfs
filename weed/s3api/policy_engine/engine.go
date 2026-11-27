@@ -2,9 +2,11 @@ package policy_engine
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -402,14 +404,9 @@ func ExtractPrincipalVariables(principal string) map[string][]string {
 			vars["aws:username"] = []string{roleName}
 		}
 	case "assumed-role":
+		// The last segment is the session name, which the caller chose, so it
+		// names no user.
 		vars["aws:principaltype"] = []string{"AssumedRole"}
-		// For assumed roles: assumed-role/RoleName/SessionName or assumed-role/path/to/RoleName/SessionName
-		// The session name is always the last segment
-		if len(resourceParts) >= 3 {
-			sessionName := resourceParts[len(resourceParts)-1]
-			vars["aws:username"] = []string{sessionName}
-			vars["aws:userid"] = []string{sessionName}
-		}
 	}
 
 	// Note: principaltype is already set correctly in the switch above based on resource type
@@ -419,10 +416,33 @@ func ExtractPrincipalVariables(principal string) map[string][]string {
 
 // ExtractConditionValuesFromRequest extracts condition values from HTTP request
 func (engine *PolicyEngine) ExtractConditionValuesFromRequest(r *http.Request) map[string][]string {
+	values := RequestConditionValues(r)
+	values["aws:SourceIp"] = []string{engine.extractSourceIP(r)}
+
+	// S3 bucket-level conditions
+	if delimiter := r.URL.Query().Get("delimiter"); delimiter != "" {
+		values["s3:delimiter"] = []string{delimiter}
+	}
+
+	if prefix := r.URL.Query().Get("prefix"); prefix != "" {
+		values["s3:prefix"] = []string{prefix}
+	}
+
+	// Multipart listings use max-uploads, so max-keys cannot constrain them.
+	if maxKeys := r.URL.Query().Get("max-keys"); maxKeys != "" && !r.URL.Query().Has("uploads") {
+		values["s3:max-keys"] = []string{maxKeys}
+	}
+
+	return values
+}
+
+// RequestConditionValues returns the condition keys read from the request
+// itself, leaving out aws:SourceIp and the bucket-listing keys, which depend
+// on the caller's proxy and listing handling.
+func RequestConditionValues(r *http.Request) map[string][]string {
 	values := make(map[string][]string)
 
 	// AWS condition keys
-	values["aws:SourceIp"] = []string{engine.extractSourceIP(r)}
 	values["aws:SecureTransport"] = []string{fmt.Sprintf("%t", r.TLS != nil)}
 	// Use AWS standard condition key for current time
 	values["aws:CurrentTime"] = []string{time.Now().Format(time.RFC3339)}
@@ -441,21 +461,11 @@ func (engine *PolicyEngine) ExtractConditionValuesFromRequest(r *http.Request) m
 	// Note: s3:ExistingObjectTag/<key> conditions are evaluated using objectEntry
 	// passed to EvaluatePolicy, not extracted from the request.
 
-	for key, value := range requestObjectTags(r) {
-		values[RequestObjectTagPrefix+key] = []string{value}
-	}
-
-	// S3 bucket-level conditions
-	if delimiter := r.URL.Query().Get("delimiter"); delimiter != "" {
-		values["s3:delimiter"] = []string{delimiter}
-	}
-
-	if prefix := r.URL.Query().Get("prefix"); prefix != "" {
-		values["s3:prefix"] = []string{prefix}
-	}
-
-	if maxKeys := r.URL.Query().Get("max-keys"); maxKeys != "" {
-		values["s3:max-keys"] = []string{maxKeys}
+	if tags := requestObjectTags(r); len(tags) > 0 {
+		for key, value := range tags {
+			values[RequestObjectTagPrefix+key] = []string{value}
+		}
+		values[RequestObjectTagKeys] = slices.Sorted(maps.Keys(tags))
 	}
 
 	// Authentication method
@@ -465,7 +475,7 @@ func (engine *PolicyEngine) ExtractConditionValuesFromRequest(r *http.Request) m
 		} else if strings.HasPrefix(authHeader, "AWS ") {
 			values["s3:authType"] = []string{"REST-HEADER"}
 		}
-	} else if r.URL.Query().Get("AWSAccessKeyId") != "" {
+	} else if query := r.URL.Query(); query.Get("AWSAccessKeyId") != "" || query.Get("X-Amz-Credential") != "" {
 		values["s3:authType"] = []string{"REST-QUERY-STRING"}
 	}
 
@@ -514,16 +524,24 @@ func requestObjectTags(r *http.Request) map[string]string {
 	if !storesRequestObjectTags(r) {
 		return nil
 	}
-	// A malformed header is rejected by the handler with InvalidTag.
-	parsed, err := url.ParseQuery(tagging)
-	if err != nil {
-		return nil
-	}
-	// putToFiler rejects a repeated key, but CopyObject stores its last
-	// value, so that is the one the policy has to see.
-	tags := make(map[string]string, len(parsed))
-	for key, vals := range parsed {
-		tags[key] = vals[len(vals)-1]
+	// Parse the same non-empty segments the tag handlers store: url.ParseQuery
+	// caps at 10,000 parameters, so a header padded with "&" segments would
+	// hide stored tag keys from every s3:RequestObjectTag* condition. A
+	// malformed pair is rejected by the handler with InvalidTag.
+	tags := make(map[string]string)
+	for _, segment := range strings.Split(tagging, "&") {
+		if segment == "" {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(segment, "=")
+		key, errKey := url.QueryUnescape(rawKey)
+		value, errValue := url.QueryUnescape(rawValue)
+		if errKey != nil || errValue != nil {
+			return nil
+		}
+		// putToFiler rejects a repeated key, but CopyObject stores its last
+		// value, so that is the one the policy has to see.
+		tags[key] = value
 	}
 	return tags
 }

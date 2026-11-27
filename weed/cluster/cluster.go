@@ -13,7 +13,9 @@ const (
 	VolumeServerType = "volumeServer"
 	FilerType        = "filer"
 	BrokerType       = "broker"
+	MountType        = "mount"
 	S3Type           = "s3"
+	VectorType       = "vector"
 )
 
 type FilerGroupName string
@@ -37,6 +39,7 @@ type Cluster struct {
 	filerGroups  *ClusterNodeGroups
 	brokerGroups *ClusterNodeGroups
 	s3Groups     *ClusterNodeGroups
+	vectorGroups *ClusterNodeGroups
 }
 
 func newClusterNodeGroups() *ClusterNodeGroups {
@@ -92,6 +95,7 @@ func NewCluster() *Cluster {
 		filerGroups:  newClusterNodeGroups(),
 		brokerGroups: newClusterNodeGroups(),
 		s3Groups:     newClusterNodeGroups(),
+		vectorGroups: newClusterNodeGroups(),
 	}
 }
 
@@ -104,6 +108,8 @@ func (cluster *Cluster) AddClusterNode(ns, nodeType string, dataCenter DataCente
 		return cluster.brokerGroups.AddClusterNode(filerGroup, nodeType, dataCenter, rack, address, version)
 	case S3Type:
 		return cluster.s3Groups.AddClusterNode(filerGroup, nodeType, dataCenter, rack, address, version)
+	case VectorType:
+		return cluster.vectorGroups.AddClusterNode(filerGroup, nodeType, dataCenter, rack, address, version)
 	case MasterType:
 		return buildClusterNodeUpdateMessage(true, filerGroup, nodeType, address)
 	}
@@ -119,6 +125,8 @@ func (cluster *Cluster) RemoveClusterNode(ns string, nodeType string, address pb
 		return cluster.brokerGroups.RemoveClusterNode(filerGroup, nodeType, address)
 	case S3Type:
 		return cluster.s3Groups.RemoveClusterNode(filerGroup, nodeType, address)
+	case VectorType:
+		return cluster.vectorGroups.RemoveClusterNode(filerGroup, nodeType, address)
 	case MasterType:
 		return buildClusterNodeUpdateMessage(false, filerGroup, nodeType, address)
 	}
@@ -133,6 +141,8 @@ func (cluster *Cluster) ListClusterNode(filerGroup FilerGroupName, nodeType stri
 		return cluster.brokerGroups.ListClusterNode(filerGroup)
 	case S3Type:
 		return cluster.s3Groups.ListClusterNode(filerGroup)
+	case VectorType:
+		return cluster.vectorGroups.ListClusterNode(filerGroup)
 	case MasterType:
 	}
 	return
@@ -160,6 +170,8 @@ func (cluster *Cluster) IsKnownNode(nodeType string, address pb.ServerAddress) b
 		groups = cluster.brokerGroups
 	case S3Type:
 		groups = cluster.s3Groups
+	case VectorType:
+		groups = cluster.vectorGroups
 	default:
 		return false
 	}

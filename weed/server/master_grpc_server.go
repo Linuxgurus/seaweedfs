@@ -14,6 +14,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -103,8 +104,103 @@ func announceVolume(message *master_pb.VolumeLocation, vid uint32, isRemote, isR
 	}
 }
 
+// reportsPriorClusterState tells whether a heartbeat could come from a server
+// still carrying cluster state from before this leader's term: it holds a
+// volume or shard id above the bound this master has issued, has seen a
+// higher volume id bound, or last synced with a different topology id.
+// Echoes of this term's own allocations stay under the bound and do not count.
+func reportsPriorClusterState(heartbeat *master_pb.Heartbeat, topologyId string, bound needle.VolumeId) bool {
+	if needle.VolumeId(heartbeat.MaxVolumeIdSeen) > bound ||
+		(heartbeat.LastSeenTopologyId != "" && heartbeat.LastSeenTopologyId != topologyId) {
+		return true
+	}
+	unissued := func(id uint32) bool { return needle.VolumeId(id) > bound }
+	for _, v := range heartbeat.Volumes {
+		if unissued(v.Id) {
+			return true
+		}
+	}
+	for _, v := range heartbeat.NewVolumes {
+		if unissued(v.Id) {
+			return true
+		}
+	}
+	for _, v := range heartbeat.ChangedVolumes {
+		if unissued(v.Id) {
+			return true
+		}
+	}
+	for _, v := range heartbeat.DeletedVolumes {
+		if unissued(v.Id) {
+			return true
+		}
+	}
+	for _, s := range heartbeat.EcShards {
+		if unissued(s.Id) {
+			return true
+		}
+	}
+	for _, s := range heartbeat.NewEcShards {
+		if unissued(s.Id) {
+			return true
+		}
+	}
+	for _, s := range heartbeat.DeletedEcShards {
+		if unissued(s.Id) {
+			return true
+		}
+	}
+	return false
+}
+
+// volumeHeartbeatTimeout is how long SendHeartbeat waits for the next
+// heartbeat before it ends the stream and unregisters the volume server.
+var volumeHeartbeatTimeout = 3 * constants.VolumePulsePeriod
+
+// heartbeatReceiver returns a function that receives the next heartbeat from
+// stream, or fails with DeadlineExceeded once none has arrived for timeout,
+// and a function that releases the receiving goroutine. A volume server sends
+// a heartbeat every VolumePulsePeriod. One that goes silent without closing
+// its connection (a hung host, a network partition) leaves Recv blocked until
+// gRPC keepalive closes the connection, which takes 80 s or more, and until
+// then the master keeps assigning writes to its volumes.
+func heartbeatReceiver(stream master_pb.Seaweed_SendHeartbeatServer, timeout time.Duration) (recv func() (*master_pb.Heartbeat, error), stop func()) {
+	type received struct {
+		heartbeat *master_pb.Heartbeat
+		err       error
+	}
+	ch := make(chan received)
+	done := make(chan struct{})
+	go func() {
+		for {
+			heartbeat, err := stream.Recv()
+			select {
+			case ch <- received{heartbeat, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	recv = func() (*master_pb.Heartbeat, error) {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case r := <-ch:
+			return r.heartbeat, r.err
+		case <-timer.C:
+			return nil, status.Errorf(codes.DeadlineExceeded, "no heartbeat for %v", timeout)
+		}
+	}
+	return recv, func() { close(done) }
+}
+
 func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServer) error {
 	var dn *topology.DataNode
+	recv, stopRecv := heartbeatReceiver(stream, volumeHeartbeatTimeout)
+	defer stopRecv()
 
 	defer func() {
 		if dn != nil {
@@ -142,7 +238,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	var echoedVid needle.VolumeId
 	var echoedTopoId string
 	for {
-		heartbeat, err := stream.Recv()
+		heartbeat, err := recv()
 		if err != nil {
 			// Graceful shutdown on either side cancels the stream; don't warn.
 			canceled := errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
@@ -182,9 +278,30 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			continue
 		}
 
+		if dn == nil {
+			// An unregistered heartbeat carries no address to admit; under
+			// the pinned single reporter it can never be the embedded one,
+			// so it must not move allocation or topology state either.
+			addr := ""
+			if heartbeat.Ip != "" {
+				addr = util.JoinHostPort(heartbeat.Ip, int(heartbeat.Port))
+			}
+			if !ms.Topo.AdmitVolumeReporter(addr) {
+				err := fmt.Errorf("volume server %s rejected: this master admits a single volume-server reporter", addr)
+				glog.Warningf("SendHeartbeat: %v", err)
+				return err
+			}
+		}
+		priorState := reportsPriorClusterState(heartbeat, ms.Topo.GetTopologyId(), ms.Topo.GetMaxVolumeId())
+		if (dn == nil && heartbeat.Ip != "") || priorState {
+			ms.Topo.NoteAllocationEvidence()
+		}
 		ms.Topo.Sequence.SetMax(heartbeat.MaxFileKey)
 		ms.Topo.UpAdjustMaxVolumeId(needle.VolumeId(heartbeat.MaxVolumeIdSeen))
-		if len(heartbeat.Volumes) > 0 {
+		// A HasNoVolumes report still carries the reporter's LastSeenTopologyId;
+		// skipping it would let an EC-only veteran's stale id miss the mismatch
+		// freeze before the hold release below.
+		if len(heartbeat.Volumes) > 0 || heartbeat.HasNoVolumes {
 			ms.Topo.CheckReportedTopologyId(heartbeat.LastSeenTopologyId)
 		}
 		if dn == nil {
@@ -302,6 +419,15 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 				}
 				message.DeletedVids = append(message.DeletedVids, uint32(v.Id))
 			}
+		}
+
+		// A full volume list is the heartbeat section that settles what a
+		// reporter holds; once applied, a post-mint allocation hold kept for
+		// prior cluster state only owes other reporters a confirm pulse. A
+		// report carrying such state is itself the evidence the hold exists
+		// for, so it keeps the window for other veterans still due.
+		if (len(heartbeat.Volumes) > 0 || heartbeat.HasNoVolumes) && !priorState {
+			ms.Topo.NoteInventoryApplied(dn.Url())
 		}
 
 		if len(heartbeat.NewEcShards) > 0 || len(heartbeat.DeletedEcShards) > 0 {
@@ -439,14 +565,14 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 	// buffer by 1 so we don't end up getting stuck writing to stopChan forever
 	stopChan := make(chan bool, 1)
 
+	ms.clusterNodeLock.Lock()
 	clientName, messageChan := ms.addClient(req.FilerGroup, req.ClientType, peerAddress)
 	for _, update := range ms.Cluster.AddClusterNode(req.FilerGroup, req.ClientType, cluster.DataCenter(req.DataCenter), cluster.Rack(req.Rack), peerAddress, req.Version) {
 		glog.V(1).Infof("Cluster: %s node %s added to group '%s'", req.ClientType, peerAddress, req.FilerGroup)
 		ms.broadcastToClients(update)
 	}
-	if req.ClientType == cluster.FilerType && !req.LeaveLockRing {
-		ms.LockRingManager.AddServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
-	}
+	ms.updateLockRing(req, peerAddress)
+	ms.clusterNodeLock.Unlock()
 	if req.ClientType == cluster.MasterType {
 		// Only the leader gets this far, and a master that starts with no raft
 		// state cannot campaign its way in, so this registration is where it
@@ -456,12 +582,7 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 	}
 
 	defer func() {
-		for _, update := range ms.Cluster.RemoveClusterNode(req.FilerGroup, req.ClientType, peerAddress) {
-			ms.broadcastToClients(update)
-		}
-		if req.ClientType == cluster.FilerType {
-			ms.LockRingManager.RemoveServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
-		}
+		ms.removeClusterNode(req, peerAddress)
 		ms.deleteClient(clientName, messageChan)
 	}()
 
@@ -555,6 +676,33 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 
 }
 
+// A filer that reconnects while leaving may overlap a stream that has not ended
+// yet, so its registration takes the address out of the ring itself.
+func (ms *MasterServer) updateLockRing(req *master_pb.KeepConnectedRequest, peerAddress pb.ServerAddress) {
+	if req.ClientType != cluster.FilerType {
+		return
+	}
+	if req.LeaveLockRing {
+		ms.LockRingManager.RemoveServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
+		return
+	}
+	ms.LockRingManager.AddServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
+}
+
+func (ms *MasterServer) removeClusterNode(req *master_pb.KeepConnectedRequest, peerAddress pb.ServerAddress) {
+	ms.clusterNodeLock.Lock()
+	defer ms.clusterNodeLock.Unlock()
+	removed := ms.Cluster.RemoveClusterNode(req.FilerGroup, req.ClientType, peerAddress)
+	for _, update := range removed {
+		ms.broadcastToClients(update)
+	}
+	// A replacement that registered before this stream ended still holds the
+	// address, so only its last registration leaves the ring.
+	if req.ClientType == cluster.FilerType && len(removed) > 0 {
+		ms.LockRingManager.RemoveServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
+	}
+}
+
 func (ms *MasterServer) onKeepConnectedMessage(registered *master_pb.KeepConnectedRequest, peerAddress pb.ServerAddress, message *master_pb.KeepConnectedRequest) {
 	if registered.ClientType == cluster.FilerType && message.LeaveLockRing {
 		glog.V(0).Infof("LockRing: filer %s leaving group '%s'", peerAddress, registered.FilerGroup)
@@ -566,10 +714,10 @@ func (ms *MasterServer) initialLockRingUpdate(clientType string, filerGroup stri
 	if ms.LockRingManager == nil {
 		return nil
 	}
-	// Filers are ring members; S3 gateways are lock clients that need the same
-	// view to dial a key's primary directly. Both get the initial snapshot;
-	// later membership changes already broadcast to every connected client.
-	if clientType != cluster.FilerType && clientType != cluster.S3Type {
+	// Filers are ring members; S3 gateways and mounts are lock clients that
+	// need the same view to dial a key's primary directly. All get the initial
+	// snapshot; later membership changes already broadcast to every client.
+	if clientType != cluster.FilerType && clientType != cluster.S3Type && clientType != cluster.MountType {
 		return nil
 	}
 

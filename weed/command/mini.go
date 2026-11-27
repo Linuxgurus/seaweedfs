@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/bits"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/admin/dash"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -410,12 +412,18 @@ var (
 	miniDataFolders                 = cmdMini.Flag.String("dir", ".", "directory to store data files")
 	miniMetricsHttpPort             = cmdMini.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	miniMetricsHttpIp               = cmdMini.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
+	miniGrpcLocalSocketDir          = cmdMini.Flag.String("grpc.localSocketDir", "/tmp", "directory for the local gRPC Unix sockets; default to /tmp. Point it at a directory a temp cleaner does not sweep, such as /run/seaweedfs")
 	miniS3Config                    = cmdMini.Flag.String("s3.config", "", "path to the S3 config file")
 	miniIamConfig                   = cmdMini.Flag.String("s3.iam.config", "", "path to the advanced IAM config file for S3")
 	miniS3AllowDeleteBucketNotEmpty = cmdMini.Flag.Bool("s3.allowDeleteBucketNotEmpty", false, "allow recursive deleting all entries along with bucket")
 	miniS3AutoCreateBucket          = cmdMini.Flag.Bool("s3.autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	miniBucket                      = cmdMini.Flag.String("bucket", "", "comma-separated S3 bucket names to create on startup if they do not already exist; leave empty to skip. Falls back to S3_BUCKET env var.")
 	miniTableBucket                 = cmdMini.Flag.String("tableBucket", "", "comma-separated S3 Tables buckets to create on startup if they do not already exist, each name[:FORMAT] with FORMAT one of ICEBERG (default) or LANCE, e.g. warehouse,vectors:LANCE; leave empty to skip. Falls back to S3_TABLE_BUCKET env var.")
+	miniVector                      = cmdMini.Flag.Bool("vector", false, "start the weed-vector engine for vector indexes and search")
+	miniVectorBinary                = cmdMini.Flag.String("vector.binary", "weed-vector", "path to the vector engine binary")
+	miniVectorPort                  = cmdMini.Flag.Int("vector.port", 8090, "vector engine gRPC port")
+	miniVectorMetricsPort           = cmdMini.Flag.Int("vector.metricsPort", 0, "optional vector HTTP health and metrics port")
+	miniVectorBucket                = cmdMini.Flag.String("vectorBucket", "", "comma-separated vector buckets to create; falls back to S3_VECTOR_BUCKET")
 )
 
 // getBindIp determines the bind IP address based on miniIp and miniBindIp flags
@@ -447,7 +455,7 @@ func initMiniMasterFlags() {
 	miniMasterOptions.peers = cmdMini.Flag.String("master.peers", "", "all master nodes in comma separated ip:masterPort list (default: none for single master)")
 	miniMasterOptions.volumeSizeLimitMB = cmdMini.Flag.Uint("master.volumeSizeLimitMB", defaultMiniVolumeSizeMB, "Master stops directing writes to oversized volumes (default: 128MB for mini)")
 	miniMasterOptions.volumePreallocate = cmdMini.Flag.Bool("master.volumePreallocate", false, "Preallocate disk space for volumes.")
-	miniMasterOptions.maxParallelVacuumPerServer = cmdMini.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server")
+	miniMasterOptions.maxParallelVacuumPerServer = cmdMini.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server; 0 for no limit (deprecated, use master.vacuum.max_parallel_per_server in master.toml)")
 	miniMasterOptions.vacuumIntervalSeconds = cmdMini.Flag.Int("master.vacuumIntervalSeconds", 840, "seconds between automatic vacuum sweeps")
 	miniMasterOptions.vacuumDeleteEmptyAfterSeconds = cmdMini.Flag.Int("master.vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	miniMasterOptions.defaultReplication = cmdMini.Flag.String("master.defaultReplication", "", "Default replication type if not specified.")
@@ -478,6 +486,7 @@ func initMiniFilerFlags() {
 	miniFilerOptions.saveToFilerLimit = cmdMini.Flag.Int("filer.saveToFilerLimit", 0, "files smaller than this limit will be saved in filer store")
 	miniFilerOptions.concurrentUploadLimitMB = cmdMini.Flag.Int("filer.concurrentUploadLimitMB", 0, "limit total concurrent upload size")
 	miniFilerOptions.concurrentFileUploadLimit = cmdMini.Flag.Int("filer.concurrentFileUploadLimit", 0, "limit number of concurrent file uploads")
+	miniFilerOptions.inflightUploadDataTimeout = cmdMini.Flag.Duration("filer.inflightUploadDataTimeout", 60*time.Second, "how long an upload waits for a slot under the concurrent upload limits before it is rejected with 429, 0 means no limit")
 	miniFilerOptions.localSocket = cmdMini.Flag.String("filer.localSocket", "", "default to /tmp/seaweedfs-filer-<port>.sock")
 	miniFilerOptions.showUIDirectoryDelete = cmdMini.Flag.Bool("filer.ui.deleteDir", true, "enable filer UI show delete directory button")
 	miniFilerOptions.downloadMaxMBps = cmdMini.Flag.Int("filer.downloadMaxMBps", 0, "download max speed for each download request, in MB per second")
@@ -489,6 +498,7 @@ func initMiniFilerFlags() {
 	miniFilerOptions.tusSessionExpiry = cmdMini.Flag.Duration("filer.tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration")
 	miniFilerOptions.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("filer.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	miniFilerOptions.remoteCacheEvictThreshold = cmdMini.Flag.Float64("filer.remoteCacheEvictThreshold", 0.9, "evict remote-cached objects (oldest first) when any volume disk exceeds this usage fraction; 0 disables")
+	miniFilerOptions.idleTimeout = cmdMini.Flag.Int("filer.idleTimeout", 10, "connection idle seconds")
 }
 
 // initMiniVolumeFlags initializes Volume server flag options
@@ -510,7 +520,7 @@ func initMiniVolumeFlags() {
 	miniOptions.v.fileSizeLimitMB = cmdMini.Flag.Int("volume.fileSizeLimitMB", 256, "limit file size to avoid out of memory")
 	miniOptions.v.ldbTimeout = cmdMini.Flag.Int64("volume.index.leveldbTimeout", 0, "alive time for leveldb")
 	miniOptions.v.concurrentUploadLimitMB = cmdMini.Flag.Int("volume.concurrentUploadLimitMB", 0, "limit total concurrent upload size")
-	miniOptions.v.concurrentDownloadLimitMB = cmdMini.Flag.Int("volume.concurrentDownloadLimitMB", 0, "limit total concurrent download size")
+	miniOptions.v.concurrentDownloadLimitMB = cmdMini.Flag.Int("volume.concurrentDownloadLimitMB", 0, "limit total concurrent download size; reads over the limit are sent to a replica unless volume.readMode is local")
 	miniOptions.v.pprof = cmdMini.Flag.Bool("volume.pprof", false, "enable pprof http handlers")
 	miniOptions.v.idxFolder = cmdMini.Flag.String("volume.dir.idx", "", "directory to store .idx files")
 	miniOptions.v.inflightUploadDataTimeout = cmdMini.Flag.Duration("volume.inflightUploadDataTimeout", 60*time.Second, "inflight upload data wait timeout")
@@ -518,6 +528,9 @@ func initMiniVolumeFlags() {
 	miniOptions.v.hasSlowRead = cmdMini.Flag.Bool("volume.hasSlowRead", true, "if true, prevents slow reads from blocking other requests")
 	miniOptions.v.readBufferSizeMB = cmdMini.Flag.Int("volume.readBufferSizeMB", 4, "read buffer size in MB")
 	miniOptions.v.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
+	miniOptions.v.fsyncMinBatchBytes = cmdMini.Flag.Int64("volume.fsyncMinBatchBytes", 1*1024*1024, "minimum bytes an fsync batch gathers before a drained queue flushes without waiting")
+	miniOptions.v.fsyncMinBatchRequests = cmdMini.Flag.Int("volume.fsyncMinBatchRequests", 128, "minimum requests an fsync batch gathers before a drained queue flushes without waiting")
+	miniOptions.v.fsyncBatchWait = cmdMini.Flag.Duration("volume.fsyncBatchWait", 500*time.Microsecond, "how long a below-minimum fsync batch waits for more requests once the queue drains; 0 flushes immediately")
 	miniOptions.v.preStopSeconds = cmdMini.Flag.Int("volume.preStopSeconds", 1, "number of seconds between stop send heartbeats and stop volume server (default: 1 for mini)")
 	miniOptions.v.setDiskIOProbeDefaults()
 }
@@ -544,10 +557,11 @@ func initMiniS3Flags() {
 	miniS3Options.idleTimeout = cmdMini.Flag.Int("s3.idleTimeout", 120, "connection idle seconds")
 	miniS3Options.concurrentUploadLimitMB = cmdMini.Flag.Int("s3.concurrentUploadLimitMB", 0, "limit total concurrent upload size")
 	miniS3Options.concurrentFileUploadLimit = cmdMini.Flag.Int("s3.concurrentFileUploadLimit", 0, "limit number of concurrent file uploads")
+	miniS3Options.inflightUploadDataTimeout = cmdMini.Flag.Duration("s3.inflightUploadDataTimeout", 60*time.Second, "how long an upload waits for a slot under the concurrent upload limits before it is rejected with SlowDown, 0 means no limit")
 	miniS3Options.enableIam = cmdMini.Flag.Bool("s3.iam", true, "enable embedded IAM API on the same port")
 	miniS3Options.iamReadOnly = miniS3IamReadOnly
 	miniS3Options.dataCenter = cmdMini.Flag.String("s3.dataCenter", "", "prefer to read and write to volumes in this data center")
-	miniS3Options.cipher = cmdMini.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads")
+	miniS3Options.cipher = cmdMini.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads; on whenever -filer.encryptVolumeData is")
 	miniS3Options.config = miniS3Config
 	miniS3Options.iamConfig = miniIamConfig
 	miniS3Options.auditLogConfig = cmdMini.Flag.String("s3.auditLogConfig", "", "path to the audit log config file")
@@ -560,6 +574,10 @@ func initMiniS3Flags() {
 	miniS3Options.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	miniS3Options.allowBackslashInKey = cmdMini.Flag.Bool("s3.allowBackslashInKey", false, allowBackslashInKeyUsage)
 	miniS3Options.iamSelfServiceRequiresGrant = cmdMini.Flag.Bool("s3.iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
+	miniS3Options.routedLookupTimeout = cmdMini.Flag.Duration("s3.routedLookupTimeout", defaultS3RoutedLookupTimeout, s3RoutedLookupTimeoutUsage)
+	miniS3Options.unreachableOwnerTTL = cmdMini.Flag.Duration("s3.unreachableOwnerTTL", defaultS3UnreachableOwnerTTL, s3UnreachableOwnerTTLUsage)
+	miniS3Options.volumeLookupTimeout = cmdMini.Flag.Duration("s3.volumeLookupTimeout", defaultS3VolumeLookupTimeout, s3VolumeLookupTimeoutUsage)
+	miniS3Options.preStopSeconds = cmdMini.Flag.Int("s3.preStopSeconds", 0, s3PreStopSecondsUsage)
 	// In mini mode, S3 uses the shared debug server started at line 681, not its own separate debug server
 	miniS3Options.debug = new(bool) // explicitly false
 	miniS3Options.debugPort = cmdMini.Flag.Int("s3.debug.port", 6060, "http port for debugging (unused in mini mode)")
@@ -577,6 +595,7 @@ func initMiniWebDAVFlags() {
 	miniWebDavOptions.cacheSizeMB = cmdMini.Flag.Int64("webdav.cacheCapacityMB", 0, "local cache capacity in MB")
 	miniWebDavOptions.maxMB = cmdMini.Flag.Int("webdav.maxMB", 4, "split files larger than the limit")
 	miniWebDavOptions.filerRootPath = cmdMini.Flag.String("webdav.filer.path", "/", "use this remote path from filer server")
+	miniWebDavOptions.idleTimeout = cmdMini.Flag.Int("webdav.idleTimeout", 10, "connection idle seconds")
 }
 
 // initMiniAdminFlags initializes Admin server flag options
@@ -595,6 +614,7 @@ func initMiniAdminFlags() {
 	miniAdminOptions.allowInsecureBind = cmdMini.Flag.Bool("admin.allowInsecureBind", false, "INSECURE: allow the unauthenticated admin interface to bind to -ip.bind instead of loopback")
 	miniAdminWorkerBindIP = cmdMini.Flag.String("admin.worker.ip", "127.0.0.1", "worker gRPC bind address; expose only with grpc.admin mTLS configured")
 	miniAdminOptions.urlPrefix = cmdMini.Flag.String("admin.urlPrefix", "", "URL path prefix when running the admin UI behind a reverse proxy under a subdirectory (e.g. /seaweedfs)")
+	miniAdminOptions.uploadMaxSizeMB = cmdMini.Flag.Int("admin.uploadMaxSizeMB", dash.DefaultUploadMaxSizeMB, "maximum total size in MB of one file browser upload (0 for no limit)")
 }
 
 func init() {
@@ -820,10 +840,20 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
+// isPortUsableOnIP reports whether port can be bound on ip. While mini also
+// opens a loopback listener, the port must additionally be free on every
+// interface so that listener cannot collide with a holder on another address.
+func isPortUsableOnIP(ip string, port int, listenOnLocalhost bool) bool {
+	if !isPortOpenOnIP(ip, port) {
+		return false
+	}
+	return !listenOnLocalhost || isPortAvailable(port)
+}
+
 // findAvailablePortOnIP finds the next available port on a specific IP starting from the given port
 // It skips any ports that are in the reservedPorts map (for gRPC port collision avoidance)
 // It returns the first available port found within maxAttempts, or 0 if none found
-func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPorts map[int]bool) int {
+func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPorts map[int]bool, listenOnLocalhost bool) int {
 	for i := 0; i < maxAttempts; i++ {
 		port := startPort + i
 		if port > 65535 {
@@ -835,7 +865,7 @@ func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPo
 			continue
 		}
 		// Check on both the specific IP and on all interfaces for maximum reliability
-		if isPortOpenOnIP(ip, port) && isPortAvailable(port) {
+		if isPortUsableOnIP(ip, port, listenOnLocalhost) {
 			return port
 		}
 	}
@@ -846,7 +876,7 @@ func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPo
 // ensurePortAvailableOnIP ensures a port pointer points to an available port on a specific IP
 // If the port is not available, it finds the next available port and updates the pointer
 // The reservedPorts map contains ports that should not be allocated (for gRPC collision avoidance)
-func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reservedPorts map[int]bool, flagName string) error {
+func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reservedPorts map[int]bool, flagName string, listenOnLocalhost bool) error {
 	// Check if this port was explicitly specified by the user (from CLI or env, before the config file was applied)
 	isExplicitPort := explicitFlags[flagName]
 
@@ -859,10 +889,10 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 	// Skip if this port is reserved for gRPC calculation
 	if reservedPorts[original] {
 		if isExplicitPort {
-			return fmt.Errorf("port %d for %s (specified by flag %s) is reserved for gRPC calculation and cannot be used", original, serviceName, flagName)
+			return fmt.Errorf("port %d for %s (specified by flag %s) is reserved by another mini service and cannot be used", original, serviceName, flagName)
 		}
-		glog.Warningf("Port %d for %s is reserved for gRPC calculation, finding alternative...", original, serviceName)
-		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts)
+		glog.Warningf("Port %d for %s is reserved by another mini service, finding alternative...", original, serviceName)
+		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts, listenOnLocalhost)
 		if newPort == 0 {
 			glog.Errorf("Could not find available port for %s starting from %d, will use original %d and fail on binding", serviceName, original+1, original)
 		} else {
@@ -873,14 +903,14 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 	}
 
 	// Check on both the specific IP and on all interfaces (0.0.0.0) for maximum reliability
-	if !isPortOpenOnIP(ip, original) || !isPortAvailable(original) {
+	if !isPortUsableOnIP(ip, original, listenOnLocalhost) {
 		// If explicitly specified, fail immediately with the originally requested port
 		if isExplicitPort {
 			return fmt.Errorf("port %d for %s (specified by flag %s) is not available on %s and cannot be used", original, serviceName, flagName, ip)
 		}
 		// For default ports, try to find an alternative
 		glog.Warningf("Port %d for %s is not available on %s, finding alternative port...", original, serviceName, ip)
-		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts)
+		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts, listenOnLocalhost)
 		if newPort == 0 {
 			glog.Errorf("Could not find available port for %s starting from %d, will use original %d and fail on binding", serviceName, original+1, original)
 		} else {
@@ -896,53 +926,80 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 // ensureAllPortsAvailableOnIP ensures all mini service ports are available on a specific IP
 // Returns an error if an explicitly specified port is unavailable.
 // This should be called before starting any services
-func ensureAllPortsAvailableOnIP(bindIp string) error {
+func ensureAllPortsAvailableOnIP(bindIp string, listenOnLocalhost bool) error {
 	portConfigs := []struct {
-		port     *int
-		name     string
-		flagName string
-		grpcPtr  *int
+		port      *int
+		name      string
+		flagName  string
+		grpcPtr   *int
+		localhost bool
 	}{
-		{miniMasterOptions.port, "Master", "master.port", miniMasterOptions.portGrpc},
-		{miniFilerOptions.port, "Filer", "filer.port", miniFilerOptions.portGrpc},
-		{miniOptions.v.port, "Volume", "volume.port", miniOptions.v.portGrpc},
+		{miniMasterOptions.port, "Master", "master.port", miniMasterOptions.portGrpc, listenOnLocalhost},
+		{miniFilerOptions.port, "Filer", "filer.port", miniFilerOptions.portGrpc, listenOnLocalhost},
+		{miniOptions.v.port, "Volume", "volume.port", miniOptions.v.portGrpc, listenOnLocalhost},
 	}
 	if *miniEnableS3 {
 		portConfigs = append(portConfigs, struct {
-			port     *int
-			name     string
-			flagName string
-			grpcPtr  *int
-		}{miniS3Options.port, "S3", "s3.port", miniS3Options.portGrpc})
+			port      *int
+			name      string
+			flagName  string
+			grpcPtr   *int
+			localhost bool
+		}{miniS3Options.port, "S3", "s3.port", miniS3Options.portGrpc, listenOnLocalhost})
 		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 			portConfigs = append(portConfigs, struct {
-				port     *int
-				name     string
-				flagName string
-				grpcPtr  *int
-			}{miniS3Options.portIceberg, "Iceberg", "s3.port.iceberg", nil})
+				port      *int
+				name      string
+				flagName  string
+				grpcPtr   *int
+				localhost bool
+			}{miniS3Options.portIceberg, "Iceberg", "s3.port.iceberg", nil, listenOnLocalhost})
 		}
 		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
 			portConfigs = append(portConfigs, struct {
-				port     *int
-				name     string
-				flagName string
-				grpcPtr  *int
-			}{miniS3Options.portLance, "Lance", "s3.port.lance", nil})
+				port      *int
+				name      string
+				flagName  string
+				grpcPtr   *int
+				localhost bool
+			}{miniS3Options.portLance, "Lance", "s3.port.lance", nil, listenOnLocalhost})
 		}
 	}
+	if *miniVector {
+		portConfigs = append(portConfigs, struct {
+			port      *int
+			name      string
+			flagName  string
+			grpcPtr   *int
+			localhost bool
+		}{miniVectorPort, "Vector", "vector.port", nil, false})
+		if *miniVectorMetricsPort > 0 {
+			portConfigs = append(portConfigs, struct {
+				port      *int
+				name      string
+				flagName  string
+				grpcPtr   *int
+				localhost bool
+			}{miniVectorMetricsPort, "Vector metrics", "vector.metricsPort", nil, false})
+		}
+	}
+
+	if *miniEnableWebDAV {
+		portConfigs = append(portConfigs, struct {
+			port      *int
+			name      string
+			flagName  string
+			grpcPtr   *int
+			localhost bool
+		}{miniWebDavOptions.port, "WebDAV", "webdav.port", nil, false})
+	}
 	portConfigs = append(portConfigs, struct {
-		port     *int
-		name     string
-		flagName string
-		grpcPtr  *int
-	}{miniWebDavOptions.port, "WebDAV", "webdav.port", nil},
-		struct {
-			port     *int
-			name     string
-			flagName string
-			grpcPtr  *int
-		}{miniAdminOptions.port, "Admin", "admin.port", miniAdminOptions.grpcPort})
+		port      *int
+		name      string
+		flagName  string
+		grpcPtr   *int
+		localhost bool
+	}{miniAdminOptions.port, "Admin", "admin.port", miniAdminOptions.grpcPort, false})
 
 	// First, reserve all gRPC ports that will be calculated to prevent HTTP port allocation from using them
 	// This prevents collisions like: HTTP port moves to X, then gRPC port is calculated as Y where Y == X
@@ -955,14 +1012,41 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 		}
 	}
 
+	chosenPorts := make(map[int]string)
+	for _, config := range portConfigs {
+		if *config.port > 0 && explicitFlags[config.flagName] {
+			if previous, exists := chosenPorts[*config.port]; exists {
+				return fmt.Errorf("port %d is shared by explicit flags %s and %s", *config.port, previous, config.flagName)
+			}
+			chosenPorts[*config.port] = config.flagName
+		}
+	}
+
+	applyMiniAdminCredentialFallback(&miniAdminOptions)
+	adminBindIP := miniAdminEffectiveBindIP(bindIp)
+
 	// Check all HTTP ports sequentially to avoid race conditions
 	// Each port check and allocation must complete before the next one starts
 	// to prevent multiple goroutines from claiming the same available port
 	// Also avoid allocating ports that are reserved for gRPC calculation
 	for _, config := range portConfigs {
+		checkIP := bindIp
+		if config.name == "Admin" {
+			checkIP = adminBindIP
+		}
 		original := *config.port
-		if err := ensurePortAvailableOnIP(config.port, config.name, bindIp, reservedPorts, config.flagName); err != nil {
+		unavailablePorts := maps.Clone(reservedPorts)
+		for port, flag := range chosenPorts {
+			if flag != config.flagName {
+				unavailablePorts[port] = true
+			}
+		}
+
+		if err := ensurePortAvailableOnIP(config.port, config.name, checkIP, unavailablePorts, config.flagName, config.localhost); err != nil {
 			return err
+		}
+		if *config.port > 0 {
+			chosenPorts[*config.port] = config.flagName
 		}
 		// If port was changed, update the reserved gRPC ports mapping
 		if *config.port != original && config.grpcPtr != nil && *config.grpcPtr == 0 {
@@ -974,7 +1058,7 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 	// Initialize all gRPC ports before services start
 	// This ensures they won't be recalculated and cause conflicts
 	// All gRPC port handling (calculation, validation, and assignment) is performed exclusively in initializeGrpcPortsOnIP
-	allocatedPorts := initializeGrpcPortsOnIP(bindIp)
+	allocatedPorts := initializeGrpcPortsOnIP(bindIp, listenOnLocalhost)
 
 	// Every other service binds within a moment of this check, but the admin
 	// waits for all of them first. The admin gRPC port sits inside the Linux
@@ -1053,7 +1137,7 @@ func listenMiniAdminWorker(bindIP string, port int) (net.Listener, error) {
 // This must be called after HTTP ports are finalized and before services start
 // Returns the set of ports allocated to mini services, for callers that must
 // keep optional listeners from stealing them.
-func initializeGrpcPortsOnIP(bindIp string) map[int]bool {
+func initializeGrpcPortsOnIP(bindIp string, listenOnLocalhost bool) map[int]bool {
 	// Track all ports allocated (both HTTP and gRPC) to prevent collisions.
 	// We must reserve HTTP ports so that gRPC fallback allocation never picks
 	// a port already assigned to an HTTP service (which hasn't bound yet).
@@ -1075,27 +1159,42 @@ func initializeGrpcPortsOnIP(bindIp string) map[int]bool {
 		}
 	}
 
+	if *miniVector {
+		allocatedPorts[*miniVectorPort] = true
+		if *miniVectorMetricsPort > 0 {
+			allocatedPorts[*miniVectorMetricsPort] = true
+		}
+	}
+
 	grpcConfigs := []struct {
-		httpPort *int
-		grpcPort *int
-		name     string
+		httpPort  *int
+		grpcPort  *int
+		name      string
+		ip        string
+		localhost bool
 	}{
-		{miniMasterOptions.port, miniMasterOptions.portGrpc, "Master"},
-		{miniFilerOptions.port, miniFilerOptions.portGrpc, "Filer"},
-		{miniOptions.v.port, miniOptions.v.portGrpc, "Volume"},
+		{miniMasterOptions.port, miniMasterOptions.portGrpc, "Master", bindIp, listenOnLocalhost},
+		{miniFilerOptions.port, miniFilerOptions.portGrpc, "Filer", bindIp, listenOnLocalhost},
+		{miniOptions.v.port, miniOptions.v.portGrpc, "Volume", bindIp, listenOnLocalhost},
 	}
 	if *miniEnableS3 {
 		grpcConfigs = append(grpcConfigs, struct {
-			httpPort *int
-			grpcPort *int
-			name     string
-		}{miniS3Options.port, miniS3Options.portGrpc, "S3"})
+			httpPort  *int
+			grpcPort  *int
+			name      string
+			ip        string
+			localhost bool
+		}{miniS3Options.port, miniS3Options.portGrpc, "S3", bindIp, listenOnLocalhost})
 	}
+	// The Admin worker gRPC binds workerGrpcBindIp (loopback by default), not
+	// -ip.bind, and never opens a companion listener.
 	grpcConfigs = append(grpcConfigs, struct {
-		httpPort *int
-		grpcPort *int
-		name     string
-	}{miniAdminOptions.port, miniAdminOptions.grpcPort, "Admin"})
+		httpPort  *int
+		grpcPort  *int
+		name      string
+		ip        string
+		localhost bool
+	}{miniAdminOptions.port, miniAdminOptions.grpcPort, "Admin", miniAdminOptions.workerGrpcBindIp, false})
 
 	for _, config := range grpcConfigs {
 		if config.grpcPort == nil {
@@ -1109,10 +1208,10 @@ func initializeGrpcPortsOnIP(bindIp string) map[int]bool {
 
 		// Verify the gRPC port is available (whether calculated or explicitly set)
 		// Check on both specific IP and all interfaces, and check against already allocated ports
-		if !isPortOpenOnIP(bindIp, *config.grpcPort) || !isPortAvailable(*config.grpcPort) || allocatedPorts[*config.grpcPort] {
+		if !isPortUsableOnIP(config.ip, *config.grpcPort, config.localhost) || allocatedPorts[*config.grpcPort] {
 			glog.Warningf("gRPC port %d for %s is not available, finding alternative...", *config.grpcPort, config.name)
 			originalPort := *config.grpcPort
-			newPort := findAvailablePortOnIP(bindIp, originalPort+1, 100, allocatedPorts)
+			newPort := findAvailablePortOnIP(config.ip, originalPort+1, 100, allocatedPorts, config.localhost)
 			if newPort == 0 {
 				glog.Errorf("Could not find available gRPC port for %s starting from %d, will use %d and fail on binding", config.name, originalPort+1, originalPort)
 			} else {
@@ -1403,8 +1502,14 @@ func runMini(cmd *Command, args []string) bool {
 		miniAdminOptions.workerGrpcBindIp = "127.0.0.1"
 	}
 
+	// Services keep the loopback companion listener only while -ip.bind is
+	// unset and the bind address falls back to -ip. While it is on, each
+	// service port must be free on every interface, not just bindIp. This
+	// must be captured before *miniBindIp is filled in below.
+	listenOnLocalhost := *miniBindIp == "" && !util.IsLoopbackOrWildcardAddress(bindIp)
+
 	// Ensure all ports are available, find alternatives if needed
-	if err := ensureAllPortsAvailableOnIP(bindIp); err != nil {
+	if err := ensureAllPortsAvailableOnIP(bindIp, listenOnLocalhost); err != nil {
 		glog.Errorf("Port allocation failed: %v", err)
 		os.Exit(1)
 	}
@@ -1429,14 +1534,18 @@ func runMini(cmd *Command, args []string) bool {
 	// ip address
 	miniMasterOptions.ip = miniIp
 	miniMasterOptions.ipBind = miniBindIp
+	miniMasterOptions.listenOnLocalhost = &listenOnLocalhost
 	miniFilerOptions.masters = pb.ServerAddresses(actualPeersForComponents).ToServiceDiscovery()
 	miniFilerOptions.ip = miniIp
 	miniFilerOptions.bindIp = miniBindIp
+	miniFilerOptions.listenOnLocalhost = &listenOnLocalhost
 	miniS3Options.ip = miniIp
 	miniS3Options.bindIp = miniBindIp
+	miniS3Options.listenOnLocalhost = &listenOnLocalhost
 	miniWebDavOptions.ipBind = miniBindIp
 	miniOptions.v.ip = miniIp
 	miniOptions.v.bindIp = miniBindIp
+	miniOptions.v.listenOnLocalhost = &listenOnLocalhost
 	miniOptions.v.masters = pb.ServerAddresses(actualPeersForComponents).ToAddresses()
 	miniOptions.v.idleConnectionTimeout = miniTimeout
 	// Admin server binds to the same address as the other mini services.
@@ -1460,19 +1569,28 @@ func runMini(cmd *Command, args []string) bool {
 	// credential manager can also serve static users.
 	miniFilerOptions.s3ConfigFile = miniS3Config
 
-	filerAddress := string(pb.NewServerAddress(*miniIp, *miniFilerOptions.port, *miniFilerOptions.portGrpc))
+	filerAddress := embeddedFilerAddress(*miniIp, *miniFilerOptions.port, miniFilerOptions.portGrpc)
 	miniS3Options.filer = &filerAddress
+	miniS3Options.homeFiler = filerAddress
 	miniWebDavOptions.filer = &filerAddress
 
 	// Register Unix socket paths for gRPC services so local inter-service
 	// communication goes through Unix sockets instead of TCP.
-	pb.RegisterLocalGrpcSocket(*miniIp, *miniMasterOptions.portGrpc, fmt.Sprintf("/tmp/seaweedfs-master-grpc-%d.sock", *miniMasterOptions.portGrpc))
-	pb.RegisterLocalGrpcSocket(*miniIp, *miniOptions.v.portGrpc, fmt.Sprintf("/tmp/seaweedfs-volume-grpc-%d.sock", *miniOptions.v.portGrpc))
-	pb.RegisterLocalGrpcSocket(*miniIp, *miniFilerOptions.portGrpc, fmt.Sprintf("/tmp/seaweedfs-filer-grpc-%d.sock", *miniFilerOptions.portGrpc))
-	if *miniS3Options.portGrpc > 0 {
-		pb.RegisterLocalGrpcSocket(*miniIp, *miniS3Options.portGrpc, fmt.Sprintf("/tmp/seaweedfs-s3-grpc-%d.sock", *miniS3Options.portGrpc))
+	localSockets := []grpcLocalSocket{
+		{"master", *miniMasterOptions.portGrpc},
+		{"volume", *miniOptions.v.portGrpc},
+		{"filer", *miniFilerOptions.portGrpc},
+		{"admin", *miniAdminOptions.grpcPort},
 	}
-	pb.RegisterLocalGrpcSocket(*miniIp, *miniAdminOptions.grpcPort, fmt.Sprintf("/tmp/seaweedfs-admin-grpc-%d.sock", *miniAdminOptions.grpcPort))
+	if *miniS3Options.portGrpc > 0 {
+		localSockets = append(localSockets, grpcLocalSocket{"s3", *miniS3Options.portGrpc})
+	}
+	if err := checkGrpcLocalSocketDir(*miniGrpcLocalSocketDir, localSockets); err != nil {
+		glog.Fatalf("Check gRPC local socket folder (-grpc.localSocketDir=%q): %v", *miniGrpcLocalSocketDir, err)
+	}
+	for _, socket := range localSockets {
+		pb.RegisterLocalGrpcSocket(*miniIp, socket.port, grpcLocalSocketPath(*miniGrpcLocalSocketDir, socket.name, socket.port))
+	}
 
 	go stats_collect.StartMetricsServer(*miniMetricsHttpIp, *miniMetricsHttpPort)
 
@@ -1520,6 +1638,23 @@ func runMini(cmd *Command, args []string) bool {
 	// tear those services down too. On Ctrl+C they rely on their own
 	// OnInterrupt hooks (see grace's LIFO ordering).
 	miniMasterOptions.shutdownCtx = MiniClusterCtx
+	// In single-master mode mini's embedded volume server is the only reporter
+	// of prior cluster state; its first heartbeat already carries the full
+	// inventory, so the post-mint allocation hold ends there instead of
+	// running the whole warmup window on every fresh start. The master pins
+	// the embedded address and refuses any other volume server, keeping the
+	// single-reporter assumption true. Multi-master minis can field
+	// late-reporting volume servers and keep the regular hold.
+	// Both fields are re-derived on every run: the package-level options
+	// survive in-process reruns, so a multi-master mini after a
+	// single-master one must not inherit the release or the stale pin.
+	singleMaster := isSingleMasterMode(*miniMasterOptions.peers)
+	miniMasterOptions.releaseAllocOnFirstReport = singleMaster
+	miniMasterOptions.singleReporterAddr = ""
+	miniFilerOptions.skipEmptyMembershipConfirm = singleMaster
+	if singleMaster {
+		miniMasterOptions.singleReporterAddr = util.JoinHostPort(*miniIp, *miniOptions.v.port)
+	}
 	miniOptions.v.shutdownCtx = MiniClusterCtx
 	miniFilerOptions.shutdownCtx = MiniClusterCtx
 	// Mini is a small/dev setup with short-lived RPCs; cap the filer's
@@ -1574,6 +1709,32 @@ func runMini(cmd *Command, args []string) bool {
 		os.Setenv("S3_TABLE_BUCKET", strings.Join(names, ","))
 	} else {
 		os.Unsetenv("S3_TABLE_BUCKET")
+	}
+
+	vectorBuckets := *miniVectorBucket
+	if vectorBuckets == "" {
+		vectorBuckets = os.Getenv("S3_VECTOR_BUCKET")
+	}
+	var vectorEntries []tableBucketEntry
+	for _, name := range parseBucketList(vectorBuckets) {
+		vectorEntries = append(vectorEntries, tableBucketEntry{name: name, format: s3tables.FormatLance})
+	}
+	if len(vectorEntries) > 0 && !*miniEnableS3 {
+		glog.Errorf("vector buckets require the S3 gateway")
+		triggerMiniClientsShutdown(5 * time.Second)
+		return false
+	}
+	if ready, err := createMiniTableBuckets(vectorEntries); err != nil || len(ready) != len(vectorEntries) {
+		glog.Errorf("created %d of %d requested vector buckets: %v", len(ready), len(vectorEntries), err)
+		triggerMiniClientsShutdown(5 * time.Second)
+		return false
+	}
+	if *miniVector {
+		if err := startMiniVector(); err != nil {
+			glog.Errorf("start vector engine: %v", err)
+			triggerMiniClientsShutdown(5 * time.Second)
+			return false
+		}
 	}
 
 	// Print welcome message after all services are running
@@ -1775,6 +1936,14 @@ func miniAdminBindIP(requestedIP string, passwordConfigured, mtlsConfigured, all
 	return "127.0.0.1"
 }
 
+func miniAdminEffectiveBindIP(requestedIP string) string {
+	hasMTLS := util.GetViper().GetString("https.admin.key") != "" &&
+		util.GetViper().GetString("https.admin.ca") != ""
+	allowInsecure := miniAdminOptions.allowInsecureBind != nil &&
+		*miniAdminOptions.allowInsecureBind
+	return miniAdminBindIP(requestedIP, *miniAdminOptions.adminPassword != "", hasMTLS, allowInsecure)
+}
+
 // miniAdminWorkerAddress encodes the finalized HTTP and gRPC ports in the
 // server-address format understood by pb.ServerToGrpcAddress.
 func miniAdminWorkerAddress(bindIP string, httpPort, grpcPort int) string {
@@ -1832,16 +2001,11 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 	applyMiniAdminCredentialFallback(&miniAdminOptions)
 
 	requestedBindIP := getBindIp()
+	bindIP := miniAdminEffectiveBindIP(requestedBindIP)
 	hasMTLS := util.GetViper().GetString("https.admin.key") != "" &&
 		util.GetViper().GetString("https.admin.ca") != ""
 	allowInsecure := miniAdminOptions.allowInsecureBind != nil &&
 		*miniAdminOptions.allowInsecureBind
-	bindIP := miniAdminBindIP(
-		requestedBindIP,
-		*miniAdminOptions.adminPassword != "",
-		hasMTLS,
-		allowInsecure,
-	)
 	miniAdminOptions.ip = &bindIP
 	if bindIP != requestedBindIP {
 		glog.Warningf(
@@ -2351,6 +2515,14 @@ func ensureMiniTableBuckets(buckets []tableBucketEntry) ([]tableBucketEntry, err
 		}
 		servable = append(servable, bucket)
 	}
+	if len(servable) == 0 {
+		return nil, nil
+	}
+
+	return createMiniTableBuckets(servable)
+}
+
+func createMiniTableBuckets(servable []tableBucketEntry) ([]tableBucketEntry, error) {
 	if len(servable) == 0 {
 		return nil, nil
 	}

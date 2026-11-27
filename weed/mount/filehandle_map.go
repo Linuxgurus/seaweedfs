@@ -2,6 +2,7 @@ package mount
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
@@ -54,20 +55,60 @@ func (i *FileHandleToInode) MarkInodeRenamed(inode uint64) {
 // existed. An existing handle only gets its counter bumped: its entry belongs
 // to whoever holds the handle lock, so callers install there (AcquireHandle)
 // rather than under this one.
-func (i *FileHandleToInode) AcquireFileHandle(wfs *WFS, inode uint64, entry *filer_pb.Entry, versionTsNs int64, signature int32) (*FileHandle, bool) {
+// Every open gets its own fh value over the shared FileHandle so that
+// RELEASE — which identifies nothing else about the dying description — can
+// scope per-open state (e.g. OFD lock owners) to the open that is closing.
+//
+// A handle whose counter already reached zero is draining its deferred flush:
+// it stays in the map only so rename/unlink can still find it, and
+// RemoveFileHandle will drop it (and every fh id minted for it) when the drain
+// completes. Attaching here would hand the kernel an fh id that vanishes mid-
+// open — reads on it return ENOENT, which the kernel reports to read() as EIO.
+// Callers must treat a draining report as "wait for the pending flush, then
+// retry the whole acquire", not as success.
+func (i *FileHandleToInode) AcquireFileHandle(wfs *WFS, inode uint64, entry *filer_pb.Entry, versionTsNs int64, signature int32, appendMode ...bool) (*FileHandle, FileHandleId, bool, bool) {
+	// Bind before publishing the handle or queuing any async close. Capture
+	// under the inode-table lock, but release it before taking the fhMap lock.
+	var writebackError *atomic.Bool
+	if wfs.option.WritebackCache {
+		wfs.inodeToPath.RLock()
+		state, found := wfs.writebackContentErrors.Load(inode)
+		if !found {
+			state, _ = wfs.writebackContentErrors.LoadOrStore(inode, new(atomic.Bool))
+		}
+		writebackError = state.(*atomic.Bool)
+		wfs.inodeToPath.RUnlock()
+	}
 	i.Lock()
 	defer i.Unlock()
 	fh, found := i.inode2fh[inode]
 	if !found {
 		fh = newFileHandle(wfs, FileHandleId(util.RandomUint64()), inode, entry)
+		fh.writebackContentError = writebackError
+		fh.fhs[fh.fh] = len(appendMode) > 0 && appendMode[0]
 		fh.entryVersionTsNs.Store(versionTsNs)
 		fh.entryVersionSignature.Store(signature)
 		i.inode2fh[inode] = fh
 		i.fh2inode[fh.fh] = inode
-		return fh, false
+		return fh, fh.fh, false, false
+	}
+	if fh.counter <= 0 {
+		return nil, 0, true, true
 	}
 	fh.counter++
-	return fh, true
+	openFh := FileHandleId(util.RandomUint64())
+	fh.fhs[openFh] = len(appendMode) > 0 && appendMode[0]
+	i.fh2inode[openFh] = inode
+	return fh, openFh, true, false
+}
+
+func (i *FileHandleToInode) isAppendHandle(openFh FileHandleId) bool {
+	i.RLock()
+	defer i.RUnlock()
+	if fh := i.inode2fh[i.fh2inode[openFh]]; fh != nil {
+		return fh.fhs[openFh]
+	}
+	return false
 }
 
 func (i *FileHandleToInode) ReleaseByHandle(fh FileHandleId) *FileHandle {
@@ -78,12 +119,15 @@ func (i *FileHandleToInode) ReleaseByHandle(fh FileHandleId) *FileHandle {
 	if !found {
 		return nil
 	}
+	// The released id never resolves again: a duplicate RELEASE on it must
+	// not decrement the counter a second time.
+	delete(i.fh2inode, fh)
 
 	fhHandle, fhFound := i.inode2fh[inode]
 	if !fhFound {
-		delete(i.fh2inode, fh)
 		return nil
 	}
+	delete(fhHandle.fhs, fh)
 
 	// If the counter is already <= 0, a prior Release already started the
 	// drain.  Return nil to prevent double-processing.
@@ -98,8 +142,15 @@ func (i *FileHandleToInode) ReleaseByHandle(fh FileHandleId) *FileHandle {
 			// via FindFileHandle during the background drain.
 			return fhHandle
 		}
+		// Fence before a reopen can see the inode without this handle.
+		if fhHandle.dirtyContent && !fhHandle.isDeleted {
+			(&contentPublication{failure: fhHandle.writebackContentError}).abandon()
+		}
 		delete(i.inode2fh, inode)
-		delete(i.fh2inode, fhHandle.fh)
+		for openFh := range fhHandle.fhs {
+			delete(i.fh2inode, openFh)
+		}
+		fhHandle.fhs = nil
 		return fhHandle
 	}
 	return nil
@@ -111,6 +162,27 @@ func (i *FileHandleToInode) ReleaseByHandle(fh FileHandleId) *FileHandle {
 func (i *FileHandleToInode) RemoveFileHandle(fh FileHandleId, inode uint64) {
 	i.Lock()
 	defer i.Unlock()
+	if fhHandle, ok := i.inode2fh[inode]; ok {
+		for openFh := range fhHandle.fhs {
+			delete(i.fh2inode, openFh)
+		}
+	}
 	delete(i.inode2fh, inode)
 	delete(i.fh2inode, fh)
+}
+
+// openFhIds returns the live fh values minted for an inode's shared handle —
+// one per still-open description.
+func (i *FileHandleToInode) openFhIds(inode uint64) []FileHandleId {
+	i.RLock()
+	defer i.RUnlock()
+	fh := i.inode2fh[inode]
+	if fh == nil {
+		return nil
+	}
+	ids := make([]FileHandleId, 0, len(fh.fhs))
+	for id := range fh.fhs {
+		ids = append(ids, id)
+	}
+	return ids
 }

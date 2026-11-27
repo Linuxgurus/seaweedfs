@@ -307,3 +307,150 @@ preferred_tags = ["fast,SSD"]
 		t.Errorf("preferred_tags = %v, want [fast ssd]", got)
 	}
 }
+
+func TestApplyMaintenanceConfigFromTomlMaxShardTransfers(t *testing.T) {
+	dir := t.TempDir()
+	cp := NewConfigPersistence(dir)
+	if err := cp.ApplyMaintenanceConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+fullness_ratio = 0.9
+`)); err != nil {
+		t.Fatalf("apply fullness: %v", err)
+	}
+	ec := erasure_coding.LoadConfigFromPersistence(cp)
+	if ec.MaxShardTransfers != nil {
+		t.Fatalf("absent key persisted as %d, want unset", *ec.MaxShardTransfers)
+	}
+	if ec.FullnessRatio != 0.9 {
+		t.Fatalf("fullness_ratio = %v, want 0.9", ec.FullnessRatio)
+	}
+
+	if err := cp.ApplyMaintenanceConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+max_shard_transfers = 0
+`)); err != nil {
+		t.Fatalf("apply 0: %v", err)
+	}
+	ec = erasure_coding.LoadConfigFromPersistence(cp)
+	if ec.MaxShardTransfers == nil || *ec.MaxShardTransfers != 0 {
+		t.Fatalf("0: got %v, want sequential 0", ec.MaxShardTransfers)
+	}
+
+	if err := cp.ApplyMaintenanceConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+max_shard_transfers = 4
+`)); err != nil {
+		t.Fatalf("apply 4: %v", err)
+	}
+	ec = erasure_coding.LoadConfigFromPersistence(cp)
+	if ec.MaxShardTransfers == nil || *ec.MaxShardTransfers != 4 {
+		t.Fatalf("4: got %v, want 4", ec.MaxShardTransfers)
+	}
+
+	if err := cp.ApplyMaintenanceConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+max_shard_transfers = -3
+`)); err != nil {
+		t.Fatalf("apply negative: %v", err)
+	}
+	ec = erasure_coding.LoadConfigFromPersistence(cp)
+	if ec.MaxShardTransfers == nil || *ec.MaxShardTransfers != 0 {
+		t.Fatalf("negative: got %v, want sequential 0", ec.MaxShardTransfers)
+	}
+}
+
+func TestApplyPluginConfigFromTomlMaxShardTransfers(t *testing.T) {
+	s := newPluginServer(t)
+	seed := &plugin_pb.PersistedJobTypeConfig{
+		JobType:      "erasure_coding",
+		AdminRuntime: &plugin_pb.AdminRuntimeConfig{Enabled: true},
+	}
+	if err := s.GetPlugin().SaveJobTypeConfig(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := s.ApplyPluginConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+replica_placement = "020"
+`)); err != nil {
+		t.Fatalf("apply placement: %v", err)
+	}
+	cfg, err := s.GetPlugin().LoadJobTypeConfig("erasure_coding")
+	if err != nil || cfg == nil {
+		t.Fatalf("load: %v %v", cfg, err)
+	}
+	if _, ok := cfg.WorkerConfigValues["max_shard_transfers"]; ok {
+		t.Fatal("absent max_shard_transfers was written into worker config")
+	}
+
+	if err := s.ApplyPluginConfigFromToml(tomlConfig(t, `
+[maintenance.erasure_coding]
+max_shard_transfers = 0
+`)); err != nil {
+		t.Fatalf("apply 0: %v", err)
+	}
+	cfg, err = s.GetPlugin().LoadJobTypeConfig("erasure_coding")
+	if err != nil || cfg == nil {
+		t.Fatalf("load 0: %v %v", cfg, err)
+	}
+	got, ok := cfg.WorkerConfigValues["max_shard_transfers"]
+	if !ok {
+		t.Fatal("max_shard_transfers = 0 missing from worker config")
+	}
+	if got.GetInt64Value() != 0 {
+		t.Fatalf("max_shard_transfers = %d, want 0", got.GetInt64Value())
+	}
+}
+
+func TestApplyPluginConfigFromTomlS3Lifecycle(t *testing.T) {
+	s := newPluginServer(t)
+	seed := &plugin_pb.PersistedJobTypeConfig{
+		JobType:      "s3_lifecycle",
+		AdminRuntime: &plugin_pb.AdminRuntimeConfig{Enabled: true, RetryLimit: 1},
+		AdminConfigValues: map[string]*plugin_pb.ConfigValue{
+			"meta_log_retention_days": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 7}},
+		},
+	}
+	if err := s.GetPlugin().SaveJobTypeConfig(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	v := tomlConfig(t, `
+[maintenance.s3_lifecycle]
+meta_log_retention_days = 0
+walker_interval_minutes = 30
+cluster_deletes_per_second = 50
+cluster_deletes_burst = 200
+retry_limit = 3
+`)
+	if err := s.ApplyPluginConfigFromToml(v); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cfg, err := s.GetPlugin().LoadJobTypeConfig("s3_lifecycle")
+	if err != nil || cfg == nil {
+		t.Fatalf("load: %v %v", cfg, err)
+	}
+	// an explicit 0 must replace the saved value, not read as unset
+	if got, ok := cfg.AdminConfigValues["meta_log_retention_days"].GetKind().(*plugin_pb.ConfigValue_Int64Value); !ok || got.Int64Value != 0 {
+		t.Errorf("meta_log_retention_days = %v, want int64 0", cfg.AdminConfigValues["meta_log_retention_days"])
+	}
+	if got := cfg.AdminConfigValues["walker_interval_minutes"].GetInt64Value(); got != 30 {
+		t.Errorf("walker_interval_minutes = %d, want 30", got)
+	}
+	if got := cfg.AdminConfigValues["cluster_deletes_per_second"].GetInt64Value(); got != 50 {
+		t.Errorf("cluster_deletes_per_second = %d, want 50", got)
+	}
+	if got := cfg.AdminConfigValues["cluster_deletes_burst"].GetInt64Value(); got != 200 {
+		t.Errorf("cluster_deletes_burst = %d, want 200", got)
+	}
+	if cfg.AdminRuntime.RetryLimit != 3 {
+		t.Errorf("retry_limit = %d, want 3", cfg.AdminRuntime.RetryLimit)
+	}
+	if !cfg.AdminRuntime.Enabled {
+		t.Errorf("enabled flipped off by unrelated toml keys")
+	}
+	if cfg.UpdatedBy != "admin.toml" {
+		t.Errorf("updated_by = %q, want admin.toml", cfg.UpdatedBy)
+	}
+}

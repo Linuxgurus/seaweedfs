@@ -20,7 +20,9 @@ use crate::storage::needle::needle::{Needle, get_actual_size};
 use crate::storage::needle_map::NeedleMapKind;
 use crate::storage::super_block::{ReplicaPlacement, SUPER_BLOCK_SIZE, SuperBlock};
 use crate::storage::types::*;
-use crate::storage::volume::{CompactionJob, VifVolumeInfo, Volume, VolumeError, VolumeSpec};
+use crate::storage::volume::{
+    CompactionJob, PREALLOCATE_SUPPORTED, VifVolumeInfo, Volume, VolumeError, VolumeSpec,
+};
 
 /// Mirrors Go's ensureCompactVolumeSpace, per filesystem: the new .dat lands
 /// next to the old one and the new .idx next to the old index, so when the
@@ -52,6 +54,40 @@ fn ensure_compact_volume_space(v: &Volume, preallocate: u64) -> Result<(), Volum
     }
 }
 
+// Create-time metadata a location must still fit after a preallocation: .vif
+// always lands beside the data file; the .idx a writable volume keeps
+// appending counts only when dir_idx shares the filesystem. Holding these
+// back keeps an exact-fit reservation from dipping under the floor once the
+// metadata is written.
+const VOLUME_CREATE_VIF_BYTES: u64 = 1 << 20;
+const VOLUME_CREATE_IDX_BYTES: u64 = 4 << 20;
+
+/// Mirrors Go's hasRoomForNewVolume: a preallocated volume reserves its full
+/// size up front, so it must fit in the free space above the min-free-space
+/// floor. Reads the disk now rather than the once-a-probe is_disk_space_low
+/// flag. A volume without preallocation reserves nothing, as does one on a
+/// platform where preallocate_file is a no-op.
+fn has_room_for_new_volume(
+    location: &DiskLocation,
+    preallocate: u64,
+    preallocate_supported: bool,
+    disk_stats_of: fn(&str) -> (u64, u64),
+) -> bool {
+    if preallocate == 0 || !preallocate_supported {
+        return true;
+    }
+    let (all, free) = disk_stats_of(&location.directory);
+    if location.min_free_space.is_low(free, all) {
+        return false;
+    }
+    let mut need = preallocate + VOLUME_CREATE_VIF_BYTES;
+    if same_filesystem(&location.directory, &location.idx_directory) {
+        need += VOLUME_CREATE_IDX_BYTES;
+    }
+    location.min_free_space.available_space(free, all)
+        >= need + location.reserved_space.load(Ordering::Relaxed)
+}
+
 /// Top-level storage manager containing all disk locations and their volumes.
 pub struct Store {
     pub locations: Vec<DiskLocation>,
@@ -76,6 +112,19 @@ pub struct Store {
     pub last_seen_topology_id: Mutex<String>,
     pub vid_stamp_lock: Mutex<()>,
     pub vid_stamp_dirty: std::sync::atomic::AtomicBool,
+    /// Reads (total, free) for a directory; a field so a test can stand in
+    /// for a disk that is full or near its floor. Go: diskStatusOf.
+    disk_stats_of: fn(&str) -> (u64, u64),
+    /// Whether a create actually reserves `preallocate` on this platform; a
+    /// field so a test can exercise the guard off Linux. Go:
+    /// createVolumeFilePreallocates.
+    preallocate_supported: bool,
+    /// The copy-claim set installed on every location by
+    /// set_volume_load_guard, kept here so a later add_location gets it too.
+    load_guard: Option<Arc<Mutex<HashSet<VolumeId>>>>,
+    /// The data directory of every disk this server loads, set before the
+    /// first `add_location` so a disk's EC mounts can see its siblings.
+    pub store_dirs: Vec<String>,
 }
 
 impl Store {
@@ -99,6 +148,10 @@ impl Store {
             last_seen_topology_id: Mutex::new(String::new()),
             vid_stamp_lock: Mutex::new(()),
             vid_stamp_dirty: std::sync::atomic::AtomicBool::new(false),
+            disk_stats_of: super::disk_location::get_disk_stats,
+            load_guard: None,
+            preallocate_supported: PREALLOCATE_SUPPORTED,
+            store_dirs: Vec::new(),
         }
     }
 
@@ -120,6 +173,8 @@ impl Store {
             min_free_space,
             tags,
         )?;
+        loc.load_guard = self.load_guard.clone();
+        loc.store_dirs = self.store_dirs.clone();
         loc.load_existing_volumes(self.needle_map_kind)?;
 
         // Check for duplicate volume IDs across existing locations
@@ -167,6 +222,17 @@ impl Store {
         self.save_vid_stamps();
 
         Ok(())
+    }
+
+    /// Mirrors Go's `Store.SetVolumeLoadGuard`: installs the copy-claim set
+    /// every location consults before scanning a volume from disk, so a
+    /// reload cannot sweep or register files out from under an in-flight
+    /// VolumeCopy.
+    pub fn set_volume_load_guard(&mut self, claims: Arc<Mutex<HashSet<VolumeId>>>) {
+        self.load_guard = Some(claims);
+        for loc in &mut self.locations {
+            loc.load_guard = self.load_guard.clone();
+        }
     }
 
     /// Scan disk locations for new volume files and load them.
@@ -226,12 +292,20 @@ impl Store {
 
     // ---- Volume lifecycle ----
 
-    /// Find the location with fewest volumes (load-balance) of the given disk type.
-    /// Matches Go's FindFreeLocation: accounts for EC shards when computing free slots.
-    fn find_free_location(&self, disk_type: &DiskType) -> Option<usize> {
+    /// Find the location with the fewest writable volumes of `collection`, so
+    /// they do not share one disk's write bandwidth, then the most free slots
+    /// (load-balance) of the given disk type. Matches Go's FindFreeLocation:
+    /// accounts for EC shards when computing free slots.
+    fn find_free_location(
+        &self,
+        disk_type: &DiskType,
+        collection: &str,
+        preallocate: u64,
+    ) -> Option<usize> {
         use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
 
-        let mut best: Option<(usize, i64)> = None; // (index, effective_free)
+        let volume_size_limit = self.volume_size_limit.load(Ordering::Relaxed);
+        let mut best: Option<(usize, usize, i64)> = None; // (index, writable, effective_free)
         for (i, loc) in self.locations.iter().enumerate() {
             if &loc.disk_type != disk_type {
                 continue;
@@ -250,14 +324,25 @@ impl Store {
             if effective_free <= 0 {
                 continue;
             }
-            if loc.is_disk_space_low.load(Ordering::Relaxed) {
+            if loc.is_disk_space_low.load(Ordering::Relaxed) || loc.read_only_mount {
                 continue;
             }
-            if best.is_none() || effective_free > best.unwrap().1 {
-                best = Some((i, effective_free));
+            if !has_room_for_new_volume(
+                loc,
+                preallocate,
+                self.preallocate_supported,
+                self.disk_stats_of,
+            ) {
+                continue;
+            }
+            let writable = loc.writable_collection_volumes_len(collection, volume_size_limit);
+            if best.is_none_or(|(_, min_writable, max_free)| {
+                writable < min_writable || (writable == min_writable && effective_free > max_free)
+            }) {
+                best = Some((i, writable, effective_free));
             }
         }
-        best.map(|(i, _)| i)
+        best.map(|(i, _, _)| i)
     }
 
     /// Find a free location matching a predicate.
@@ -277,7 +362,7 @@ impl Store {
 
         let mut best: Option<(usize, i64)> = None;
         for (i, loc) in self.locations.iter().enumerate() {
-            if !pred(loc) || loc.is_disk_space_low.load(Ordering::Relaxed) {
+            if !pred(loc) || loc.is_disk_space_low.load(Ordering::Relaxed) || loc.read_only_mount {
                 continue;
             }
 
@@ -302,6 +387,64 @@ impl Store {
             }
         }
         best.map(|(i, _)| i)
+    }
+
+    /// Mirrors Go's Store.ReserveFreeLocation: a copy's pick and its .dat
+    /// reservation are separate steps, so verify live space under the store
+    /// lock and charge need against the location's pending reservations, or
+    /// a second copy can spend the same headroom before the first lands.
+    pub fn reserve_free_location<F>(
+        &self,
+        need: u64,
+        pred: F,
+        replace_vid: Option<VolumeId>,
+    ) -> Option<usize>
+    where
+        F: Fn(&DiskLocation) -> bool,
+    {
+        let loc_idx = self.find_free_location_predicate(
+            |loc| {
+                if loc.available_space.load(Ordering::Relaxed) <= need || !pred(loc) {
+                    return false;
+                }
+                let (all, free) = (self.disk_stats_of)(&loc.directory);
+                !loc.min_free_space.is_low(free, all)
+                    && loc.min_free_space.available_space(free, all)
+                        > loc.reserved_space.load(Ordering::Relaxed) + need
+            },
+            replace_vid,
+        )?;
+        let loc = &self.locations[loc_idx];
+        let (all, free) = (self.disk_stats_of)(&loc.directory);
+        loc.reserved_space.fetch_add(need, Ordering::Relaxed);
+        loc.available_space.store(
+            loc.min_free_space
+                .available_space(free, all)
+                .saturating_sub(loc.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        Some(loc_idx)
+    }
+
+    /// Mirrors Go's Store.ReleaseFreeLocation: returns space
+    /// reserve_free_location charged when the copy it paid for does not
+    /// land. Removing the pending charge first keeps a probe that already
+    /// rebased the cache from seeing the refund twice.
+    pub fn release_free_location(&self, loc_idx: usize, need: u64) {
+        if let Some(loc) = self.locations.get(loc_idx) {
+            loc.reserved_space.fetch_sub(need, Ordering::Relaxed);
+            loc.available_space.fetch_add(need, Ordering::Relaxed);
+        }
+    }
+
+    /// Mirrors Go's Store.CommitFreeLocation: settles a reservation whose
+    /// copy landed. The bytes are real on disk, so only the pending charge
+    /// ends — the cache keeps the charge, which now matches the live usage
+    /// the next probe will read.
+    pub fn commit_free_location(&self, loc_idx: usize, need: u64) {
+        if let Some(loc) = self.locations.get(loc_idx) {
+            loc.reserved_space.fetch_sub(need, Ordering::Relaxed);
+        }
     }
 
     /// Returns the index of the disk that should receive a new EC
@@ -335,6 +478,10 @@ impl Store {
     /// their index files across disks of the same node and lose them at
     /// startup. See seaweedfs/seaweedfs#9212.
     ///
+    /// A non-empty `required_disk_type` limits every step to disks of that
+    /// type, so a copy meant for one medium never lands beside the volume's
+    /// copy on another.
+    ///
     /// `data_shard_count` is taken as a parameter rather than read from
     /// `DATA_SHARDS_COUNT` so custom-ratio builds can swap the default
     /// without touching this helper.
@@ -348,6 +495,7 @@ impl Store {
         collection: &str,
         vid: VolumeId,
         data_shard_count: u32,
+        required_disk_type: &str,
         shard_ids: &[ShardId],
     ) -> Option<usize> {
         const TIER_ANY_DISK: u8 = 1;
@@ -356,10 +504,25 @@ impl Store {
         const TIER_MOUNTED: u8 = 4;
         const TIER_OWNS_SHARD: u8 = 5;
 
+        let required =
+            (!required_disk_type.is_empty()).then(|| DiskType::from_string(required_disk_type));
         // (index, tier, owned shard count, free shard slots)
         let mut best: Option<(usize, u8, usize, i64)> = None;
         for (i, loc) in self.locations.iter().enumerate() {
             let owned = owned_ec_shard_count(loc, vid, shard_ids);
+            if loc.read_only_mount || required.as_ref().is_some_and(|t| loc.disk_type != *t) {
+                // An owner that cannot take the copy still owns the shard:
+                // placing another copy on a sibling would register it on two disks.
+                // A typed copy also yields to an unmounted file of the shard there,
+                // which a later mount would pick ahead of the copy.
+                if owned > 0
+                    || (required.is_some()
+                        && has_ec_shard_file_on_disk(loc, collection, vid, shard_ids))
+                {
+                    return None;
+                }
+                continue;
+            }
             let free = ec_free_shard_count(loc, data_shard_count);
             if owned == 0 {
                 if loc.is_disk_space_low.load(Ordering::Relaxed) {
@@ -460,12 +623,14 @@ impl Store {
         if self.find_volume(vid).is_some() {
             return Err(VolumeError::AlreadyExists);
         }
-        let loc_idx = self.find_free_location(&disk_type).ok_or_else(|| {
-            VolumeError::Io(io::Error::other(format!(
-                "no free location for disk type {:?}",
-                disk_type
-            )))
-        })?;
+        let loc_idx = self
+            .find_free_location(&disk_type, spec.collection, spec.preallocate)
+            .ok_or_else(|| {
+                VolumeError::Io(io::Error::other(format!(
+                    "no free location for disk type {:?}",
+                    disk_type
+                )))
+            })?;
 
         self.locations[loc_idx].create_volume(vid, self.needle_map_kind, spec)
     }
@@ -811,14 +976,39 @@ impl Store {
         vol.read_needle_opt(n, read_deleted)
     }
 
-    /// Resolve a needle read under this guard, to run after it is released.
+    /// Resolve a needle read with the store guard held only for the lookup:
+    /// the plan can wait on a vacuum commit's data-file lease, and waiting
+    /// under the guard would park store writers, and every reader queued
+    /// behind them, on that commit. A handle closed while the plan waited is
+    /// looked up again, a bounded number of times.
     pub(crate) fn needle_read_plan(
-        &self,
+        store: &std::sync::RwLock<Store>,
         vid: VolumeId,
         id: NeedleId,
         read_deleted: bool,
     ) -> Result<crate::storage::volume::NeedleReadPlan, VolumeError> {
-        let (_, vol) = self.find_volume(vid).ok_or(VolumeError::NotFound)?;
+        let find = || {
+            let store = store.read().unwrap();
+            store
+                .find_volume(vid)
+                .map(|(_, vol)| vol)
+                .ok_or(VolumeError::NotFound)
+        };
+        Self::plan_on_open_handle(find, id, read_deleted)
+    }
+
+    fn plan_on_open_handle(
+        mut find: impl FnMut() -> Result<Arc<Volume>, VolumeError>,
+        id: NeedleId,
+        read_deleted: bool,
+    ) -> Result<crate::storage::volume::NeedleReadPlan, VolumeError> {
+        let mut vol = find()?;
+        for _ in 0..3 {
+            match vol.needle_read_plan(id, read_deleted) {
+                Err(_) if vol.is_closed() => vol = find()?,
+                plan => return plan,
+            }
+        }
         vol.needle_read_plan(id, read_deleted)
     }
 
@@ -879,13 +1069,14 @@ impl Store {
         &self,
         vid: VolumeId,
         n: &mut Needle,
+        fsync: bool,
     ) -> Result<Size, VolumeError> {
         // Match Go's DeleteVolumeNeedle: check noWriteOrDelete before proceeding.
         let (_, vol) = self.find_volume(vid).ok_or(VolumeError::NotFound)?;
         if vol.is_no_write_or_delete() {
             return Err(VolumeError::ReadOnly(vid));
         }
-        vol.delete_needle(n)
+        vol.delete_needle(n, fsync)
     }
 
     // ---- Collection operations ----
@@ -941,10 +1132,12 @@ impl Store {
         for loc in &self.locations {
             if loc.original_max_volume_count == 0 {
                 let current = loc.max_volume_count.load(Ordering::Relaxed);
-                let (_, free) = super::disk_location::get_disk_stats(&loc.directory);
+                let (all, free) = (self.disk_stats_of)(&loc.directory);
 
                 let unused_space = loc.unused_space(volume_size_limit);
-                let unclaimed = (free as i64) - (unused_space as i64);
+                // Free space under -volume.minFreeSpace is not available for new volumes.
+                let unclaimed =
+                    loc.min_free_space.available_space(free, all) as i64 - unused_space as i64;
 
                 let vol_count = loc.volumes_len() as i32;
                 let loc_ec_shards = loc.ec_shard_count();
@@ -1022,13 +1215,14 @@ impl Store {
     /// Matches Go's Store.MountEcShards which mounts one shard at a time.
     /// `source_disk_type` is the source volume's disk type from the
     /// `VolumeEcShardsMount` RPC (#9423); pass `""` for non-RPC paths.
+    /// Returns the index of the disk the shard mounted on.
     pub fn mount_ec_shard(
         &mut self,
         vid: VolumeId,
         collection: &str,
         shard_id: ShardId,
         source_disk_type: &str,
-    ) -> Result<(), VolumeError> {
+    ) -> Result<usize, VolumeError> {
         self.stamp_allocated_vid(vid);
         // The .ecx may live on a different disk than the shard being mounted
         // (ec.balance / ec.rebuild can spread shards across sibling disks), so
@@ -1041,7 +1235,7 @@ impl Store {
         // next. Like Go, a NotFound just means "not this disk"; anything else
         // is collected so an all-disks-fail error names every disk tried.
         let mut failures: Vec<(String, VolumeError)> = Vec::new();
-        for loc in &mut self.locations {
+        for (disk, loc) in self.locations.iter_mut().enumerate() {
             // Check if the shard file exists on this location
             let shard = EcVolumeShard::new(&loc.directory, collection, vid, shard_id);
             if !std::path::Path::new(&shard.file_name()).exists() {
@@ -1066,7 +1260,7 @@ impl Store {
                 &idx_dir,
                 source_disk_type,
             ) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(disk),
                 Err(VolumeError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => failures.push((loc.directory.clone(), e)),
             }
@@ -1179,6 +1373,19 @@ impl Store {
             }
         }
         None
+    }
+
+    /// Takes the journal lock of every runtime of `vid`, in disk order, so no
+    /// delete append is in flight while the caller reads the journals.
+    pub(crate) fn lock_ec_journals(
+        &self,
+        vid: VolumeId,
+    ) -> Vec<std::sync::MutexGuard<'_, crate::storage::erasure_coding::ec_volume::EcJournal>> {
+        self.locations
+            .iter()
+            .filter_map(|loc| loc.find_ec_volume(vid))
+            .map(|ecv| ecv.journal())
+            .collect()
     }
 
     /// Find an EC volume across all locations (mutable).
@@ -1331,22 +1538,27 @@ impl Store {
         Vec<master_pb::VolumeEcShardInformationMessage>,
         Vec<master_pb::VolumeEcShardInformationMessage>,
     ) {
-        let (mut ec_shards, expired) = self.find_expired_ec_volumes();
-        let (deleted, still_held) = self.remove_expired_ec_volumes(expired);
+        let (mut ec_shards, expired, quarantined) = self.find_expired_ec_volumes();
+        let (mut deleted, still_held) = self.remove_expired_ec_volumes(expired);
         ec_shards.extend(still_held);
+        deleted.extend(quarantined);
         (ec_shards, deleted)
     }
 
-    /// The read half of `delete_expired_ec_volumes`: the shards to report, and
-    /// the expired EC volumes, by disk index, for `remove_expired_ec_volumes`.
+    /// The read half of `delete_expired_ec_volumes`: the shards to report, the
+    /// expired EC volumes, by disk index, for `remove_expired_ec_volumes`, and
+    /// the shards of volumes this pass quarantined, which go out as deleted
+    /// once so the master drops them before the next full EC heartbeat.
     pub fn find_expired_ec_volumes(
         &self,
     ) -> (
         Vec<master_pb::VolumeEcShardInformationMessage>,
         Vec<(usize, VolumeId)>,
+        Vec<master_pb::VolumeEcShardInformationMessage>,
     ) {
         let mut ec_shards = Vec::new();
         let mut expired = Vec::new();
+        let mut quarantined_now = Vec::new();
 
         for (disk_id, loc) in self.locations.iter().enumerate() {
             for (vid, ec_vol) in loc.ec_volumes() {
@@ -1361,6 +1573,8 @@ impl Store {
                             io_count,
                             "ec volume quarantined after consecutive IO errors"
                         );
+                        quarantined_now
+                            .extend(ec_vol.to_volume_ec_shard_information_messages(disk_id as u32));
                     }
                 } else {
                     ec_shards
@@ -1369,7 +1583,7 @@ impl Store {
             }
         }
 
-        (ec_shards, expired)
+        (ec_shards, expired, quarantined_now)
     }
 
     /// The write half of `delete_expired_ec_volumes`: destroys each volume that
@@ -1639,7 +1853,7 @@ impl Store {
     {
         match self.begin_compact_volume(vid, preallocate)? {
             Some(job) => job.run(progress_fn),
-            None => Ok(()),
+            None => Err(crate::storage::volume::compacting_error(vid)),
         }
     }
 
@@ -1761,7 +1975,7 @@ fn update_dat_replica_placement(
             return Err(VolumeError::Io(io::Error::new(
                 e.kind(),
                 format!("volume {} failed to open {}: {}", vid, dat_path, e),
-            )))
+            )));
         }
     };
     let mut header = [0u8; SUPER_BLOCK_SIZE];
@@ -1775,12 +1989,13 @@ fn update_dat_replica_placement(
     let mut block = header.to_vec();
     block.resize(SUPER_BLOCK_SIZE + extra_size, 0);
     if extra_size > 0 {
-        file.read_exact(&mut block[SUPER_BLOCK_SIZE..]).map_err(|e| {
-            VolumeError::Io(io::Error::new(
-                e.kind(),
-                format!("volume {} failed to parse superblock: {}", vid, e),
-            ))
-        })?;
+        file.read_exact(&mut block[SUPER_BLOCK_SIZE..])
+            .map_err(|e| {
+                VolumeError::Io(io::Error::new(
+                    e.kind(),
+                    format!("volume {} failed to parse superblock: {}", vid, e),
+                ))
+            })?;
     }
     let mut super_block = SuperBlock::from_bytes(&block).map_err(|e| {
         VolumeError::Io(io::Error::new(
@@ -1895,6 +2110,19 @@ fn ec_free_shard_count(loc: &DiskLocation, data_shard_count: u32) -> i64 {
         return 0;
     }
     free
+}
+
+/// Whether `loc` holds a file for one of `shard_ids` of `vid`, mounted or not.
+fn has_ec_shard_file_on_disk(
+    loc: &DiskLocation,
+    collection: &str,
+    vid: VolumeId,
+    shard_ids: &[ShardId],
+) -> bool {
+    let base = crate::storage::volume::volume_file_name(&loc.directory, collection, vid);
+    shard_ids
+        .iter()
+        .any(|shard_id| std::path::Path::new(&format!("{}.ec{:02}", base, shard_id)).exists())
 }
 
 /// Reports how many of `shard_ids` this disk already claims for `vid`, per
@@ -2030,6 +2258,351 @@ mod tests {
         assert!(store.has_volume(VolumeId(1)));
         assert!(!store.has_volume(VolumeId(2)));
         assert_eq!(store.total_volume_count(), 1);
+    }
+
+    // fakeDisk stands in for the disk under a location; a preallocating
+    // create takes its size out of FAKE_FREE, as fallocate does on Linux.
+    const MIB: u64 = 1 << 20;
+    static FAKE_ALL: AtomicU64 = AtomicU64::new(0);
+    static FAKE_FREE: AtomicU64 = AtomicU64::new(0);
+    static FAKE_DISK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fake_disk_stats(_: &str) -> (u64, u64) {
+        (
+            FAKE_ALL.load(Ordering::Relaxed),
+            FAKE_FREE.load(Ordering::Relaxed),
+        )
+    }
+
+    // Store with one location whose fake disk has the given free space and a
+    // Bytes floor; the low-disk flag stays false, as between two probes.
+    fn headroom_store(dir: &str, free: u64, floor: u64) -> Store {
+        FAKE_ALL.store(10 * 1024 * MIB, Ordering::Relaxed);
+        FAKE_FREE.store(free, Ordering::Relaxed);
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                10,
+                DiskType::HardDrive,
+                MinFreeSpace::Bytes(floor),
+                Vec::new(),
+            )
+            .unwrap();
+        store.disk_stats_of = fake_disk_stats;
+        // The fake disk behaves like fallocate on Linux: pretend creates reserve.
+        store.preallocate_supported = true;
+        store
+    }
+
+    // Mirrors Go's TestAddVolumeRefusesPreallocationThatCrossesFloor: the
+    // reservation must fit above the floor even though the once-a-probe
+    // is_disk_space_low flag is still false.
+    #[test]
+    fn test_add_volume_refuses_preallocation_crossing_floor() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        // 4 MiB above the floor, so an 8 MiB reservation would cross it.
+        let mut store = headroom_store(dir, floor + 4 * MIB, floor);
+
+        let spec = VolumeSpec {
+            preallocate: 8 * MIB,
+            ..VolumeSpec::default()
+        };
+        assert!(
+            store
+                .add_volume(VolumeId(1), DiskType::HardDrive, &spec)
+                .is_err()
+        );
+        assert!(!store.has_volume(VolumeId(1)));
+    }
+
+    // Mirrors Go's TestAddVolumeAllowsPreallocationWhereUnsupported: where
+    // preallocate_file is a no-op the reservation never happens, so it must
+    // not hold the create back.
+    #[test]
+    fn test_add_volume_allows_preallocation_where_unsupported() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let mut store = headroom_store(dir, floor + MIB, floor);
+        store.preallocate_supported = false;
+
+        let spec = VolumeSpec {
+            preallocate: 8 * MIB,
+            ..VolumeSpec::default()
+        };
+        store
+            .add_volume(VolumeId(1), DiskType::HardDrive, &spec)
+            .unwrap();
+    }
+
+    // Mirrors Go's TestAddVolumeAllowsPlainVolumeAboveFloor and
+    // TestAddVolumeAllowsMergeVolumeBelowFloor: a volume reserving nothing is
+    // created either way, so growth is only held back when it would cross
+    // the floor.
+    #[test]
+    fn test_add_volume_allows_plain_volume_anywhere() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let mut store = headroom_store(dir, floor + MIB, floor);
+        store
+            .add_volume(VolumeId(1), DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+
+        FAKE_FREE.store(floor - MIB, Ordering::Relaxed);
+        store
+            .add_volume(VolumeId(2), DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+    }
+
+    // Mirrors Go's TestGrowthLoopStopsAtFloorWhenVolumesPreallocate: the
+    // master keeps asking for volumes while the disk sits just above its
+    // floor; each created volume reserves its full size, so the disk must
+    // not be driven below the floor.
+    #[test]
+    fn test_growth_loop_stops_at_floor_when_volumes_preallocate() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let preallocate = MIB;
+        // Room for 4 preallocated volumes above the floor once each create's
+        // metadata allowance is held back.
+        let create_cost = preallocate + VOLUME_CREATE_VIF_BYTES + VOLUME_CREATE_IDX_BYTES;
+        let mut store = headroom_store(dir, floor + 4 * create_cost, floor);
+
+        let spec = VolumeSpec {
+            preallocate,
+            ..VolumeSpec::default()
+        };
+        let mut created = 0;
+        for i in 1..=20u32 {
+            if store
+                .add_volume(VolumeId(i), DiskType::HardDrive, &spec)
+                .is_ok()
+            {
+                created += 1;
+                FAKE_FREE.fetch_sub(create_cost, Ordering::Relaxed);
+            }
+        }
+
+        assert!(
+            FAKE_FREE.load(Ordering::Relaxed) >= floor,
+            "free space fell below the floor after {created} volumes"
+        );
+        // Exactly the room above the floor must be used. Checking only an
+        // upper bound would also pass when every create fails.
+        assert_eq!(created, 4);
+    }
+
+    // Mirrors Go's TestReserveFreeLocationChargesPickedReservation: a copy's
+    // pick and its .dat reservation are separate steps, so the picked
+    // location's cached free space must carry the charge at once or a second
+    // copy can spend the same headroom.
+    #[test]
+    fn test_reserve_free_location_charges_picked_reservation() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let need = 30 * MIB;
+        // 40 MiB above the floor: room for one 30 MiB reservation, not two.
+        let store = headroom_store(dir, floor + 40 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(40 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+        assert_eq!(
+            store.locations[0].available_space.load(Ordering::Relaxed),
+            10 * MIB
+        );
+        assert_eq!(store.reserve_free_location(need, pred, None), None);
+    }
+
+    // Mirrors Go's TestReserveFreeLocationRechecksLiveDisk: the cached free
+    // space is refreshed only once a minute, so a stale-high value must not
+    // admit a reservation the live disk cannot fit.
+    #[test]
+    fn test_reserve_free_location_rechecks_live_disk() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let store = headroom_store(dir, floor + 5 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(100 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(30 * MIB, pred, None), None);
+    }
+
+    // Mirrors Go's TestReleaseFreeLocationRestoresReservation: a failed copy
+    // must return its reservation, or the headroom stays booked until the
+    // next disk probe and blocks retries.
+    #[test]
+    fn test_release_free_location_restores_reservation() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let need = 30 * MIB;
+        // 40 MiB above the floor: room for one 30 MiB reservation, not two.
+        let store = headroom_store(dir, floor + 40 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(40 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+        store.release_free_location(0, need);
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+    }
+
+    // Mirrors Go's TestReleaseFreeLocationAfterProbeRefundsOnlyOwnCharge: a
+    // probe between reserve and release must not resurrect the charge — the
+    // live reading already forgot the failed copy's pending bytes, so
+    // refunding them would let two copies spend the same headroom.
+    #[test]
+    fn test_release_free_location_after_probe_refunds_only_own_charge() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let need = 30 * MIB;
+        let store = headroom_store(dir, floor + 40 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(40 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+
+        // Mid-copy probe stores live-above-floor minus pending (as
+        // check_disk_space does): the charge survives it.
+        let loc = &store.locations[0];
+        let live_above_floor = loc
+            .min_free_space
+            .available_space(FAKE_FREE.load(Ordering::Relaxed), FAKE_ALL.load(Ordering::Relaxed));
+        loc.available_space.store(
+            live_above_floor.saturating_sub(loc.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            10 * MIB
+        );
+        assert_eq!(store.reserve_free_location(need, pred, None), None);
+
+        // The failed copy removes only its own charge.
+        store.release_free_location(0, need);
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            40 * MIB
+        );
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+        assert_eq!(store.reserve_free_location(need, pred, None), None);
+    }
+
+    // Mirrors Go's TestCommitFreeLocationSettlesLandedReservation: a copy
+    // that lands ends its pending charge without refunding the cache — the
+    // charge and the landed bytes cancel out.
+    #[test]
+    fn test_commit_free_location_settles_landed_reservation() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let need = 30 * MIB;
+        let store = headroom_store(dir, floor + 40 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(40 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+
+        FAKE_FREE.fetch_sub(need, Ordering::Relaxed); // the copied bytes are on disk
+        store.commit_free_location(0, need);
+        let loc = &store.locations[0];
+        assert_eq!(loc.reserved_space.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            10 * MIB
+        );
+
+        // The next probe reads the landed usage and the ended charge agrees.
+        let live_above_floor = loc
+            .min_free_space
+            .available_space(FAKE_FREE.load(Ordering::Relaxed), FAKE_ALL.load(Ordering::Relaxed));
+        loc.available_space.store(
+            live_above_floor.saturating_sub(loc.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            10 * MIB
+        );
+    }
+
+    // Mirrors Go's TestCommitFreeLocationSettlesAsBytesLand: a running copy
+    // settles its charge as its bytes land on disk, so the live-space check
+    // sees the written part once — in the disk reading — not again inside
+    // the pending charge.
+    #[test]
+    fn test_commit_free_location_settles_as_bytes_land() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        let need = 30 * MIB;
+        let store = headroom_store(dir, floor + 70 * MIB, floor);
+        store.locations[0]
+            .available_space
+            .store(70 * MIB, Ordering::Relaxed);
+
+        let pred = |loc: &DiskLocation| loc.disk_type == DiskType::HardDrive;
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+
+        // Half the copy's bytes are on disk now; settling that much charge
+        // keeps the second 30 MiB reservation inside the real headroom.
+        FAKE_FREE.fetch_sub(15 * MIB, Ordering::Relaxed);
+        store.commit_free_location(0, 15 * MIB);
+
+        assert_eq!(store.reserve_free_location(need, pred, None), Some(0));
+        let loc = &store.locations[0];
+        assert_eq!(loc.reserved_space.load(Ordering::Relaxed), 45 * MIB);
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), 10 * MIB);
+    }
+
+    // Mirrors Go's TestMaybeAdjustVolumeMaxIgnoresFreeSpaceInsideFloor: space
+    // inside the floor adds no slots.
+    #[test]
+    fn test_maybe_adjust_volume_max_ignores_free_space_inside_floor() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let floor = 1000 * MIB;
+        // 90 MiB above the floor is 3 x 30 MiB volumes; the rest is headroom.
+        let mut store = headroom_store(dir, floor + 90 * MIB, floor);
+        store.volume_size_limit.store(30 * MIB, Ordering::Relaxed);
+        store.locations[0].original_max_volume_count = 0;
+
+        store.maybe_adjust_volume_max();
+
+        assert_eq!(
+            store.locations[0].max_volume_count.load(Ordering::Relaxed),
+            3
+        );
     }
 
     // Mirrors Go's TestConfigureVolumeUpdatesSuperblock: configure must leave
@@ -2404,7 +2977,9 @@ mod tests {
             cookie: Cookie(0xaa),
             ..Needle::default()
         };
-        let deleted = store.delete_volume_needle(VolumeId(1), &mut del_n).unwrap();
+        let deleted = store
+            .delete_volume_needle(VolumeId(1), &mut del_n, false)
+            .unwrap();
         assert!(deleted.0 > 0);
     }
 
@@ -2513,6 +3088,87 @@ mod tests {
         assert_eq!(store.locations[1].volumes_len(), 1);
     }
 
+    fn add_spread_test_volume(store: &mut Store, vid: u32, collection: &str) {
+        let spec = VolumeSpec {
+            collection,
+            ..VolumeSpec::default()
+        };
+        store
+            .add_volume(VolumeId(vid), DiskType::HardDrive, &spec)
+            .unwrap();
+    }
+
+    fn location_of(store: &Store, vid: u32) -> Option<usize> {
+        store
+            .locations
+            .iter()
+            .position(|loc| loc.find_volume(VolumeId(vid)).is_some())
+    }
+
+    // Mirrors Go's TestAddVolumeSpreadsCollectionOverDisks.
+    #[test]
+    fn test_add_volume_spreads_collection_over_disks() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+
+        add_spread_test_volume(&mut store, 1, "other");
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        let first = location_of(&store, 3);
+        // Leave the disk with the "spread" volume holding fewer volumes overall.
+        let other_on_first = if first == Some(1) { 2 } else { 1 };
+        store
+            .delete_volume(VolumeId(other_on_first), false, false, false)
+            .unwrap();
+
+        add_spread_test_volume(&mut store, 4, "spread");
+        assert_ne!(location_of(&store, 4), first);
+    }
+
+    // Mirrors Go's TestAddVolumeIgnoresFullVolumesOfCollection.
+    #[test]
+    fn test_add_volume_ignores_full_volumes_of_collection() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+        // Every .dat holds at least its superblock, so all volumes are full.
+        store.volume_size_limit.store(1, Ordering::Relaxed);
+
+        add_spread_test_volume(&mut store, 1, "spread");
+        let full_disk = location_of(&store, 1);
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        assert_eq!(location_of(&store, 3), full_disk);
+    }
+
+    // Mirrors Go's TestAddVolumeIgnoresReadOnlyVolumesOfCollection.
+    #[test]
+    fn test_add_volume_ignores_read_only_volumes_of_collection() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+
+        add_spread_test_volume(&mut store, 1, "spread");
+        let writable_disk = location_of(&store, 1);
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        assert_ne!(location_of(&store, 3), writable_disk);
+        store
+            .find_volume(VolumeId(3))
+            .unwrap()
+            .1
+            .set_read_only()
+            .unwrap();
+
+        // The other disk holds more volumes, but its "spread" volume is read-only.
+        add_spread_test_volume(&mut store, 4, "spread");
+        assert_ne!(location_of(&store, 4), writable_disk);
+    }
+
     #[test]
     fn test_store_delete_collection() {
         let tmp = TempDir::new().unwrap();
@@ -2558,6 +3214,7 @@ mod tests {
 
     #[test]
     fn test_maybe_adjust_volume_max_reserves_plain_volumes_while_preallocating() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
 
@@ -2566,7 +3223,7 @@ mod tests {
             .add_location(
                 dir,
                 dir,
-                2,
+                5,
                 DiskType::HardDrive,
                 MinFreeSpace::Percent(1.0),
                 Vec::new(),
@@ -2583,15 +3240,13 @@ mod tests {
             )
             .unwrap();
 
-        // Room for 2.5 volumes: the plain volume claims one, leaving one more slot.
-        let (_, free) = crate::storage::disk_location::get_disk_stats(dir);
-        let volume_size_limit = (free as f64 / 2.5) as u64;
-        if volume_size_limit == 0 {
-            return; // cannot determine free disk space
-        }
-        store
-            .volume_size_limit
-            .store(volume_size_limit, Ordering::Relaxed);
+        // Room for 2.5 volumes above the 1% floor: the plain volume claims one,
+        // leaving one more slot.
+        let limit = 1024 * MIB;
+        FAKE_ALL.store(100 * limit, Ordering::Relaxed);
+        FAKE_FREE.store(limit + limit * 5 / 2, Ordering::Relaxed);
+        store.disk_stats_of = fake_disk_stats;
+        store.volume_size_limit.store(limit, Ordering::Relaxed);
         store.locations[0].original_max_volume_count = 0;
         store.set_preallocate(true);
 
@@ -2882,7 +3537,7 @@ mod tests {
             cookie: Cookie(2),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
 
         let size_before = store.find_volume(vid).unwrap().1.dat_file_size().unwrap();
 
@@ -2902,6 +3557,207 @@ mod tests {
         assert_eq!(v.file_count(), 2);
         assert_eq!(v.deleted_count(), 0);
         assert_eq!(v.dat_file_size().unwrap(), volume_size);
+    }
+
+    /// A volume `vid` holding needle 1, compacted and ready to commit, behind
+    /// the store lock the server's handlers use.
+    fn store_ready_to_commit(
+        dir: &str,
+        vid: VolumeId,
+        kind: NeedleMapKind,
+    ) -> Arc<std::sync::RwLock<Store>> {
+        let mut store = make_test_store(&[dir]);
+        store.needle_map_kind = kind;
+        store
+            .add_volume(vid, DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+        write_test_needle(&mut store, vid, 1, b"live needle");
+        store.compact_volume(vid, 0, 0, |_| true).unwrap();
+        Arc::new(std::sync::RwLock::new(store))
+    }
+
+    /// Commits as the vacuum-commit RPC does: the volume is looked up under
+    /// the store guard, which is dropped before the commit takes its locks.
+    /// The result comes back on a channel, so a deadlock fails a test by
+    /// timing out instead of hanging it.
+    fn commit_like_the_rpc(
+        store: Arc<std::sync::RwLock<Store>>,
+        vid: VolumeId,
+    ) -> std::sync::mpsc::Receiver<Result<(), VolumeError>> {
+        let (committed, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_, vol) = store.read().unwrap().find_volume(vid).unwrap();
+            let _sync_guard = vol.data_file_sync_lock().lock().unwrap();
+            let _lease = vol.instance().write_lock();
+            let _ = committed.send(vol.commit_compact_held());
+        });
+        result
+    }
+
+    /// Holds the next commit of `vid` inside its swap window, where the needle
+    /// map is closed, until the returned sender is used.
+    fn hold_commit_in_swap_window(
+        vid: VolumeId,
+    ) -> (
+        crate::storage::volume::commit_swap_hook::Registration,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, in_window) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let entered = std::sync::Mutex::new(entered);
+        let hook = crate::storage::volume::commit_swap_hook::register(vid, move || {
+            entered.lock().unwrap().send(()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        });
+        (hook, in_window, release)
+    }
+
+    /// Plans and reads needle 1 of `vid` on another thread, and returns once
+    /// the plan holds the volume handle, so a timed check cannot pass on a
+    /// late start.
+    fn plan_in_background(
+        store: &Arc<std::sync::RwLock<Store>>,
+        vid: VolumeId,
+    ) -> std::sync::mpsc::Receiver<Result<Vec<u8>, VolumeError>> {
+        let (_, vol) = store.read().unwrap().find_volume(vid).unwrap();
+        let handles = Arc::strong_count(&vol);
+        let (planned, plan) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        std::thread::spawn(move || {
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            };
+            let read = Store::needle_read_plan(&reader, vid, NeedleId(1), false)
+                .and_then(|mut plan| plan.read_full(&mut n))
+                .map(|()| n.data);
+            let _ = planned.send(read);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&vol) == handles {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the plan never looked up the volume"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        plan
+    }
+
+    /// A GET planned while a vacuum commit has the needle map closed waits for
+    /// the commit, as Go's readNeedle does, instead of answering NotFound for a
+    /// live needle.
+    fn check_read_plan_waits_out_a_commit_swap_window(kind: NeedleMapKind, vid: VolumeId) {
+        let tmp = TempDir::new().unwrap();
+        let store = store_ready_to_commit(tmp.path().to_str().unwrap(), vid, kind);
+        let (_hook, in_window, release) = hold_commit_in_swap_window(vid);
+        let commit = commit_like_the_rpc(store.clone(), vid);
+        in_window
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never reached its swap window");
+
+        let plan = plan_in_background(&store, vid);
+        if let Ok(early) = plan.recv_timeout(std::time::Duration::from_millis(300)) {
+            release.send(()).unwrap();
+            panic!("planned during the swap window instead of waiting: {early:?}");
+        }
+
+        release.send(()).unwrap();
+        commit
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never finished")
+            .unwrap();
+        let after = plan
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the plan still waits after the commit finished");
+        assert_eq!(after.unwrap(), b"live needle");
+    }
+
+    #[test]
+    fn test_read_plan_waits_out_a_commit_swap_window_in_memory() {
+        check_read_plan_waits_out_a_commit_swap_window(NeedleMapKind::InMemory, VolumeId(81));
+    }
+
+    #[test]
+    fn test_read_plan_waits_out_a_commit_swap_window_redb() {
+        check_read_plan_waits_out_a_commit_swap_window(NeedleMapKind::Redb, VolumeId(83));
+    }
+
+    /// A plan on a handle an unmount closed looks the volume up again and
+    /// reads the remounted volume.
+    #[test]
+    fn test_read_plan_retries_a_handle_closed_by_a_remount() {
+        let tmp = TempDir::new().unwrap();
+        let vid = VolumeId(1);
+        let mut store = make_test_store(&[tmp.path().to_str().unwrap()]);
+        store
+            .add_volume(vid, DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+        write_test_needle(&mut store, vid, 1, b"live needle");
+        let (_, stale) = store.find_volume(vid).unwrap();
+        assert!(store.unmount_volume(vid).unwrap());
+        store.mount_volume(vid, "", DiskType::HardDrive).unwrap();
+
+        let mut stale = Some(stale);
+        let mut plan = Store::plan_on_open_handle(
+            || match stale.take() {
+                Some(vol) => Ok(vol),
+                None => store
+                    .find_volume(vid)
+                    .map(|(_, vol)| vol)
+                    .ok_or(VolumeError::NotFound),
+            },
+            NeedleId(1),
+            false,
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(1),
+            ..Needle::default()
+        };
+        plan.read_full(&mut n).unwrap();
+        assert_eq!(n.data, b"live needle");
+    }
+
+    /// A plan waiting for a commit holds no store guard, so a store writer
+    /// finishes while the commit is still in its swap window.
+    #[test]
+    fn test_read_plan_waiting_on_a_commit_does_not_block_a_store_writer() {
+        let tmp = TempDir::new().unwrap();
+        let vid = VolumeId(82);
+        let store =
+            store_ready_to_commit(tmp.path().to_str().unwrap(), vid, NeedleMapKind::InMemory);
+        let (_hook, in_window, release) = hold_commit_in_swap_window(vid);
+        let commit = commit_like_the_rpc(store.clone(), vid);
+        in_window
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never reached its swap window");
+
+        let plan = plan_in_background(&store, vid);
+        let (wrote, written) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        std::thread::spawn(move || {
+            let _guard = writer.write().unwrap();
+            let _ = wrote.send(());
+        });
+        let writer_done = written.recv_timeout(std::time::Duration::from_secs(10));
+        let planned_early = plan.try_recv().is_ok();
+        release.send(()).unwrap();
+        writer_done.expect("a store writer waited on the commit");
+        assert!(!planned_early, "planned during the swap window");
+
+        let committed = commit
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never finished");
+        assert!(committed.is_ok(), "{committed:?}");
+        let after = plan
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the plan still waits after the commit finished");
+        assert_eq!(after.unwrap(), b"live needle");
     }
 
     fn write_test_needle(store: &mut Store, vid: VolumeId, id: u64, data: &[u8]) {
@@ -2957,8 +3813,8 @@ mod tests {
         assert!(store.cleanup_compact_volume(vid).is_err());
         let (_, v) = store.find_volume(vid).unwrap();
         assert!(v.relocate_index_to(other.path().to_str().unwrap()).is_err());
-        // Go parity: a commit that finds the volume compacting is a no-op.
-        store.commit_compact_volume(vid).unwrap();
+        assert!(store.commit_compact_volume(vid).is_err());
+        assert!(store.compact_volume(vid, 0, 0, |_| true).is_err());
 
         let (_, v) = store.find_volume(vid).expect("still mounted");
         assert!(v.is_compacting());
@@ -3005,7 +3861,7 @@ mod tests {
             cookie: Cookie(2),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
         let revision = {
             let (_, v) = store.find_volume(vid).unwrap();
             v.super_block().compaction_revision
@@ -3030,7 +3886,7 @@ mod tests {
             cookie: Cookie(4),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
 
         drop(release_tx);
         copy.join().unwrap().unwrap();
@@ -3103,7 +3959,7 @@ mod tests {
         let base = volume_file_name(&store.locations[2].idx_directory, collection, vid);
         std::fs::write(format!("{}.ecx", base), vec![0u8; 20]).unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(2),
@@ -3313,7 +4169,7 @@ mod tests {
         let base = volume_file_name(&store.locations[2].idx_directory, collection, vid);
         std::fs::write(format!("{}.ecx", base), vec![0u8; 20]).unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(1),
@@ -3327,7 +4183,7 @@ mod tests {
     #[test]
     fn test_find_ec_shard_target_location_falls_through_to_hdd_when_nothing_matches() {
         let (store, _tmp) = make_ec_target_test_store(2);
-        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(3333), 10, &[]);
+        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(3333), 10, "", &[]);
         assert!(got.is_some(), "expected an HDD fallback");
         assert_eq!(store.locations[got.unwrap()].disk_type, DiskType::HardDrive);
     }
@@ -3343,7 +4199,7 @@ mod tests {
             .max_volume_count
             .store(0, Ordering::Relaxed);
 
-        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(4444), 10, &[]);
+        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(4444), 10, "", &[]);
         assert_eq!(
             got,
             Some(0),
@@ -3392,7 +4248,7 @@ mod tests {
             .mount_ec_shards(vid, collection, &[0], "")
             .unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(1),
@@ -3434,21 +4290,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[0]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[0]),
             Some(0),
             "a copy of shard 0 left its owning disk",
         );
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[2]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[2]),
             Some(1),
             "a copy of shard 2 left its owning disk",
         );
         // A shard no disk owns yet is placed by the unchanged waterfall: both
         // disks have it mounted, so the emptier one wins.
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[7]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[7]),
             Some(1),
             "placement of an unclaimed shard changed",
+        );
+    }
+
+    /// A copy that names a disk type skips the other medium even when that
+    /// disk has the EC volume mounted, and refuses rather than split a shard
+    /// another medium already owns.
+    #[test]
+    fn test_find_ec_shard_target_location_required_disk_type() {
+        let (mut store, _tmp) = make_ec_target_test_store(2);
+        store.locations[0].disk_type = DiskType::Ssd;
+        store.locations[1].disk_type = DiskType::from_string("hdd_ht");
+        let collection = "grafana-loki";
+        let vid = VolumeId(5555);
+        let base0 = volume_file_name(&store.locations[0].directory, collection, vid);
+        std::fs::write(format!("{}.ec00", base0), b"x").unwrap();
+        std::fs::write(format!("{}.ec01", base0), b"x").unwrap();
+        std::fs::write(format!("{}.ecx", base0), vec![0u8; 20]).unwrap();
+        store.locations[0]
+            .mount_ec_shards(vid, collection, &[0, 1], "")
+            .unwrap();
+
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[2]),
+            Some(0)
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[2]),
+            Some(1),
+            "a hdd_ht copy landed off the hdd_ht disk",
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[1]),
+            None,
+            "a shard the ssd disk owns must not get a second claim on hdd_ht",
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd", &[2]),
+            None
+        );
+        std::fs::write(format!("{}.ec03", base0), b"x").unwrap();
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[3]),
+            None,
+            "an unmounted shard file on ssd would be mounted ahead of a hdd_ht copy",
         );
     }
 
@@ -3486,13 +4386,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[0]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[0]),
             Some(0),
             "a copy of shard 0 left its owning disk when the disk was full",
         );
         // A shard it does not own still respects the space filter.
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[7]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[7]),
             Some(1),
             "an unclaimed shard should go to the disk with free slots",
         );

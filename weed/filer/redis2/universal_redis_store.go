@@ -2,6 +2,7 @@ package redis2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 
 const (
 	DIR_LIST_MARKER = "\x00"
+
+	// a listing whose callback stops early reads at most one batch more than
+	// it uses, and no single pipeline grows with the listing limit
+	listFetchBatchSize = 128
 )
 
 type UniversalRedis2Store struct {
@@ -42,6 +47,15 @@ func (store *UniversalRedis2Store) getKey(key string) string {
 	}
 	return store.keyPrefix + key
 }
+
+// OverwritesAtOnce: Redis keeps no transaction here, the SET of an insert
+// replaces the stored entry together with its expiry, and the insert lists the
+// name whether or not it was listed before.
+func (store *UniversalRedis2Store) OverwritesAtOnce() bool {
+	return true
+}
+
+var _ filer.OverwritingStore = (*UniversalRedis2Store)(nil)
 
 func (store *UniversalRedis2Store) BeginTransaction(ctx context.Context) (context.Context, error) {
 	return ctx, nil
@@ -96,7 +110,12 @@ func (store *UniversalRedis2Store) UpdateEntry(ctx context.Context, entry *filer
 
 func (store *UniversalRedis2Store) FindEntry(ctx context.Context, fullpath util.FullPath) (entry *filer.Entry, err error) {
 
-	data, err := store.Client.Get(ctx, store.getKey(string(fullpath))).Result()
+	return decodeEntry(fullpath, store.Client.Get(ctx, store.getKey(string(fullpath))))
+}
+
+func decodeEntry(fullpath util.FullPath, get *redis.StringCmd) (entry *filer.Entry, err error) {
+
+	data, err := get.Result()
 	if err == redis.Nil {
 		return nil, filer_pb.ErrNotFound
 	}
@@ -202,9 +221,13 @@ func (store *UniversalRedis2Store) ListDirectoryEntries(ctx context.Context, dir
 
 	// fetch entry meta
 	var entry *filer.Entry
-	for _, fileName := range members {
+	var gets []*redis.StringCmd
+	for i, fileName := range members {
+		if i%listFetchBatchSize == 0 {
+			gets = store.getEntries(ctx, dirPath, members[i:])
+		}
 		path := util.NewFullPath(string(dirPath), fileName)
-		entry, err = store.FindEntry(ctx, path)
+		entry, err = decodeEntry(path, gets[i%listFetchBatchSize])
 		lastFileName = fileName
 		if err != nil {
 			glog.V(0).InfofCtx(ctx, "list %s : %v", path, err)
@@ -233,6 +256,23 @@ func (store *UniversalRedis2Store) ListDirectoryEntries(ctx context.Context, dir
 	}
 
 	return lastFileName, err
+}
+
+// getEntries pipelines the GETs for up to listFetchBatchSize of members. Each
+// command keeps its own error, so a missing value still reads as redis.Nil and
+// fails only that member.
+func (store *UniversalRedis2Store) getEntries(ctx context.Context, dirPath util.FullPath, members []string) []*redis.StringCmd {
+	if len(members) > listFetchBatchSize {
+		members = members[:listFetchBatchSize]
+	}
+	gets := make([]*redis.StringCmd, len(members))
+	store.Client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, fileName := range members {
+			gets[i] = pipe.Get(ctx, store.getKey(string(util.NewFullPath(string(dirPath), fileName))))
+		}
+		return nil
+	})
+	return gets
 }
 
 func (store *UniversalRedis2Store) removeOrphanedDirectoryListMember(ctx context.Context, dirPath util.FullPath, fileName string) {
@@ -269,13 +309,29 @@ func (store *UniversalRedis2Store) removeOrphanedDirectoryListMember(ctx context
 	}
 }
 
-var existsScript = redis.NewScript(`return redis.call('EXISTS', KEYS[1])`)
+const (
+	existsScript     = `return redis.call('EXISTS', KEYS[1])`
+	existsScriptSHA1 = "36470718001cbf79c047c6e440069970b40bb3b4"
+)
+
+// runScript runs a Lua script by its digest with EVALSHA and falls back to EVAL
+// when Redis does not have it cached, as redis.Script.Run does. The digest is a
+// constant pinned by TestScriptDigests rather than computed in Go, so no SHA-1
+// runs here or at package init (GODEBUG=fips140=only panics on SHA-1), and
+// there is no SCRIPT LOAD and no lock.
+func runScript(ctx context.Context, c redis.Scripter, src, sha1Hex string, keys []string, args ...interface{}) *redis.Cmd {
+	r := c.EvalSha(ctx, sha1Hex, keys, args...)
+	if err := r.Err(); errors.Is(err, redis.ErrNoScript) || redis.HasErrorPrefix(err, "NOSCRIPT") {
+		return c.Eval(ctx, src, keys, args...)
+	}
+	return r
+}
 
 // replica-routed clients (useReadOnly, routeByLatency) would run a plain EXISTS on a lagging
 // replica and misread a live value as absent, turning the repair destructive; a script always
 // runs on the key's master
 func (store *UniversalRedis2Store) existsOnMaster(ctx context.Context, key string) (int64, error) {
-	return existsScript.Run(ctx, store.Client, []string{key}).Int64()
+	return runScript(ctx, store.Client, existsScript, existsScriptSHA1, []string{key}).Int64()
 }
 
 func isLogicallyExpired(entry *filer.Entry) bool {
@@ -285,7 +341,7 @@ func isLogicallyExpired(entry *filer.Entry) bool {
 // deletes the value only when it still holds exactly the bytes the expiry decision was made on;
 // single-key, so it runs on all transports where a multi-key script would be CROSSSLOT.
 // -1: already gone, 0: changed under us, 1: deleted
-var deleteIfUnchangedScript = redis.NewScript(`
+const deleteIfUnchangedScript = `
 local v = redis.call('GET', KEYS[1])
 if v == false then
 	return -1
@@ -293,7 +349,9 @@ end
 if v == ARGV[1] then
 	return redis.call('DEL', KEYS[1])
 end
-return 0`)
+return 0`
+
+const deleteIfUnchangedScriptSHA1 = "0d3bc8239b52ed42ffa708b9250dcc75f5d17694"
 
 func (store *UniversalRedis2Store) deleteExpiredEntry(ctx context.Context, dirPath util.FullPath, path util.FullPath, fileName string) {
 	// survive the listing request being canceled mid-delete
@@ -321,7 +379,7 @@ func (store *UniversalRedis2Store) deleteExpiredEntry(ctx context.Context, dirPa
 
 	// 0 means a concurrent recreate changed the value: keep it. -1 means the redis
 	// TTL won after the re-read: the member still needs the not-found repair.
-	deleted, err := deleteIfUnchangedScript.Run(ctx, store.Client, []string{valueKey}, data).Int()
+	deleted, err := runScript(ctx, store.Client, deleteIfUnchangedScript, deleteIfUnchangedScriptSHA1, []string{valueKey}, data).Int()
 	if err != nil || deleted == 0 {
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -230,6 +235,181 @@ func TestReplicatedWriteForwardsFsyncToReplicas(t *testing.T) {
 	}
 }
 
+// newReplicateTestStore builds a single-disk store in dir, draining the notify
+// channels so volume mounts never block on a heartbeat reader.
+func newReplicateTestStore(t *testing.T, dir string) *storage.Store {
+	t.Helper()
+	store := storage.NewStore(nil, "127.0.0.1", 8080, 18080, "http://127.0.0.1:8080", "store-id",
+		[]string{dir}, []int32{100}, []util.MinFreeSpace{{}}, "",
+		storage.NeedleMapInMemory, []types.DiskType{types.HardDriveType}, nil, 3,
+		stats.DefaultDiskIOProbeConfig())
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-store.NewVolumesChan:
+			case <-store.DeletedVolumesChan:
+			case <-store.NewEcShardsChan:
+			case <-store.DeletedEcShardsChan:
+			case <-store.StateUpdateChan:
+			case <-done:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(done)
+		store.Close()
+	})
+	return store
+}
+
+// TestReplicatedWriteOverlapsLocalAndReplicaWrites runs the write path with a
+// real local volume and a replica that stalls mid-request: the fan-out starts
+// while the local write is still free to run, the local write lands before the
+// replica unblocks, and the acknowledged write waits for both legs.
+func TestReplicatedWriteOverlapsLocalAndReplicaWrites(t *testing.T) {
+	replicaStarted := make(chan url.Values, 1)
+	releaseReplica := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseReplica) }) }
+	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replicaStarted <- r.URL.Query()
+		<-releaseReplica
+		w.WriteHeader(http.StatusCreated)
+		if _, err := w.Write([]byte(`{"size":21}`)); err != nil {
+			t.Errorf("replica write response: %v", err)
+		}
+	}))
+	defer replica.Close()
+	defer release()
+	replicaHost := strings.TrimPrefix(replica.URL, "http://")
+
+	masterFn, dialOption := startMockMasterServer(t, &mockMasterServer{
+		locations: []*master_pb.Location{{Url: "127.0.0.1:8080"}, {Url: replicaHost}},
+	})
+
+	store := newReplicateTestStore(t, t.TempDir())
+	volumeId := needle.VolumeId(7)
+	operation.InvalidateVolumeIdLocationCache(volumeId.String())
+	if err := store.AddVolume(volumeId, "", storage.NeedleMapInMemory, "001", "15d", 0, needle.GetCurrentVersion(), 0, types.HardDriveType, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("overlapped write data")
+	n := &needle.Needle{
+		Id:       1,
+		Data:     data,
+		Checksum: needle.NewCRC(data),
+		Ttl:      needle.EMPTY_TTL,
+	}
+	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/7,01637037d6", nil)
+	if err := r.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReplicatedWrite(context.Background(), masterFn, dialOption, store, volumeId, n, r, "")
+		done <- err
+	}()
+
+	var q url.Values
+	select {
+	case q = <-replicaStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replica never received the fan-out request")
+	}
+	if got := q.Get("type"); got != "replicate" {
+		t.Errorf("replica type = %q, want replicate", got)
+	}
+	if got := q.Get("ttl"); got != "15d" {
+		t.Errorf("replica ttl = %q, want the inherited volume ttl 15d", got)
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("write returned before the replica responded: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		readBack := &needle.Needle{Id: n.Id}
+		if _, err := store.ReadVolumeNeedle(volumeId, readBack, nil, nil); err == nil && string(readBack.Data) == string(data) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("local write did not land while the replica was still blocked")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("ReplicatedWrite: %v", err)
+	}
+}
+
+// TestReplicatedWriteFailsWhenEitherLegFails checks that a failed local write
+// or a failed replica fan-out fails the whole request even when the other leg
+// succeeded.
+func TestReplicatedWriteFailsWhenEitherLegFails(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		volumeId      needle.VolumeId
+		readonlyLocal bool
+		replicaStatus int
+	}{
+		{name: "local write fails", volumeId: 8, readonlyLocal: true, replicaStatus: http.StatusCreated},
+		{name: "replica write fails", volumeId: 9, replicaStatus: http.StatusInternalServerError},
+		{name: "replica read only", volumeId: 10, replicaStatus: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.replicaStatus)
+			}))
+			defer replica.Close()
+			replicaHost := strings.TrimPrefix(replica.URL, "http://")
+
+			masterFn, dialOption := startMockMasterServer(t, &mockMasterServer{
+				locations: []*master_pb.Location{{Url: "127.0.0.1:8080"}, {Url: replicaHost}},
+			})
+
+			store := newReplicateTestStore(t, t.TempDir())
+			operation.InvalidateVolumeIdLocationCache(tc.volumeId.String())
+			if err := store.AddVolume(tc.volumeId, "", storage.NeedleMapInMemory, "001", "", 0, needle.GetCurrentVersion(), 0, types.HardDriveType, 0); err != nil {
+				t.Fatal(err)
+			}
+			if tc.readonlyLocal {
+				if err := store.MarkVolumeReadonly(tc.volumeId, false, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			data := []byte("write data")
+			n := &needle.Needle{
+				Id:       1,
+				Data:     data,
+				Checksum: needle.NewCRC(data),
+				Ttl:      needle.EMPTY_TTL,
+			}
+			r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:8080/%d,01637037d6", tc.volumeId), nil)
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := ReplicatedWrite(context.Background(), masterFn, dialOption, store, tc.volumeId, n, r, "")
+			if err == nil {
+				t.Fatal("ReplicatedWrite succeeded despite a failed leg")
+			}
+			if errors.Is(err, ErrorWriteRefused) {
+				t.Fatalf("replicated write incorrectly proves no append: %v", err)
+			}
+		})
+	}
+}
+
 // TestReplicatedWriteRejectsWriteWithNoTarget verifies that a write this server
 // cannot store and has no replica to forward to fails instead of being
 // acknowledged with nothing written.
@@ -270,5 +450,120 @@ func TestReplicatedWriteRejectsWriteWithNoTarget(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// TestReplicatedWriteFailsAtTheBoundWhenAReplicaNeverAnswers: a replica that
+// takes the forward and never answers fails the write at the forward bound,
+// not at the transport's 30 s response header timeout.
+func TestReplicatedWriteFailsAtTheBoundWhenAReplicaNeverAnswers(t *testing.T) {
+	received := make(chan struct{}, 1)
+	release := make(chan struct{})
+	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- struct{}{}
+		<-release
+	}))
+	defer replica.Close()
+	defer close(release)
+
+	defer func(d time.Duration) { replicaRequestTimeout = d }(replicaRequestTimeout)
+	replicaRequestTimeout = 300 * time.Millisecond
+
+	masterFn, dialOption := startMockMasterServer(t, &mockMasterServer{
+		locations: []*master_pb.Location{{Url: strings.TrimPrefix(replica.URL, "http://")}},
+	})
+	volumeId := needle.VolumeId(1)
+	operation.InvalidateVolumeIdLocationCache(volumeId.String())
+	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/1,01637037d6", nil)
+	if err := r.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+	n := &needle.Needle{Id: 1, Data: []byte("test data"), Ttl: needle.EMPTY_TTL}
+
+	timeouts := stats.VolumeServerReplicationFailures.WithLabelValues(stats.ReplicationOpWrite, stats.FailureTimeout)
+	timeoutsBefore := testutil.ToFloat64(timeouts)
+	start := time.Now()
+	_, err := ReplicatedWrite(context.Background(), masterFn, dialOption, &storage.Store{}, volumeId, n, r, "")
+	elapsed := time.Since(start)
+	select {
+	case <-received:
+	default:
+		t.Fatal("the replica never received the forward")
+	}
+	if err == nil {
+		t.Fatal("a replica that never answers cannot ack the write")
+	}
+	if elapsed < replicaRequestTimeout || elapsed > 5*time.Second {
+		t.Fatalf("write failed after %v, want about the %v forward bound: %v", elapsed, replicaRequestTimeout, err)
+	}
+	if got := testutil.ToFloat64(timeouts) - timeoutsBefore; got != 1 {
+		t.Fatalf("replication timeout failures went up by %v, want 1: %v", got, err)
+	}
+}
+
+// TestReplicatedWriteGivesALargerBodyMoreTime: a replica that answers after
+// the bodiless bound, but within the bound for its body, still acks the write.
+func TestReplicatedWriteGivesALargerBodyMoreTime(t *testing.T) {
+	defer func(d time.Duration) { replicaRequestTimeout = d }(replicaRequestTimeout)
+	replicaRequestTimeout = 300 * time.Millisecond
+	data := make([]byte, replicaMinBytesPerSec)
+	answerAfter := (replicaRequestTimeout + replicaRequestBound(len(data))) / 2
+
+	received := make(chan int, 1)
+	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mr, err := r.MultipartReader()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		part, err := mr.NextPart()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body, _ := io.ReadAll(part)
+		received <- len(body)
+		time.Sleep(answerAfter)
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, "{}")
+	}))
+	defer replica.Close()
+
+	masterFn, dialOption := startMockMasterServer(t, &mockMasterServer{
+		locations: []*master_pb.Location{{Url: strings.TrimPrefix(replica.URL, "http://")}},
+	})
+	volumeId := needle.VolumeId(1)
+	operation.InvalidateVolumeIdLocationCache(volumeId.String())
+	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/1,01637037d6", nil)
+	if err := r.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+	n := &needle.Needle{Id: 1, Data: data, Ttl: needle.EMPTY_TTL}
+
+	if _, err := ReplicatedWrite(context.Background(), masterFn, dialOption, &storage.Store{}, volumeId, n, r, ""); err != nil {
+		t.Fatalf("a replica answering within the %v bound for a %d-byte body failed the write: %v", replicaRequestBound(len(data)), len(data), err)
+	}
+	select {
+	case got := <-received:
+		if got != len(data) {
+			t.Fatalf("the replica received %d bytes, want %d", got, len(data))
+		}
+	default:
+		t.Fatal("the replica never received the forward")
+	}
+}
+
+func TestReplicaRequestBoundGrowsWithTheBody(t *testing.T) {
+	for _, tc := range []struct {
+		size int
+		want time.Duration
+	}{
+		{0, replicaRequestTimeout},
+		{replicaMinBytesPerSec / 2, replicaRequestTimeout + 500*time.Millisecond},
+		{256 * replicaMinBytesPerSec, replicaRequestTimeout + 256*time.Second},
+	} {
+		if got := replicaRequestBound(tc.size); got != tc.want {
+			t.Errorf("replicaRequestBound(%d) = %v, want %v", tc.size, got, tc.want)
+		}
 	}
 }

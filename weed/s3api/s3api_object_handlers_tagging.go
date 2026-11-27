@@ -75,10 +75,7 @@ func (s3a *S3ApiServer) GetObjectTaggingHandler(w http.ResponseWriter, r *http.R
 		}
 	} else {
 		// Handle regular (non-versioned) object tagging retrieval
-		target := util.FullPath(fmt.Sprintf("%s/%s", s3a.bucketDir(bucket), object))
-		dir, name := target.DirAndName()
-
-		entry, err = s3a.getEntry(dir, name)
+		entry, err = s3a.getObjectEntryRoutedByKey(bucket, object)
 		if err != nil {
 			if err == filer_pb.ErrNotFound {
 				glog.Errorf("GetObjectTaggingHandler %s: %v", r.URL, err)
@@ -110,6 +107,9 @@ func (s3a *S3ApiServer) GetObjectTaggingHandler(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	if versioningConfigured {
+		setTaggingVersionIdHeader(w, versionId, entry)
+	}
 	writeSuccessResponseXML(w, r, FromTags(tags))
 
 }
@@ -139,6 +139,12 @@ func (s3a *S3ApiServer) PutObjectTaggingHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 	tags := tagging.ToTags()
+	// A key may appear only once in a tag set; the map keeps one of them.
+	if len(tags) != len(tagging.TagSet.Tag) {
+		glog.Errorf("PutObjectTaggingHandler duplicate tag keys %s", r.URL)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidTag)
+		return
+	}
 	err = ValidateTags(tags)
 	if err != nil {
 		glog.Errorf("PutObjectTaggingHandler ValidateTags error %s: %v", r.URL, err)
@@ -206,7 +212,7 @@ func (s3a *S3ApiServer) PutObjectTaggingHandler(w http.ResponseWriter, r *http.R
 			return
 		}
 
-		if err = s3a.setTags(dir, name, tags); err != nil {
+		if err = s3a.setTags(s3a.routableWriteOwner(bucket, object), dir, name, tags); err != nil {
 			if err == filer_pb.ErrNotFound {
 				glog.Errorf("PutObjectTaggingHandler setTags %s: %v", r.URL, err)
 				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
@@ -250,8 +256,8 @@ func (s3a *S3ApiServer) PutObjectTaggingHandler(w http.ResponseWriter, r *http.R
 		entry.Extended[S3TAG_PREFIX+k] = []byte(v)
 	}
 
-	// Update the entry with tags
-	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	// Update the entry with tags, on the owner the read resolved it from
+	err = s3a.withWriteOwnerFilerClient(s3a.routableWriteOwner(bucket, object), func(client filer_pb.SeaweedFilerClient) error {
 		request := &filer_pb.UpdateEntryRequest{
 			Directory: updateDirectory,
 			Entry:     entry,
@@ -270,6 +276,7 @@ func (s3a *S3ApiServer) PutObjectTaggingHandler(w http.ResponseWriter, r *http.R
 	}
 
 	glog.V(3).Infof("PutObjectTaggingHandler: Successfully updated tags for %s/%s", bucket, object)
+	setTaggingVersionIdHeader(w, versionId, entry)
 	w.WriteHeader(http.StatusOK)
 	s3err.PostLog(r, http.StatusOK, s3err.ErrNone)
 }
@@ -346,7 +353,7 @@ func (s3a *S3ApiServer) DeleteObjectTaggingHandler(w http.ResponseWriter, r *htt
 			return
 		}
 
-		err := s3a.rmTags(dir, name)
+		err := s3a.rmTags(s3a.routableWriteOwner(bucket, object), dir, name)
 		if err != nil {
 			if err == filer_pb.ErrNotFound {
 				glog.Errorf("DeleteObjectTaggingHandler %s: %v", r.URL, err)
@@ -388,13 +395,14 @@ func (s3a *S3ApiServer) DeleteObjectTaggingHandler(w http.ResponseWriter, r *htt
 
 	if !hasDeletion {
 		// No tags to delete - success
+		setTaggingVersionIdHeader(w, versionId, entry)
 		w.WriteHeader(http.StatusNoContent)
 		s3err.PostLog(r, http.StatusNoContent, s3err.ErrNone)
 		return
 	}
 
-	// Update the entry
-	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	// Update the entry on the owner the read resolved it from
+	err = s3a.withWriteOwnerFilerClient(s3a.routableWriteOwner(bucket, object), func(client filer_pb.SeaweedFilerClient) error {
 		request := &filer_pb.UpdateEntryRequest{
 			Directory: updateDirectory,
 			Entry:     entry,
@@ -413,6 +421,17 @@ func (s3a *S3ApiServer) DeleteObjectTaggingHandler(w http.ResponseWriter, r *htt
 	}
 
 	glog.V(3).Infof("DeleteObjectTaggingHandler: Successfully deleted tags for %s/%s", bucket, object)
+	setTaggingVersionIdHeader(w, versionId, entry)
 	w.WriteHeader(http.StatusNoContent)
 	s3err.PostLog(r, http.StatusNoContent, s3err.ErrNone)
+}
+
+// setTaggingVersionIdHeader reports the version the tagging request acted on,
+// "null" for an object written before versioning was enabled.
+func setTaggingVersionIdHeader(w http.ResponseWriter, versionId string, entry *filer_pb.Entry) {
+	versionId = resolvedSourceVersionId(versionId, entry)
+	if versionId == "" {
+		versionId = "null"
+	}
+	w.Header().Set("x-amz-version-id", versionId)
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 )
@@ -32,14 +33,30 @@ const (
 	// contend on the same attribute.
 	ExtendedKeyMaintenanceStatus = s3_constants.ExtS3TablesPrefix + "maintenanceStatus"
 	ExtendedKeyEntryType         = s3_constants.ExtS3TablesPrefix + "entryType"
+	// ExtendedKeyDeleting marks a catalog record claimed by an in-flight
+	// create, delete or rename, so the claim survives until the operation
+	// finishes or releases it. A table carries "create", "delete" or "rename";
+	// a namespace being deleted carries the random claim token written by
+	// claimForDelete.
+	ExtendedKeyDeleting = s3_constants.ExtS3TablesPrefix + "deleting"
+	// ExtendedKeyMoving holds the metadata an update moving a record's root is
+	// about to write, so the record holds both roots until the move lands.
+	ExtendedKeyMoving = s3_constants.ExtS3TablesPrefix + "moving"
+
+	// ExtendedKeyVectorPolicy is written by the S3 Vectors service on table
+	// buckets. It lives here rather than in the vectors package so the catalog
+	// can assert it in its update preconditions: a whole-entry write that does
+	// not know the key could silently erase a concurrently saved vector policy.
+	ExtendedKeyVectorPolicy = "s3vectors-policy"
 
 	// Entry-type marker values for ExtendedKeyEntryType. Absent or "table" means
 	// a table; views are stored like tables but tagged "view".
 	EntryTypeTable = "table"
 	EntryTypeView  = "view"
 
-	// Maximum request body size (10MB)
-	maxRequestBodySize = 10 * 1024 * 1024
+	// MaxRequestBodySize is the largest request body the handler reads (10MB).
+	// In-process callers that send a table's full metadata check against it.
+	MaxRequestBodySize = 10 * 1024 * 1024
 )
 
 var (
@@ -63,6 +80,8 @@ type S3TablesHandler struct {
 	trusted         bool // Trusted local tooling (shell/admin) bypasses authorization
 	iamAuthorizer   IAMAuthorizer
 	localAccountIDs func(string) bool
+	oidcIssuers     func(context.Context) []string
+	canEncrypt      func() bool
 }
 
 // NewS3TablesHandler creates a new S3 Tables handler
@@ -106,6 +125,19 @@ func (h *S3TablesHandler) SetLocalAccountChecker(fn func(string) bool) {
 	h.localAccountIDs = fn
 }
 
+// SetTrustedIssuerSource injects the configured OIDC issuer set. A federated
+// STS session carries no asserted issuers, so its legacy owner checks read it.
+func (h *S3TablesHandler) SetTrustedIssuerSource(fn func(context.Context) []string) {
+	h.oidcIssuers = fn
+}
+
+// SetEncryptionChecker injects the predicate that tells whether the gateway
+// holds an SSE-S3 key, so a bucket whose declared AES256 the write path
+// applies is not created where every write would then fail.
+func (h *S3TablesHandler) SetEncryptionChecker(fn func() bool) {
+	h.canEncrypt = fn
+}
+
 // FilerClient interface for filer operations
 type FilerClient interface {
 	WithFilerClient(streamingMode bool, fn func(client filer_pb.SeaweedFilerClient) error) error
@@ -130,6 +162,10 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 	// the status the handler answers decides how its error is logged (logRequestError)
 	sw := &statusRecorder{ResponseWriter: w}
 	w = sw
+	fence := h.fenceVectorNamespace(w, r, filerClient, operation)
+	if fence != nil {
+		w, filerClient = fence, fence
+	}
 
 	var err error
 	switch operation {
@@ -226,6 +262,9 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if fence != nil {
+		fence.settle()
+	}
 	if err != nil {
 		logRequestError(operation, sw.status, err)
 	}
@@ -359,9 +398,26 @@ func claimString(claims map[string]interface{}, key string) string {
 	return str
 }
 
-// trustedIssuers returns the OIDC issuers the auth layer asserted into the
-// identity's claims; they re-anchor legacy owner checks in checkPermission.
+// trustedIssuers returns the OIDC issuers that re-anchor legacy owner checks in
+// checkPermission: those the auth layer asserted into a bearer token's claims,
+// else, for a federated STS session, the configured set.
 func (h *S3TablesHandler) trustedIssuers(r *http.Request) []string {
+	claims := requestClaims(r)
+	if _, asserted := claims["seaweed:oidc-issuers"]; asserted {
+		return strings.Fields(claimString(claims, "seaweed:oidc-issuers"))
+	}
+	if h.oidcIssuers != nil && sts.IsParentUserID(claimString(claims, "aws:userid")) {
+		return h.oidcIssuers(r.Context())
+	}
+	return nil
+}
+
+// callerSubject returns the OIDC subject in the request identity's claims.
+func callerSubject(r *http.Request) string {
+	return claimString(requestClaims(r), "sub")
+}
+
+func requestClaims(r *http.Request) map[string]interface{} {
 	identityRaw := s3_constants.GetIdentityFromContext(r)
 	if identityRaw == nil {
 		return nil
@@ -373,7 +429,7 @@ func (h *S3TablesHandler) trustedIssuers(r *http.Request) []string {
 	if val.Kind() != reflect.Struct {
 		return nil
 	}
-	return strings.Fields(claimString(identityClaimsMap(val), "seaweed:oidc-issuers"))
+	return identityClaimsMap(val)
 }
 
 // normalizePrincipalID collapses ARN and identity strings to a key that is stable within a single account.
@@ -434,15 +490,15 @@ func (h *S3TablesHandler) readRequestBody(r *http.Request, v interface{}) error 
 	defer r.Body.Close()
 
 	// Limit request body size to prevent unbounded reads
-	limitedReader := io.LimitReader(r.Body, maxRequestBodySize+1)
+	limitedReader := io.LimitReader(r.Body, MaxRequestBodySize+1)
 	body, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
 
 	// Check if body exceeds size limit
-	if len(body) > maxRequestBodySize {
-		return fmt.Errorf("request body too large: exceeds maximum size of %d bytes", maxRequestBodySize)
+	if len(body) > MaxRequestBodySize {
+		return fmt.Errorf("request body too large: exceeds maximum size of %d bytes", MaxRequestBodySize)
 	}
 
 	if len(body) == 0 {
@@ -549,6 +605,7 @@ func (h *S3TablesHandler) authorizeAbsentTarget(r *http.Request, filerClient Fil
 	}
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespace,

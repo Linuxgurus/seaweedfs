@@ -389,6 +389,11 @@ func (m *Entry) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x3a
 	}
+	if m.CommitTsNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.CommitTsNs))
+		i--
+		dAtA[i] = 0x30
+	}
 	if len(m.Extended) > 0 {
 		for k := range m.Extended {
 			v := m.Extended[k]
@@ -1014,6 +1019,16 @@ func (m *CreateEntryRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.Fsync {
+		i--
+		if m.Fsync {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x48
+	}
 	if m.IsMoved {
 		i--
 		if m.IsMoved {
@@ -1289,6 +1304,25 @@ func (m *ObjectMutation) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.ConditionKey) > 0 {
+		i -= len(m.ConditionKey)
+		copy(dAtA[i:], m.ConditionKey)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.ConditionKey)))
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0x82
+	}
+	if m.Condition != nil {
+		size, err := m.Condition.MarshalToSizedBufferVT(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		i--
+		dAtA[i] = 0x7a
+	}
 	if m.KeepRemoteObject {
 		i--
 		if m.KeepRemoteObject {
@@ -1456,6 +1490,13 @@ func (m *Recompute) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.OnlyIfCurrentName) > 0 {
+		i -= len(m.OnlyIfCurrentName)
+		copy(dAtA[i:], m.OnlyIfCurrentName)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.OnlyIfCurrentName)))
+		i--
+		dAtA[i] = 0x52
+	}
 	if len(m.ExcludeName) > 0 {
 		i -= len(m.ExcludeName)
 		copy(dAtA[i:], m.ExcludeName)
@@ -1566,6 +1607,16 @@ func (m *ObjectTransactionRequest) MarshalToSizedBufferVT(dAtA []byte) (int, err
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.ConditionPreferAlt {
+		i--
+		if m.ConditionPreferAlt {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x58
 	}
 	if len(m.ConditionAltKey) > 0 {
 		i -= len(m.ConditionAltKey)
@@ -1697,6 +1748,11 @@ func (m *ObjectTransactionResponse) MarshalToSizedBufferVT(dAtA []byte) (int, er
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.FailedMutation != nil {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(*m.FailedMutation))
+		i--
+		dAtA[i] = 0x18
 	}
 	if m.ErrorCode != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.ErrorCode))
@@ -2486,6 +2542,40 @@ func (m *DeleteEntryRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.IsMoved {
+		i--
+		if m.IsMoved {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x68
+	}
+	if len(m.ExpectedExtended) > 0 {
+		for k := range m.ExpectedExtended {
+			v := m.ExpectedExtended[k]
+			baseI := i
+			i -= len(v)
+			copy(dAtA[i:], v)
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(len(v)))
+			i--
+			dAtA[i] = 0x12
+			i -= len(k)
+			copy(dAtA[i:], k)
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(len(k)))
+			i--
+			dAtA[i] = 0xa
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(baseI-i))
+			i--
+			dAtA[i] = 0x62
+		}
+	}
+	if m.IfNotModifiedAfterNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.IfNotModifiedAfterNs))
+		i--
+		dAtA[i] = 0x58
+	}
 	if m.KeepRemoteObject {
 		i--
 		if m.KeepRemoteObject {
@@ -2658,6 +2748,16 @@ func (m *AtomicRenameEntryRequest) MarshalToSizedBufferVT(dAtA []byte) (int, err
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.FailIfTargetExists {
+		i--
+		if m.FailIfTargetExists {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x30
 	}
 	if len(m.Signatures) > 0 {
 		var pksize2 int
@@ -4033,6 +4133,11 @@ func (m *SubscribeMetadataResponse) MarshalToSizedBufferVT(dAtA []byte) (int, er
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.MutationTsNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.MutationTsNs))
+		i--
+		dAtA[i] = 0x38
+	}
 	if m.FlushedTsNs != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.FlushedTsNs))
 		i--
@@ -4984,9 +5089,9 @@ func (m *FilerConf_PathConf) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x38
 	}
-	if m.Fsync {
+	if m.Fsync != nil {
 		i--
-		if m.Fsync {
+		if *m.Fsync {
 			dAtA[i] = 1
 		} else {
 			dAtA[i] = 0
@@ -5111,6 +5216,11 @@ func (m *CacheRemoteObjectToLocalClusterRequest) MarshalToSizedBufferVT(dAtA []b
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.MaxSize != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.MaxSize))
+		i--
+		dAtA[i] = 0x28
 	}
 	if m.DownloadConcurrency != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.DownloadConcurrency))
@@ -5561,6 +5671,13 @@ func (m *Lock) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.PrevRenewToken) > 0 {
+		i -= len(m.PrevRenewToken)
+		copy(dAtA[i:], m.PrevRenewToken)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.PrevRenewToken)))
+		i--
+		dAtA[i] = 0x42
+	}
 	if m.Seq != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.Seq))
 		i--
@@ -5717,6 +5834,13 @@ func (m *ReplicateLockRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) 
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if len(m.PrevRenewToken) > 0 {
+		i -= len(m.PrevRenewToken)
+		copy(dAtA[i:], m.PrevRenewToken)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.PrevRenewToken)))
+		i--
+		dAtA[i] = 0x42
 	}
 	if m.Seq != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.Seq))
@@ -6692,6 +6816,9 @@ func (m *Entry) SizeVT() (n int) {
 			n += mapEntrySize + 1 + protohelpers.SizeOfVarint(uint64(mapEntrySize))
 		}
 	}
+	if m.CommitTsNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.CommitTsNs))
+	}
 	l = len(m.HardLinkId)
 	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
@@ -6975,6 +7102,9 @@ func (m *CreateEntryRequest) SizeVT() (n int) {
 	if m.IsMoved {
 		n += 2
 	}
+	if m.Fsync {
+		n += 2
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -7108,6 +7238,14 @@ func (m *ObjectMutation) SizeVT() (n int) {
 	if m.KeepRemoteObject {
 		n += 2
 	}
+	if m.Condition != nil {
+		l = m.Condition.SizeVT()
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	l = len(m.ConditionKey)
+	if l > 0 {
+		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -7154,6 +7292,10 @@ func (m *Recompute) SizeVT() (n int) {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	l = len(m.ExcludeName)
+	if l > 0 {
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	l = len(m.OnlyIfCurrentName)
 	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
@@ -7210,6 +7352,9 @@ func (m *ObjectTransactionRequest) SizeVT() (n int) {
 	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
+	if m.ConditionPreferAlt {
+		n += 2
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -7226,6 +7371,9 @@ func (m *ObjectTransactionResponse) SizeVT() (n int) {
 	}
 	if m.ErrorCode != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.ErrorCode))
+	}
+	if m.FailedMutation != nil {
+		n += 1 + protohelpers.SizeOfVarint(uint64(*m.FailedMutation))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -7548,6 +7696,21 @@ func (m *DeleteEntryRequest) SizeVT() (n int) {
 	if m.KeepRemoteObject {
 		n += 2
 	}
+	if m.IfNotModifiedAfterNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.IfNotModifiedAfterNs))
+	}
+	if len(m.ExpectedExtended) > 0 {
+		for k, v := range m.ExpectedExtended {
+			_ = k
+			_ = v
+			l = 1 + len(v) + protohelpers.SizeOfVarint(uint64(len(v)))
+			mapEntrySize := 1 + len(k) + protohelpers.SizeOfVarint(uint64(len(k))) + l
+			n += mapEntrySize + 1 + protohelpers.SizeOfVarint(uint64(mapEntrySize))
+		}
+	}
+	if m.IsMoved {
+		n += 2
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -7598,6 +7761,9 @@ func (m *AtomicRenameEntryRequest) SizeVT() (n int) {
 			l += protohelpers.SizeOfVarint(uint64(e))
 		}
 		n += 1 + protohelpers.SizeOfVarint(uint64(l)) + l
+	}
+	if m.FailIfTargetExists {
+		n += 2
 	}
 	n += len(m.unknownFields)
 	return n
@@ -8162,6 +8328,9 @@ func (m *SubscribeMetadataResponse) SizeVT() (n int) {
 	if m.FlushedTsNs != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.FlushedTsNs))
 	}
+	if m.MutationTsNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.MutationTsNs))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -8501,7 +8670,7 @@ func (m *FilerConf_PathConf) SizeVT() (n int) {
 	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
-	if m.Fsync {
+	if m.Fsync != nil {
 		n += 2
 	}
 	if m.VolumeGrowthCount != 0 {
@@ -8579,6 +8748,9 @@ func (m *CacheRemoteObjectToLocalClusterRequest) SizeVT() (n int) {
 	}
 	if m.DownloadConcurrency != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.DownloadConcurrency))
+	}
+	if m.MaxSize != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.MaxSize))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -8765,6 +8937,10 @@ func (m *Lock) SizeVT() (n int) {
 	if m.Seq != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.Seq))
 	}
+	l = len(m.PrevRenewToken)
+	if l > 0 {
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -8824,6 +9000,10 @@ func (m *ReplicateLockRequest) SizeVT() (n int) {
 	}
 	if m.Seq != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.Seq))
+	}
+	l = len(m.PrevRenewToken)
+	if l > 0 {
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -10217,6 +10397,25 @@ func (m *Entry) UnmarshalVT(dAtA []byte) error {
 			}
 			m.Extended[mapkey] = mapvalue
 			iNdEx = postIndex
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CommitTsNs", wireType)
+			}
+			m.CommitTsNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.CommitTsNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		case 7:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field HardLinkId", wireType)
@@ -12164,6 +12363,26 @@ func (m *CreateEntryRequest) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.IsMoved = bool(v != 0)
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Fsync", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Fsync = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -13106,6 +13325,74 @@ func (m *ObjectMutation) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.KeepRemoteObject = bool(v != 0)
+		case 15:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Condition", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Condition == nil {
+				m.Condition = &WriteCondition{}
+			}
+			if err := m.Condition.UnmarshalVT(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 16:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ConditionKey", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.ConditionKey = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -13530,6 +13817,38 @@ func (m *Recompute) UnmarshalVT(dAtA []byte) error {
 			}
 			m.ExcludeName = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OnlyIfCurrentName", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.OnlyIfCurrentName = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -13927,6 +14246,26 @@ func (m *ObjectTransactionRequest) UnmarshalVT(dAtA []byte) error {
 			}
 			m.ConditionAltKey = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ConditionPreferAlt", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ConditionPreferAlt = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -14029,6 +14368,26 @@ func (m *ObjectTransactionResponse) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FailedMutation", wireType)
+			}
+			var v int32
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.FailedMutation = &v
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -16157,6 +16516,173 @@ func (m *DeleteEntryRequest) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.KeepRemoteObject = bool(v != 0)
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IfNotModifiedAfterNs", wireType)
+			}
+			m.IfNotModifiedAfterNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.IfNotModifiedAfterNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 12:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ExpectedExtended", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ExpectedExtended == nil {
+				m.ExpectedExtended = make(map[string][]byte)
+			}
+			var mapkey string
+			var mapvalue []byte
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return protohelpers.ErrIntOverflow
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					var stringLenmapkey uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return protohelpers.ErrIntOverflow
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapkey |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapkey := int(stringLenmapkey)
+					if intStringLenmapkey < 0 {
+						return protohelpers.ErrInvalidLength
+					}
+					postStringIndexmapkey := iNdEx + intStringLenmapkey
+					if postStringIndexmapkey < 0 {
+						return protohelpers.ErrInvalidLength
+					}
+					if postStringIndexmapkey > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
+					iNdEx = postStringIndexmapkey
+				} else if fieldNum == 2 {
+					var mapbyteLen uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return protohelpers.ErrIntOverflow
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapbyteLen |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intMapbyteLen := int(mapbyteLen)
+					if intMapbyteLen < 0 {
+						return protohelpers.ErrInvalidLength
+					}
+					postbytesIndex := iNdEx + intMapbyteLen
+					if postbytesIndex < 0 {
+						return protohelpers.ErrInvalidLength
+					}
+					if postbytesIndex > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapvalue = make([]byte, mapbyteLen)
+					copy(mapvalue, dAtA[iNdEx:postbytesIndex])
+					iNdEx = postbytesIndex
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := protohelpers.Skip(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return protohelpers.ErrInvalidLength
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.ExpectedExtended[mapkey] = mapvalue
+			iNdEx = postIndex
+		case 13:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IsMoved", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.IsMoved = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -16531,6 +17057,26 @@ func (m *AtomicRenameEntryRequest) UnmarshalVT(dAtA []byte) error {
 			} else {
 				return fmt.Errorf("proto: wrong wireType = %d for field Signatures", wireType)
 			}
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FailIfTargetExists", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.FailIfTargetExists = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -20153,6 +20699,25 @@ func (m *SubscribeMetadataResponse) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MutationTsNs", wireType)
+			}
+			m.MutationTsNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.MutationTsNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -22263,7 +22828,8 @@ func (m *FilerConf_PathConf) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
-			m.Fsync = bool(v != 0)
+			b := bool(v != 0)
+			m.Fsync = &b
 		case 7:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field VolumeGrowthCount", wireType)
@@ -22750,6 +23316,25 @@ func (m *CacheRemoteObjectToLocalClusterRequest) UnmarshalVT(dAtA []byte) error 
 				b := dAtA[iNdEx]
 				iNdEx++
 				m.DownloadConcurrency |= int32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxSize", wireType)
+			}
+			m.MaxSize = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.MaxSize |= int64(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -23959,6 +24544,38 @@ func (m *Lock) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PrevRenewToken", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PrevRenewToken = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -24319,6 +24936,38 @@ func (m *ReplicateLockRequest) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PrevRenewToken", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PrevRenewToken = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])

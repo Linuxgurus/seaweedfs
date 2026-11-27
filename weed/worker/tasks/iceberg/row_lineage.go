@@ -360,7 +360,12 @@ func copyFileRows(ctx context.Context, reader *parquet.Reader, entry iceberg.Man
 		reader.Close()
 		return 0, err
 	}
-	return visitFilteredParquetRows(ctx, reader, entry.DataFile().FilePath(), bucketName, dataPath, positionDeletes, eqGroups, func(filtered []parquet.Row, positions []int64) error {
+	eqGroups, dataSeq, err := equalityDeletesFor(eqGroups, entry)
+	if err != nil {
+		reader.Close()
+		return 0, err
+	}
+	return visitFilteredParquetRows(ctx, reader, entry.DataFile().FilePath(), bucketName, dataPath, positionDeletes, eqGroups, dataSeq, func(filtered []parquet.Row, positions []int64) error {
 		if mapper != nil {
 			filtered = mapper.mapRows(filtered, positions)
 		}
@@ -368,12 +373,16 @@ func copyFileRows(ctx context.Context, reader *parquet.Reader, entry iceberg.Man
 	})
 }
 
-// mergedFileFirstRowID is the _row_id of the merged output's first row, or nil when it carries none: the value the
-// manifest entry's first_row_id must name, since rewritten rows keep their IDs rather than taking fresh ones.
+// mergedFileFirstRowID is the _row_id of the merged output's first row, or nil when the file must be committed
+// without a first_row_id: a null _row_id would inherit first_row_id+position, an id another row already holds.
+// Committed without one, the nulls take fresh ids from the table's next-row-id and materialized values still
+// override inheritance.
 func mergedFileFirstRowID(data []byte) (*int64, error) {
-	reader := parquet.NewReader(bytes.NewReader(data))
-	defer reader.Close()
-	schema := reader.Schema()
+	file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, err
+	}
+	schema := file.Schema()
 	if schema == nil {
 		return nil, nil
 	}
@@ -381,6 +390,11 @@ func mergedFileFirstRowID(data []byte) (*int64, error) {
 	if !ok {
 		return nil, nil
 	}
+	if rowIDHasNulls(file, leaf.ColumnIndex) {
+		return nil, nil
+	}
+	reader := parquet.NewReader(file)
+	defer reader.Close()
 	rows := make([]parquet.Row, 1)
 	n, err := reader.ReadRows(rows)
 	if err != nil && err != io.EOF {
@@ -400,6 +414,22 @@ func mergedFileFirstRowID(data []byte) (*int64, error) {
 		return &id, nil
 	}
 	return nil, nil
+}
+
+// rowIDHasNulls reports whether any row group's _row_id column chunk counts a null. A chunk whose statistics
+// cannot be read counts as having one: a first_row_id named on a hidden null is the failure this guards.
+func rowIDHasNulls(file *parquet.File, columnIndex int) bool {
+	for _, rg := range file.RowGroups() {
+		chunks := rg.ColumnChunks()
+		if columnIndex >= len(chunks) {
+			return true
+		}
+		cc, ok := chunks[columnIndex].(*parquet.FileColumnChunk)
+		if !ok || cc.NullCount() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // lineageCodec is the codec of the first data column leaf that declares one,

@@ -175,3 +175,264 @@ func TestReadEcShardNeedleUniformLayout(t *testing.T) {
 		}
 	}
 }
+
+func corruptEcShardRange(t *testing.T, ecVolume *erasure_coding.EcVolume, shardId erasure_coding.ShardId, offset int64, size int64) {
+	t.Helper()
+	path := ecVolume.DataBaseFileName() + erasure_coding.ToExt(int(shardId))
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open shard %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xA5}, int(size)), offset); err != nil {
+		t.Fatalf("corrupt shard %s: %v", path, err)
+	}
+}
+
+// A shard that serves corrupt bytes fails the needle CRC check after the
+// intervals are assembled. The read should rebuild the suspect range from the
+// surviving shards and return the correct needle instead of an error.
+func TestReadEcShardNeedleHealsBitRottedShard(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(9)
+
+	n := randomNeedleOfSize(77, 1024)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) != 1 {
+		t.Fatalf("needle covers %d intervals, want 1", len(intervals))
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+
+	got := new(needle.Needle)
+	got.Id = n.Id
+	if _, err := store.ReadEcShardNeedle(vid, got, nil); err != nil {
+		t.Fatalf("read should reconstruct around the corrupt shard: %v", err)
+	}
+	if !bytes.Equal(got.Data, n.Data) {
+		t.Fatalf("read back %d bytes, want the %d written", len(got.Data), len(n.Data))
+	}
+}
+
+// Same for a needle striped over several shards: only the rotted interval is
+// rebuilt; the good shards' bytes must survive untouched.
+func TestReadEcShardNeedleHealsBitRottedShardInSpanningNeedle(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(10)
+
+	n := randomNeedleOfSize(42, 3*erasure_coding.ErasureCodingSmallBlockSize+1234)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) < 2 {
+		t.Fatalf("needle covers %d interval(s), want it split over several", len(intervals))
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+
+	got := new(needle.Needle)
+	got.Id = n.Id
+	if _, err := store.ReadEcShardNeedle(vid, got, nil); err != nil {
+		t.Fatalf("read should reconstruct around the corrupt shard: %v", err)
+	}
+	if !bytes.Equal(got.Data, n.Data) {
+		t.Fatalf("read back %d bytes, want the %d written", len(got.Data), len(n.Data))
+	}
+}
+
+// The gather that rebuilds a suspect range can itself pick up a second corrupt
+// shard as reconstruction input. The first candidate then fails the needle
+// parse, and the read should retry the decode with that input dropped.
+func TestReadEcShardNeedleHealsWhenRebuildInputAlsoRotted(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(12)
+
+	n := randomNeedleOfSize(77, 1024)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) != 1 {
+		t.Fatalf("needle covers %d intervals, want 1", len(intervals))
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+
+	// Every shard is local, so the rebuild gather takes the lowest-numbered
+	// surviving shards: the first parity shard is always one of the inputs.
+	parityInput := erasure_coding.ShardId(ecVolume.ECContext.DataShards)
+	corruptEcShardRange(t, ecVolume, parityInput, shardOffset, int64(intervals[0].Size))
+
+	got := new(needle.Needle)
+	got.Id = n.Id
+	if _, err := store.ReadEcShardNeedle(vid, got, nil); err != nil {
+		t.Fatalf("read should reconstruct past a corrupt rebuild input: %v", err)
+	}
+	if !bytes.Equal(got.Data, n.Data) {
+		t.Fatalf("read back %d bytes, want the %d written", len(got.Data), len(n.Data))
+	}
+}
+
+// rotParityManyShards stores a one-interval needle and corrupts its range on
+// its own shard and on the lowest-numbered survivors, as many as parity, so
+// every cheap decode reads at least two corrupt inputs.
+func rotParityManyShards(t *testing.T, store *Store, vid needle.VolumeId) *needle.Needle {
+	n := randomNeedleOfSize(99, 1024)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) != 1 {
+		t.Fatalf("needle covers %d intervals, want 1", len(intervals))
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+	corrupted := 1
+	for other := erasure_coding.ShardId(0); corrupted < ecVolume.ECContext.ParityShards; other++ {
+		if other == shardId {
+			continue
+		}
+		corruptEcShardRange(t, ecVolume, other, shardOffset, int64(intervals[0].Size))
+		corrupted++
+	}
+	return n
+}
+
+// rotSuspectNextToCleanOne stores a needle over two shards, corrupts the first
+// of them, and corrupts enough other shards that rebuilding both suspects would
+// exceed parity: only the clean suspect kept as an input repairs the read.
+func rotSuspectNextToCleanOne(t *testing.T, store *Store, vid needle.VolumeId) *needle.Needle {
+	n := randomNeedleOfSize(55, erasure_coding.ErasureCodingSmallBlockSize+1234)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) != 2 {
+		t.Fatalf("needle covers %d intervals, want 2", len(intervals))
+	}
+	suspects := make(map[erasure_coding.ShardId]bool)
+	for _, interval := range intervals {
+		shardId, _ := ecVolume.IntervalToShardIdAndOffset(interval)
+		suspects[shardId] = true
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+	corrupted := 1
+	for other := erasure_coding.ShardId(0); corrupted < ecVolume.ECContext.ParityShards; other++ {
+		if suspects[other] {
+			continue
+		}
+		for _, interval := range intervals {
+			_, offset := ecVolume.IntervalToShardIdAndOffset(interval)
+			corruptEcShardRange(t, ecVolume, other, offset, int64(interval.Size))
+		}
+		corrupted++
+	}
+	return n
+}
+
+func readEcNeedleBack(t *testing.T, store *Store, vid needle.VolumeId, n *needle.Needle) error {
+	got := new(needle.Needle)
+	got.Id = n.Id
+	if _, err := store.ReadEcShardNeedle(vid, got, nil); err != nil {
+		return err
+	}
+	if !bytes.Equal(got.Data, n.Data) {
+		t.Fatalf("read back %d bytes, want the %d written", len(got.Data), len(n.Data))
+	}
+	return nil
+}
+
+func TestReadEcShardNeedleHealsWhenParityManyShardsRotted(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(13)
+	n := rotParityManyShards(t, store, vid)
+	if err := readEcNeedleBack(t, store, vid, n); err != nil {
+		t.Fatalf("read should reconstruct within parity: %v", err)
+	}
+}
+
+func TestReadEcShardNeedleHealsCorruptSuspectNextToCleanOne(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(14)
+	n := rotSuspectNextToCleanOne(t, store, vid)
+	if err := readEcNeedleBack(t, store, vid, n); err != nil {
+		t.Fatalf("read should reconstruct within parity: %v", err)
+	}
+}
+
+// Past the recovery budget the corrupt-set search does not run, and the read
+// keeps to the retries it extends: one corrupt range in a needle over more
+// shards than parity still heals one suspect at a time, while parity-many
+// corrupt shards stay unreadable.
+func TestReadEcShardNeedleCorruptSetSearchPastBudget(t *testing.T) {
+	setEcRecoverBudget(t, 1)
+	store := newTestStore(t, 1)
+
+	const wideVid = needle.VolumeId(17)
+	wide := randomNeedleOfSize(77, 6*erasure_coding.ErasureCodingSmallBlockSize+1234)
+	ecVolume := encodeAndMountEcVolume(t, store, wideVid, []*needle.Needle{wide})
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(wide.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	if len(intervals) <= ecVolume.ECContext.ParityShards {
+		t.Fatalf("needle covers %d intervals, want more than %d", len(intervals), ecVolume.ECContext.ParityShards)
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[1])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[1].Size))
+	if err := readEcNeedleBack(t, store, wideVid, wide); err != nil {
+		t.Fatalf("one corrupt shard should reconstruct past the budget: %v", err)
+	}
+
+	n := rotParityManyShards(t, store, 15)
+	if err := readEcNeedleBack(t, store, 15, n); err == nil {
+		t.Fatalf("parity-many corrupt shards should need the search, which the budget rules out")
+	}
+}
+
+// When more shards than parity are corrupt in the same range no hypothesis can
+// gather enough clean input, so the read still fails instead of serving wrong
+// bytes.
+func TestReadEcShardNeedleFailsWhenCorruptionExceedsParity(t *testing.T) {
+	store := newTestStore(t, 1)
+	const vid = needle.VolumeId(11)
+
+	n := randomNeedleOfSize(88, 1024)
+	ecVolume := encodeAndMountEcVolume(t, store, vid, []*needle.Needle{n})
+
+	_, _, intervals, err := ecVolume.LocateEcShardNeedle(n.Id, ecVolume.Version)
+	if err != nil {
+		t.Fatalf("locate needle: %v", err)
+	}
+	shardId, shardOffset := ecVolume.IntervalToShardIdAndOffset(intervals[0])
+	corruptEcShardRange(t, ecVolume, shardId, shardOffset, int64(intervals[0].Size))
+	corrupted := 0
+	for other := erasure_coding.ShardId(0); corrupted < ecVolume.ECContext.ParityShards; other++ {
+		if other == shardId {
+			continue
+		}
+		corruptEcShardRange(t, ecVolume, other, shardOffset, int64(intervals[0].Size))
+		corrupted++
+	}
+
+	got := new(needle.Needle)
+	got.Id = n.Id
+	if _, err := store.ReadEcShardNeedle(vid, got, nil); err == nil {
+		t.Fatal("read should fail when corruption exceeds what parity can rebuild")
+	}
+}

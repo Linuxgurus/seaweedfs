@@ -105,7 +105,7 @@ func (s3a *S3ApiServer) GetObjectAclHandler(w http.ResponseWriter, r *http.Reque
 	// Get object owner from metadata, fallback to request account
 	var objectOwner string
 	var objectOwnerDisplayName string
-	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
+	amzAccountId := s3a.requestAccountId(r)
 
 	if entry.Extended != nil {
 		if ownerBytes, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
@@ -224,7 +224,7 @@ func (s3a *S3ApiServer) PutObjectAclHandler(w http.ResponseWriter, r *http.Reque
 
 	// Get current object owner from metadata
 	var objectOwner string
-	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
+	amzAccountId := s3a.requestAccountId(r)
 
 	if entry.Extended != nil {
 		if ownerBytes, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
@@ -234,7 +234,8 @@ func (s3a *S3ApiServer) PutObjectAclHandler(w http.ResponseWriter, r *http.Reque
 
 	// **PERMISSION CHECKS**
 
-	isAdmin := s3a.isUserAdmin(r)
+	// Without auth there is no caller to check, as in checkAccessByOwnership.
+	isAdmin := s3a.isUserAdmin(r) || (s3a.iam != nil && !s3a.iam.isEnabled())
 
 	// Without stored owner metadata there is no way to prove a non-admin
 	// caller owns this object, so they must not modify its ACL or claim it.
@@ -288,6 +289,9 @@ func (s3a *S3ApiServer) PutObjectAclHandler(w http.ResponseWriter, r *http.Reque
 	// Extract ACL from request (either canned ACL or XML body)
 	// This function also validates that the owner in the request matches the object owner
 	grants, errCode := ExtractAcl(r, s3a.iam, bucketOwnership, bucketOwnerId, objectOwner, amzAccountId)
+	if errCode == s3err.ErrNone {
+		errCode = rejectPublicGrants(bucketConfig, grants)
+	}
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return

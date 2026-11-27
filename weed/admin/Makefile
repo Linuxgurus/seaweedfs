@@ -14,25 +14,27 @@ WEED_BINARY := $(BUILD_DIR)/weed
 .PHONY: all
 all: build
 
-# fork: pin the templ CLI. The committed *_templ.go must stay reproducible:
-# regenerating with a different CLI rewrites those files and creates merge
-# conflicts with upstream. v0.3.1001 reproduces our committed output (verified on
-# cluster_ec_shards, cluster_ec_volumes and ec_volume_details; v0.3.1020, the
-# version in go.mod, rewrites them). templ warns this is older than go.mod; that
-# is deliberate. Bump only together with a targeted regeneration pass.
-TEMPL_VERSION ?= v0.3.1001
-
-# Install the pinned templ if a different version is on PATH
+# Install templ pinned to the go.mod version so generated code matches the runtime.
+# Invoke the binary in Go's install dir so a different templ earlier on PATH cannot shadow it.
+TEMPL_VERSION := $(shell go list -m -f '{{.Version}}' github.com/a-h/templ)
+GOBIN := $(shell go env GOBIN)
+ifeq ($(GOBIN),)
+ifeq ($(shell go env GOOS),windows)
+GOBIN := $(shell go env GOPATH | cut -d';' -f1)/bin
+else
+GOBIN := $(shell go env GOPATH | cut -d: -f1)/bin
+endif
+endif
+TEMPL := $(GOBIN)/templ
 .PHONY: install-templ
 install-templ:
-	@templ version 2>/dev/null | grep -qx "$(TEMPL_VERSION)" \
-		|| (echo "Installing templ $(TEMPL_VERSION)..." && go install github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION))
+	@("$(TEMPL)" version 2>/dev/null | grep -qF $(TEMPL_VERSION)) || (echo "Installing templ $(TEMPL_VERSION)..." && go install github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION))
 
 # Generate templ files
 .PHONY: generate
 generate: install-templ static-gz
 	@echo "Generating templ files..."
-	@templ generate ./view
+	@"$(TEMPL)" generate ./view
 	@echo "Generated: $(TEMPL_GO_FILES)"
 
 # Regenerate the gzipped static mirror embedded into the binary
@@ -52,7 +54,7 @@ clean-templ:
 .PHONY: watch
 watch: install-templ
 	@echo "Watching for templ file changes..."
-	@cd $(BUILD_DIR) && templ generate --watch
+	@cd $(BUILD_DIR) && "$(TEMPL)" generate --watch
 
 # Build the main weed binary with admin component
 .PHONY: build
@@ -89,11 +91,11 @@ lint:
 
 # Format the code
 .PHONY: fmt
-fmt:
+fmt: install-templ
 	@echo "Formatting Go code..."
 	@go fmt ./...
 	@echo "Formatting templ files..."
-	@templ fmt $(VIEW_DIR)
+	@"$(TEMPL)" fmt $(VIEW_DIR)
 
 # Validate static files exist
 .PHONY: validate-static
@@ -173,8 +175,8 @@ $(WEED_BINARY): $(TEMPL_GO_FILES) $(GO_FILES)
 	@$(MAKE) build
 
 # Auto-generate templ files when .templ files change
-# fork: generate the single file from weed/admin rather than the whole tree from
-# the repo root, so the baked FileName paths stay view/app/... (see TEMPL_VERSION)
-%_templ.go: %.templ
+# fork: generate from weed/admin so the baked FileName paths stay view/app/...
+# and the tree stays reproducible with the templ version pinned above.
+%_templ.go: %.templ | install-templ
 	@echo "Regenerating $@ from $<"
-	@cd $(ADMIN_DIR) && templ generate -f $<
+	@cd $(ADMIN_DIR) && "$(TEMPL)" generate -f $<

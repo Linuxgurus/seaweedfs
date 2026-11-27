@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"context"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -31,6 +32,8 @@ func one(c *filer_pb.WriteCondition_Clause) *filer_pb.WriteCondition {
 func TestWriteConditionSatisfied(t *testing.T) {
 	base := time.Unix(1700000000, 0)
 	present := entryWithETag("abc", base)
+	plainDir := &filer.Entry{FullPath: "/test/obj", Attr: filer.Attr{Mode: os.ModeDir | 0755}}
+	objectDir := &filer.Entry{FullPath: "/test/obj", Attr: filer.Attr{Mode: os.ModeDir | 0755, Mime: "text/plain"}}
 
 	cases := []struct {
 		name string
@@ -43,6 +46,11 @@ func TestWriteConditionSatisfied(t *testing.T) {
 		{"ifnotexists-present", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_NOT_EXISTS}), present, false},
 		{"ifexists-absent", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_EXISTS}), nil, false},
 		{"ifexists-present", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_EXISTS}), present, true},
+		{"ifexists-plain-dir", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_EXISTS}), plainDir, true},
+		{"ifobjectexists-absent", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_OBJECT_EXISTS}), nil, false},
+		{"ifobjectexists-present", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_OBJECT_EXISTS}), present, true},
+		{"ifobjectexists-plain-dir", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_OBJECT_EXISTS}), plainDir, false},
+		{"ifobjectexists-object-dir", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_OBJECT_EXISTS}), objectDir, true},
 		{"etagmatch-hit", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"abc"`}}), present, true},
 		{"etagmatch-miss", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"zzz"`}}), present, false},
 		{"etagmatch-absent", one(&filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"abc"`}}), nil, false},
@@ -222,6 +230,28 @@ func TestIfEntryEqualNormalizesExpected(t *testing.T) {
 	}
 }
 
+// A store that keeps the entry as given (JSON-backed stores) returns FileSize
+// zero beside chunks; an expected entry read from it must still match it.
+func TestIfEntryEqualUnnormalizedStored(t *testing.T) {
+	stored := &filer.Entry{
+		FullPath: "/d/f",
+		Attr:     filer.Attr{Mtime: time.Unix(42, 0)},
+		Chunks: []*filer_pb.FileChunk{
+			{Fid: &filer_pb.FileId{VolumeId: 3, FileKey: 1, Cookie: 2}, Size: 4},
+		},
+	}
+	cond := one(&filer_pb.WriteCondition_Clause{
+		Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+		ExpectedEntry: stored.ToProtoEntry(),
+	})
+	if !writeConditionSatisfied(cond, stored) {
+		t.Error("an entry read from the store must equal the stored entry")
+	}
+	if stored.FileSize != 0 {
+		t.Fatalf("the check changed the stored entry's FileSize to %d", stored.FileSize)
+	}
+}
+
 // A stamp built from the metadata-log event carries chunks in serialized
 // form (file_id moved into fid), while the stored entry came through
 // FindEntry which restores file_id. The comparison must still match.
@@ -256,6 +286,23 @@ func TestStoredEntryETag(t *testing.T) {
 	md5Only := &filer.Entry{Attr: filer.Attr{Md5: []byte{0xab, 0xcd}}}
 	if got := storedEntryETag(md5Only); got != "abcd" {
 		t.Errorf("md5 fallback: got %q", got)
+	}
+	remoteOnly := &filer.Entry{
+		Attr:   filer.Attr{FileSize: 10},
+		Remote: &filer_pb.RemoteEntry{RemoteETag: `"remote-etag"`, RemoteSize: 10},
+	}
+	if got := storedEntryETag(remoteOnly); got != "remote-etag" {
+		t.Errorf("remote etag: got %q", got)
+	}
+	remoteStale := &filer.Entry{
+		Attr:   filer.Attr{FileSize: 10, Md5: []byte{0xab}},
+		Remote: &filer_pb.RemoteEntry{RemoteETag: `"remote-etag"`, RemoteSize: 99},
+	}
+	if got := storedEntryETag(remoteStale); got != "ab" {
+		t.Errorf("stale remote size falls to md5: got %q", got)
+	}
+	if got := storedEntryETag(&filer.Entry{}); got != "" {
+		t.Errorf("empty entry: got %q", got)
 	}
 }
 
@@ -380,5 +427,72 @@ func TestUpdateEntryConditionEnforced(t *testing.T) {
 	}
 	if got := store.entries["/test/obj"].Attr.Mtime.Unix(); got != 1700000005 {
 		t.Fatalf("update not applied, mtime %d", got)
+	}
+}
+
+func TestDeleteCutoff(t *testing.T) {
+	base := time.Unix(1700000000, 500_000_000)
+
+	// nanoseconds take precedence when set
+	if got := deleteCutoff(1, base.UnixNano()); !got.Equal(base) {
+		t.Fatalf("ns guard should win, got %v", got)
+	}
+	// no guard stays disabled
+	if got := deleteCutoff(0, 0); !got.IsZero() {
+		t.Fatalf("no guard must stay zero, got %v", got)
+	}
+	// a whole-second guard covers its full second: entry.Mtime.Unix() > sec
+	// is entry.Mtime after the last nanosecond of that second
+	cutoff := deleteCutoff(base.Unix(), 0)
+	if want := time.Unix(0, (base.Unix()+1)*1_000_000_000-1); !cutoff.Equal(want) {
+		t.Fatalf("seconds guard = %v, want %v", cutoff, want)
+	}
+	if base.After(cutoff) {
+		t.Fatal("entry inside the guard second must not be treated as newer")
+	}
+	// a seconds guard beyond the nanosecond range keeps its date: an entry
+	// in the guarded second is deleted and only a newer one is skipped
+	farSec := time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	farCutoff := deleteCutoff(farSec, 0)
+	if want := time.Unix(farSec, 999_999_999); !farCutoff.Equal(want) {
+		t.Fatalf("huge seconds guard = %v, want %v", farCutoff, want)
+	}
+	if time.Unix(farSec, 0).After(farCutoff) {
+		t.Fatal("entry in the guarded far-future second must not be treated as newer")
+	}
+	if !time.Unix(farSec+1, 0).After(farCutoff) {
+		t.Fatal("entry past the guarded far-future second must be treated as newer")
+	}
+}
+
+func TestDeleteEntryKeepsAnEntryModifiedAfterTheCutoff(t *testing.T) {
+	listed := time.Unix(1700000000, 500)
+	for _, tc := range []struct {
+		name  string
+		req   *filer_pb.DeleteEntryRequest
+		mtime time.Time
+		kept  bool
+	}{
+		{"ns cutoff, unchanged", &filer_pb.DeleteEntryRequest{IfNotModifiedAfterNs: listed.UnixNano()}, listed, false},
+		{"ns cutoff, modified since", &filer_pb.DeleteEntryRequest{IfNotModifiedAfterNs: listed.UnixNano()}, listed.Add(time.Nanosecond), true},
+		{"seconds cutoff, same second", &filer_pb.DeleteEntryRequest{IfNotModifiedAfter: listed.Unix()}, listed.Add(time.Millisecond), false},
+		{"seconds cutoff, modified since", &filer_pb.DeleteEntryRequest{IfNotModifiedAfter: listed.Unix()}, listed.Add(time.Second), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRenameTestStore()
+			store.entries["/test/obj"] = &filer.Entry{
+				FullPath: "/test/obj",
+				Attr:     filer.Attr{Inode: 1, Mtime: tc.mtime, Mode: 0644},
+			}
+			fs := &FilerServer{filer: newRenameTestFiler(t, store), option: &FilerOption{}, entryLockTable: util.NewLockTable[util.FullPath]()}
+			tc.req.Directory, tc.req.Name = "/test", "obj"
+			resp, err := fs.DeleteEntry(context.Background(), tc.req)
+			if err != nil || resp.Error != "" {
+				t.Fatalf("DeleteEntry: %v %q", err, resp.GetError())
+			}
+			if _, kept := store.entries["/test/obj"]; kept != tc.kept {
+				t.Fatalf("kept = %v, want %v", kept, tc.kept)
+			}
+		})
 	}
 }

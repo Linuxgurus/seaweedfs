@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -205,7 +207,7 @@ func TestWriteNeedleBlobRejectedOnReadOnlyVolume(t *testing.T) {
 
 	datSizeBefore, _, _ := v.DataBackend.GetStat()
 
-	err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, n.Size)
+	err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), withNeedleId(blob, 2), n.Size)
 	if err == nil {
 		t.Fatalf("expected WriteNeedleBlob to be rejected on a read-only volume")
 	}
@@ -247,7 +249,7 @@ func TestWriteNeedleBlobRejectsSizeMismatch(t *testing.T) {
 
 	// types.Size(n.DataSize) is what needle.Append reports, and what a caller
 	// following the payload-size convention would send.
-	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, types.Size(n.DataSize)); err == nil {
+	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), withNeedleId(blob, 2), types.Size(n.DataSize)); err == nil {
 		t.Fatal("expected WriteNeedleBlob to reject a size that disagrees with the blob header")
 	}
 
@@ -256,7 +258,7 @@ func TestWriteNeedleBlobRejectsSizeMismatch(t *testing.T) {
 		t.Errorf(".dat grew from %d to %d on a rejected blob", datSizeBefore, datSizeAfter)
 	}
 
-	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, n.Size); err != nil {
+	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), withNeedleId(blob, 2), n.Size); err != nil {
 		t.Fatalf("write needle blob with the header size: %v", err)
 	}
 }
@@ -323,7 +325,7 @@ func TestWriteNeedleBlobRejectsNegativeSize(t *testing.T) {
 
 			datSizeBefore, _, _ := v.DataBackend.GetStat()
 
-			if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, size); err == nil {
+			if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), withNeedleId(blob, 2), size); err == nil {
 				t.Error("expected WriteNeedleBlob to reject a negative size")
 			}
 
@@ -369,7 +371,7 @@ func TestWriteNeedleBlobRejectsLengthMismatch(t *testing.T) {
 			}
 			datSizeBefore, _, _ := v.DataBackend.GetStat()
 
-			if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), tc.mutate(blob), n.Size); err == nil {
+			if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), tc.mutate(withNeedleId(blob, 2)), n.Size); err == nil {
 				t.Error("expected WriteNeedleBlob to reject a blob whose length does not match its size")
 			}
 
@@ -412,7 +414,7 @@ func TestWriteNeedleBlobRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read needle blob: %v", err)
 	}
-	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, n.Size); err != nil {
+	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), withNeedleId(blob, 2), n.Size); err != nil {
 		t.Fatalf("write needle blob: %v", err)
 	}
 	got := newEmptyNeedle(2)
@@ -431,7 +433,7 @@ func TestWriteNeedleBlobRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read delete record: %v", err)
 	}
-	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(3), deleteRecord, 0); err != nil {
+	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(3), withNeedleId(deleteRecord, 3), 0); err != nil {
 		t.Fatalf("write size-0 needle blob: %v", err)
 	}
 
@@ -495,5 +497,123 @@ func TestDoWriteRequestRefusesReadOnlyBeforeAppend(t *testing.T) {
 	}
 	if v.nm.IndexFileSize() != idxBefore {
 		t.Fatalf("idx size changed; needle must not index")
+	}
+}
+
+type syncCountingBackend struct {
+	backend.BackendStorageFile
+	syncs atomic.Int64
+}
+
+func (b *syncCountingBackend) Sync() error {
+	b.syncs.Add(1)
+	return b.BackendStorageFile.Sync()
+}
+
+// A drained queue used to flush whatever it held, turning durable writes into
+// one fsync per request at low concurrency. With a batch window configured, a
+// straggler that lands inside the window joins the same sync.
+func TestSyncBatchDefersFlushForStragglers(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 7, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	counting := &syncCountingBackend{BackendStorageFile: v.DataBackend}
+	v.DataBackend = counting
+	writeBytes := int64(needle.GetActualSize(16, v.Version()))
+	v.location = &DiskLocation{syncBatch: SyncBatchOption{
+		MinBytes:    writeBytes * 2,
+		MinRequests: syncBatchMaxRequests,
+		Wait:        time.Minute,
+	}}
+
+	armed := make(chan chan time.Time, 4)
+	prevAfter := syncBatchAfter
+	syncBatchAfter = func(time.Duration) <-chan time.Time {
+		window := make(chan time.Time, 1)
+		armed <- window
+		return window
+	}
+	defer func() { syncBatchAfter = prevAfter }()
+
+	done := make(chan error, 3)
+	writeAsync := func(id uint64) {
+		n := new(needle.Needle)
+		n.Data = make([]byte, 16)
+		n.Checksum = needle.NewCRC(n.Data)
+		n.Id = types.Uint64ToNeedleId(id)
+		_, _, _, writeErr := v.writeNeedle2(n, true, true, false)
+		done <- writeErr
+	}
+	windowFor := func(id uint64) chan time.Time {
+		go writeAsync(id)
+		window := <-armed
+		select {
+		case <-done:
+			t.Fatalf("write %d flushed while its batch window was still open", id)
+		default:
+		}
+		return window
+	}
+
+	windowFor(1)
+	// the straggler fills the batch to MinBytes, closing the window early
+	go writeAsync(2)
+	for i := 0; i < 2; i++ {
+		if writeErr := <-done; writeErr != nil {
+			t.Fatalf("write needle: %v", writeErr)
+		}
+	}
+	if syncs := counting.syncs.Load(); syncs != 1 {
+		t.Fatalf("expected both writes to share one .dat sync, got %d", syncs)
+	}
+
+	window := windowFor(3)
+	window <- time.Now()
+	if writeErr := <-done; writeErr != nil {
+		t.Fatalf("write needle: %v", writeErr)
+	}
+	if syncs := counting.syncs.Load(); syncs != 2 {
+		t.Fatalf("expected a lone write to take its own sync, got %d total", syncs)
+	}
+}
+
+// withNeedleId returns a copy of blob whose header names needle id.
+func withNeedleId(blob []byte, id uint64) []byte {
+	out := append([]byte(nil), blob...)
+	types.NeedleIdToBytes(out[types.CookieSize:types.CookieSize+types.NeedleIdSize], types.Uint64ToNeedleId(id))
+	return out
+}
+
+func TestWriteNeedleBlobRejectsAnotherNeedlesBlob(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 7, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	n := newRandomNeedle(1)
+	offset, _, _, err := v.writeNeedle2(n, true, false, false)
+	if err != nil {
+		t.Fatalf("write needle: %v", err)
+	}
+	blob, err := v.ReadNeedleBlob(int64(offset), n.Size)
+	if err != nil {
+		t.Fatalf("read needle blob: %v", err)
+	}
+	datSizeBefore, _, _ := v.DataBackend.GetStat()
+	if err = v.WriteNeedleBlob(types.Uint64ToNeedleId(2), blob, n.Size); err == nil {
+		t.Fatal("needle 1's blob was stored under key 2")
+	}
+	if datSizeAfter, _, _ := v.DataBackend.GetStat(); datSizeAfter != datSizeBefore {
+		t.Errorf("rejected blob grew .dat from %d to %d bytes", datSizeBefore, datSizeAfter)
+	}
+	if _, ok := v.nm.Get(types.Uint64ToNeedleId(2)); ok {
+		t.Error("rejected blob was indexed under key 2")
 	}
 }

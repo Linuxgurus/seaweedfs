@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,9 +146,12 @@ type Node interface {
 }
 
 type NodeImpl struct {
-	diskUsages   *DiskUsages
-	id           NodeId
-	parent       Node
+	diskUsages *DiskUsages
+	id         NodeId
+	// parent is an atomic pointer because unlinking runs under the rack's
+	// lock while readers (vacuum sweeps, usage propagation, String) reach
+	// it with no shared lock.
+	parent       atomic.Pointer[Node]
 	sync.RWMutex // lock children
 	children     map[NodeId]Node
 	// maxVolumeId uses atomic ops so UpAdjustMaxVolumeId (called from the
@@ -241,6 +245,11 @@ func (n *NodeImpl) PickNodesByWeight(numberOfNodes int, option *VolumeGrowOption
 			lastWeights += weights
 		}
 	}
+	// Servers holding fewer writable volumes of the layout come first; the
+	// weighted order above only breaks ties among them.
+	sort.SliceStable(sortedCandidates, func(i, j int) bool {
+		return option.lessLoaded(sortedCandidates[i], sortedCandidates[j])
+	})
 
 	restNodes = make([]Node, 0, numberOfNodes-1)
 	ret := false
@@ -292,8 +301,8 @@ func (n *NodeImpl) IsLocked() (isTryLock bool) {
 }
 
 func (n *NodeImpl) String() string {
-	if n.parent != nil {
-		return n.parent.String() + ":" + string(n.id)
+	if parent := n.Parent(); parent != nil {
+		return parent.String() + ":" + string(n.id)
 	}
 	return string(n.id)
 }
@@ -307,9 +316,7 @@ func (n *NodeImpl) getOrCreateDisk(diskType types.DiskType) *DiskUsageCounts {
 }
 
 // inMaintenanceMode is true for a data node whose volume server is in
-// maintenance mode. Racks and data centers never are: their rolled-up counters
-// still include such a node, so their free-slot totals may exceed what their
-// children will actually hand out; see reserveOneVolumeInternal.
+// maintenance mode. Racks and data centers never are.
 func (n *NodeImpl) inMaintenanceMode() bool {
 	dn, ok := n.value.(*DataNode)
 	return ok && dn.InMaintenanceMode()
@@ -317,9 +324,23 @@ func (n *NodeImpl) inMaintenanceMode() bool {
 
 // AvailableSpaceFor is the free volume slots on this node for the option's disk
 // type. A data node in maintenance mode reports none: it is being drained, so
-// it is neither a volume-growth candidate nor reservable.
+// it is neither a volume-growth candidate nor reservable. A data node with more
+// volumes than slots also reports none, and racks, data centers and the
+// topology sum their children, so it cannot hide the free slots of others.
 func (n *NodeImpl) AvailableSpaceFor(option *VolumeGrowOption) int64 {
 	if n.inMaintenanceMode() {
+		return 0
+	}
+	if !n.IsDataNode() {
+		n.RLock()
+		defer n.RUnlock()
+		var free int64
+		for _, child := range n.children {
+			free += child.AvailableSpaceFor(option)
+		}
+		return free
+	}
+	if option.hasRefused(n) {
 		return 0
 	}
 	t := n.diskUsages.getDisk(option.DiskType)
@@ -328,7 +349,7 @@ func (n *NodeImpl) AvailableSpaceFor(option *VolumeGrowOption) int64 {
 	}
 	freeVolumeSlotCount := atomic.LoadInt64(&t.maxVolumeCount) + atomic.LoadInt64(&t.remoteVolumeCount) - atomic.LoadInt64(&t.volumeCount)
 	freeVolumeSlotCount -= erasure_coding.VolumeSlots(atomic.LoadInt64(&t.ecShardCount))
-	return freeVolumeSlotCount
+	return max(0, freeVolumeSlotCount)
 }
 
 // CapacityFor is the total registered volume slots for the option's disk type;
@@ -390,7 +411,11 @@ func (n *NodeImpl) ReleaseReservedCapacity(reservationId string) {
 	}
 }
 func (n *NodeImpl) SetParent(node Node) {
-	n.parent = node
+	if node == nil {
+		n.parent.Store(nil)
+		return
+	}
+	n.parent.Store(&node)
 }
 
 func (n *NodeImpl) Children() (ret []Node) {
@@ -403,7 +428,10 @@ func (n *NodeImpl) Children() (ret []Node) {
 }
 
 func (n *NodeImpl) Parent() Node {
-	return n.parent
+	if parent := n.parent.Load(); parent != nil {
+		return *parent
+	}
+	return nil
 }
 
 func (n *NodeImpl) GetValue() interface{} {
@@ -428,11 +456,13 @@ func (n *NodeImpl) reserveOneVolumeInternal(r int64, option *VolumeGrowOption, u
 		}
 		return node.AvailableSpaceFor(option)
 	}
-	// The caller draws r from this node's rolled-up free slots, which still
-	// count children the walk below skips: a data node in maintenance mode
-	// reports no space, and an over-committed one reports less than zero. Fold
-	// r into the space that is actually on offer so it cannot walk off the end
-	// and fail with slots still free.
+	if option.layoutLoad != nil && n.IsRack() {
+		return n.reserveLeastLoaded(r, option, freeSpaceOf)
+	}
+	// The caller drew r from this node's free slots, which can exceed what the
+	// children offer once their reservations or a newer heartbeat are counted.
+	// Fold r into the space that is actually on offer so it cannot walk off the
+	// end and fail with slots still free.
 	var eligible int64
 	for _, node := range n.children {
 		if freeSpace := freeSpaceOf(node); freeSpace > 0 {
@@ -482,8 +512,8 @@ func (n *NodeImpl) reserveOneVolumeInternal(r int64, option *VolumeGrowOption, u
 func (n *NodeImpl) UpAdjustDiskUsageDelta(diskType types.DiskType, diskUsage *DiskUsageCounts) { //can be negative
 	existingDisk := n.getOrCreateDisk(diskType)
 	existingDisk.addDiskUsageCounts(diskUsage)
-	if n.parent != nil {
-		n.parent.UpAdjustDiskUsageDelta(diskType, diskUsage)
+	if parent := n.Parent(); parent != nil {
+		parent.UpAdjustDiskUsageDelta(diskType, diskUsage)
 	}
 }
 func (n *NodeImpl) UpAdjustMaxVolumeId(vid needle.VolumeId) {
@@ -497,8 +527,8 @@ func (n *NodeImpl) UpAdjustMaxVolumeId(vid needle.VolumeId) {
 			break
 		}
 	}
-	if n.parent != nil {
-		n.parent.UpAdjustMaxVolumeId(vid)
+	if parent := n.Parent(); parent != nil {
+		parent.UpAdjustMaxVolumeId(vid)
 	}
 }
 func (n *NodeImpl) GetMaxVolumeId() needle.VolumeId {

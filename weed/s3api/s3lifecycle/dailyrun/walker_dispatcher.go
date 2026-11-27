@@ -8,16 +8,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/bootstrap"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/engine"
-	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"golang.org/x/time/rate"
 )
 
 // WalkerDispatcher adapts LifecycleClient to bootstrap.Dispatcher so
 // the Phase 4b walker can drive the same LifecycleDelete RPC the
-// meta-log replay path uses. No CAS witness is supplied; the server's
-// identityMatches treats nil ExpectedIdentity as "bootstrap call, skip
-// witness" (see weed/s3api/s3api_internal_lifecycle.go), which is the
-// right contract for a full-tree walk that has just observed the entry.
+// meta-log replay path uses, with the listed entry's identity as the
+// CAS witness: an object rewritten between listing and dispatch
+// resolves as STALE_IDENTITY instead of being deleted.
 type WalkerDispatcher struct {
 	Client LifecycleClient
 	// Limiter throttles LifecycleDelete dispatch under the cluster's
@@ -25,6 +23,11 @@ type WalkerDispatcher struct {
 	// daily-run's processMatches uses so the walker and replay paths
 	// can't combine to burst past the cap. nil disables throttling.
 	Limiter *rate.Limiter
+	// DeleteTimeout bounds each LifecycleDelete, applied after the
+	// limiter wait. <= 0 uses DefaultDeleteTimeout.
+	DeleteTimeout time.Duration
+	// nil skips per-pass outcome counts.
+	Stats *RunStats
 }
 
 // Compile-time check.
@@ -57,37 +60,22 @@ func (d *WalkerDispatcher) Delete(ctx context.Context, action *engine.CompiledAc
 	}
 	rh := action.Key.RuleHash
 	req := &s3_lifecycle_pb.LifecycleDeleteRequest{
-		Bucket:     action.Bucket,
-		ObjectPath: objectPath,
-		VersionId:  entry.VersionID,
-		RuleHash:   rh[:],
-		ActionKind: toProtoActionKind(action.Key.ActionKind),
-		// ExpectedIdentity intentionally nil; server bootstraps from
-		// the live entry on this code path.
+		Bucket:           action.Bucket,
+		ObjectPath:       objectPath,
+		VersionId:        entry.VersionID,
+		RuleHash:         rh[:],
+		ActionKind:       toProtoActionKind(action.Key.ActionKind),
+		ExpectedIdentity: toProtoIdentity(entry.Identity),
 	}
 	kindLabel := action.Key.ActionKind.String()
-	if d.Limiter != nil {
-		waitStart := time.Now()
-		if waitErr := d.Limiter.Wait(ctx); waitErr != nil {
-			return fmt.Errorf("walker dispatch %s/%s %s: limiter: %w", action.Bucket, objectPath, action.Key.ActionKind, waitErr)
-		}
-		stats.S3LifecycleDispatchLimiterWaitSeconds.Observe(time.Since(waitStart).Seconds())
-	}
-	resp, err := d.Client.LifecycleDelete(ctx, req)
+	resp, err := deleteWithRetry(ctx, d.Client, d.Limiter, req, d.DeleteTimeout)
 	if err != nil {
 		// "RPC_ERROR" matches the streaming dispatcher and processMatches
 		// labels so transport-class failures aggregate under one key.
-		stats.S3LifecycleDispatchCounter.WithLabelValues(action.Bucket, kindLabel, "RPC_ERROR").Inc()
+		countDispatch(d.Stats, action.Bucket, kindLabel, "RPC_ERROR")
 		return fmt.Errorf("walker dispatch %s/%s %s: %w", action.Bucket, objectPath, action.Key.ActionKind, err)
 	}
-	if resp == nil {
-		// A misbehaving server stub returning (nil, nil) would panic on
-		// the switch below. Bucket under RPC_ERROR rather than a new
-		// label — operationally it's the same class of failure.
-		stats.S3LifecycleDispatchCounter.WithLabelValues(action.Bucket, kindLabel, "RPC_ERROR").Inc()
-		return fmt.Errorf("walker dispatch %s/%s %s: nil response", action.Bucket, objectPath, action.Key.ActionKind)
-	}
-	stats.S3LifecycleDispatchCounter.WithLabelValues(action.Bucket, kindLabel, resp.Outcome.String()).Inc()
+	countDispatch(d.Stats, action.Bucket, kindLabel, resp.Outcome.String())
 	switch resp.Outcome {
 	case s3_lifecycle_pb.LifecycleDeleteOutcome_DONE,
 		s3_lifecycle_pb.LifecycleDeleteOutcome_NOOP_RESOLVED,

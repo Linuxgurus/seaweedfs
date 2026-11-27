@@ -86,7 +86,7 @@ func Detection(
 		VolumeRatio: volumeRatio,
 		// Move incrementally across detection cycles rather than draining a rack
 		// in one batch; the scheduler re-evaluates each cycle.
-		GlobalMaxMovesPerRack: 10,
+		GlobalMaxMovesPerRack: globalMaxMovesPerRack(ecConfig, maxResults),
 		// Balance heterogeneous-capacity racks by fractional fullness.
 		GlobalUtilizationBased: true,
 		RackTotalCapRaised: func(collection string, vid uint32, rackCap, evenCap int) {
@@ -96,6 +96,12 @@ func Detection(
 	if len(moves) == 0 {
 		return nil, false, nil
 	}
+
+	// The global phase is capped per rack while the per-volume phases are not,
+	// so order it ahead of the within-rack moves: otherwise a long within-rack
+	// backlog pushes every global move past the detection cap, and a server that
+	// holds far more shards than its peers never drains.
+	sortMovesByPhase(moves)
 
 	hasMore := false
 	if maxResults > 0 && len(moves) > maxResults {
@@ -166,6 +172,8 @@ func buildBalancerTopology(topoInfo *master_pb.TopologyInfo, config *Config, all
 		vid        uint32
 	}
 	volRatios := make(map[volRatioKey][2]int)
+	emptyIndex := emptyIndexEcVolumes(topoInfo)
+	plainVolumes := plainReplicaVolumes(topoInfo)
 
 	// Normalize the disk-type filter: "hdd" (and the default "") map to the
 	// HardDriveType, which the topology reports under the empty-string key. Keep a
@@ -282,7 +290,14 @@ func buildBalancerTopology(topoInfo *master_pb.TopologyInfo, config *Config, all
 						if !allowedCollections.Matches(eci.Collection) {
 							continue
 						}
+						if emptyIndex[ecVolumeKey{eci.Collection, eci.Id}] {
+							continue
+						}
 						node.AddShards(eci.Id, eci.Collection, eci.DiskId, erasure_coding.ShardBits(eci.EcIndexBits))
+						node.SetEncodeTs(eci.Id, eci.Collection, eci.DiskId, eci.EncodeTsNs)
+						if plainVolumes[ecVolumeKey{eci.Collection, eci.Id}] {
+							node.Freeze(eci.Id, eci.Collection)
+						}
 						if d, p := ecbalancer.VolumeShardRatio(eci); d > 0 || p > 0 {
 							volRatios[volRatioKey{eci.Collection, eci.Id}] = [2]int{d, p}
 						}
@@ -299,6 +314,60 @@ func buildBalancerTopology(topoInfo *master_pb.TopologyInfo, config *Config, all
 		return r[0], r[1]
 	}
 	return topo, nodeCount, volumeRatio
+}
+
+// ecVolumeKey names an EC volume: ids repeat across collections.
+type ecVolumeKey struct {
+	collection string
+	vid        uint32
+}
+
+// emptyIndexEcVolumes are the EC volumes no holder reports a needle for, i.e.
+// every .ecx is empty. A shard copy refuses a 0-byte .ecx, so a move of one
+// can only fail, every detection cycle; there is no data in it to balance.
+// Their shards still count toward disk occupancy.
+func emptyIndexEcVolumes(topoInfo *master_pb.TopologyInfo) map[ecVolumeKey]bool {
+	empty := make(map[ecVolumeKey]bool)
+	for _, dc := range topoInfo.GetDataCenterInfos() {
+		for _, rack := range dc.GetRackInfos() {
+			for _, dn := range rack.GetDataNodeInfos() {
+				for _, diskInfo := range dn.GetDiskInfos() {
+					for _, eci := range diskInfo.GetEcShardInfos() {
+						k := ecVolumeKey{eci.Collection, eci.Id}
+						if isEmpty, seen := empty[k]; !seen || isEmpty {
+							empty[k] = eci.FileCount == 0
+						}
+					}
+				}
+			}
+		}
+	}
+	for k, isEmpty := range empty {
+		if !isEmpty {
+			delete(empty, k)
+		}
+	}
+	return empty
+}
+
+// plainReplicaVolumes are the volumes with a plain replica registered. An EC
+// volume among them belongs to an encode that has not finished, or to one whose
+// source cleanup is pending, and the encoder owns its shards until the plain
+// replicas are gone.
+func plainReplicaVolumes(topoInfo *master_pb.TopologyInfo) map[ecVolumeKey]bool {
+	plain := make(map[ecVolumeKey]bool)
+	for _, dc := range topoInfo.GetDataCenterInfos() {
+		for _, rack := range dc.GetRackInfos() {
+			for _, dn := range rack.GetDataNodeInfos() {
+				for _, diskInfo := range dn.GetDiskInfos() {
+					for _, vi := range diskInfo.GetVolumeInfos() {
+						plain[ecVolumeKey{vi.Collection, vi.Id}] = true
+					}
+				}
+			}
+		}
+	}
+	return plain
 }
 
 // resolveECRatio returns the (dataShards, parityShards) for a collection from the
@@ -337,6 +406,63 @@ func countEcShards(ecShardInfos []*master_pb.VolumeEcShardInformationMessage) in
 		count += erasure_coding.GetShardCount(eci)
 	}
 	return count
+}
+
+// sortMovesByPhase orders a plan for truncation, keeping the planner's order
+// within a phase: dedup and cross-rack first, then the capped global phase,
+// then within-rack. A volume's moves keep their plan order: a global move can
+// take a shard that an earlier within-rack move placed, and the scheduler runs
+// only a volume's first move per cycle.
+func sortMovesByPhase(moves []ecbalancer.Move) {
+	type volumeKey struct {
+		collection string
+		vid        uint32
+	}
+	volumeOrder := make(map[volumeKey]int)
+	order := make([]int, len(moves))
+	for i, m := range moves {
+		vk := volumeKey{m.Collection, m.VolumeID}
+		volumeOrder[vk] = max(volumeOrder[vk], movePhaseOrder(m.Phase))
+		order[i] = volumeOrder[vk]
+	}
+	idx := make([]int, len(moves))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortStableFunc(idx, func(a, b int) int { return order[a] - order[b] })
+	sorted := make([]ecbalancer.Move, len(moves))
+	for i, j := range idx {
+		sorted[i] = moves[j]
+	}
+	copy(moves, sorted)
+}
+
+func movePhaseOrder(phase string) int {
+	switch phase {
+	case "dedup":
+		return 0
+	case "cross_rack":
+		return 1
+	case "global":
+		return 2
+	default:
+		return 3
+	}
+}
+
+// globalMaxMovesPerRack is the configured per-rack cap on global moves, or the default
+// when unset (0 would otherwise mean unlimited to the planner). It never exceeds
+// maxResults: the detection keeps at most that many moves, and each planned global move
+// costs a scan of the source node's volumes, so a larger cap only adds planning time.
+func globalMaxMovesPerRack(c *Config, maxResults int) int {
+	moves := c.GlobalMaxMovesPerRack
+	if moves <= 0 {
+		moves = DefaultGlobalMaxMovesPerRack
+	}
+	if maxResults > 0 {
+		moves = min(moves, maxResults)
+	}
+	return moves
 }
 
 func movePhasePriority(phase string) types.TaskPriority {

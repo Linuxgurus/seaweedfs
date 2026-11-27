@@ -3,6 +3,7 @@ package leveldb
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -10,12 +11,12 @@ import (
 	"os"
 
 	"github.com/syndtr/goleveldb/leveldb"
-	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/leveldb_handle"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
@@ -26,7 +27,7 @@ func init() {
 }
 
 type LevelDB2Store struct {
-	dbs      []*leveldb.DB
+	dbs      []*leveldb_handle.DB
 	dbCount  int
 	ReadOnly bool
 
@@ -93,8 +94,14 @@ func (store *LevelDB2Store) buildOptions() *opt.Options {
 func (store *LevelDB2Store) initialize(dir string, dbCount int) (err error) {
 	glog.Infof("filer store leveldb2 dir: %s", dir)
 	os.MkdirAll(dir, 0755)
-	if err := weed_util.TestFolderWritable(dir); err != nil {
-		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+	if weed_util.IsReadOnlyMount(dir) {
+		glog.V(0).Infof("filer store %s is on a read-only filesystem, opening it read-only", dir)
+		store.ReadOnly = true
+	}
+	if !store.ReadOnly {
+		if err := weed_util.TestFolderWritable(dir); err != nil {
+			return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+		}
 	}
 
 	opts := store.buildOptions()
@@ -102,10 +109,7 @@ func (store *LevelDB2Store) initialize(dir string, dbCount int) (err error) {
 	for d := 0; d < dbCount; d++ {
 		dbFolder := fmt.Sprintf("%s/%02d", dir, d)
 		os.MkdirAll(dbFolder, 0755)
-		db, dbErr := leveldb.OpenFile(dbFolder, opts)
-		if leveldb_errors.IsCorrupted(dbErr) {
-			db, dbErr = leveldb.RecoverFile(dbFolder, opts)
-		}
+		db, dbErr := leveldb_handle.OpenFile(dbFolder, opts)
 		if dbErr != nil {
 			glog.Errorf("filer store open dir %s: %v", dbFolder, dbErr)
 			return dbErr
@@ -114,6 +118,10 @@ func (store *LevelDB2Store) initialize(dir string, dbCount int) (err error) {
 	}
 	store.dbCount = dbCount
 
+	if err := leveldb_handle.CheckKeyHash(store.dbs, fips140.Enforced(), store.ReadOnly); err != nil {
+		store.Shutdown()
+		return err
+	}
 	return
 }
 
@@ -220,7 +228,11 @@ func (store *LevelDB2Store) DeleteFolderChildren(ctx context.Context, fullpath w
 		}
 		batch.Delete(append(directoryPrefix, []byte(fileName)...))
 	}
+	iterErr := iter.Error()
 	iter.Release()
+	if iterErr != nil {
+		return fmt.Errorf("delete %s : %v", fullpath, iterErr)
+	}
 
 	err = store.dbs[partitionId].Write(batch, writeOptions(ctx))
 
@@ -239,7 +251,7 @@ func (store *LevelDB2Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 
 	directoryPrefix, partitionId := genDirectoryKeyPrefix(dirPath, prefix, store.dbCount)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart, _ = genDirectoryKeyPrefix(dirPath, startFileName, store.dbCount)
 	}
 
@@ -282,6 +294,9 @@ func (store *LevelDB2Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 			break
 		}
 	}
+	if err == nil {
+		err = iter.Error()
+	}
 	iter.Release()
 
 	return lastFileName, err
@@ -309,7 +324,7 @@ func getNameFromKey(key []byte) string {
 
 // hash directory, and use last byte for partitioning
 func hashToBytes(dir string, dbCount int) ([]byte, int) {
-	h := md5.New()
+	h := weed_util.NewMd5()
 	io.WriteString(h, dir)
 
 	b := h.Sum(nil)

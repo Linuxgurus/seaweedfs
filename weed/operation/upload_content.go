@@ -3,7 +3,7 @@ package operation
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/fips140"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
@@ -63,6 +64,10 @@ type UploadOption struct {
 	MaxAttempts       int                              // <=0 uses the default
 	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 	FilerJwt          security.FilerJwtProvider        // credential for proxy chunk URLs; nil → process-wide jwt.filer_signing
+
+	// stallWatchdogDisarmed turns the watchdog off for this upload's later
+	// attempts once it fired: a re-arm could burn every retry.
+	stallWatchdogDisarmed bool
 }
 
 type UploadResult struct {
@@ -124,8 +129,11 @@ var (
 // the retry gate can decide on the status code instead of the message text.
 // StatusCode 0 means the request never got a response — a transport failure.
 type uploadStatusError struct {
-	StatusCode int
-	err        error
+	StatusCode          int
+	refusedBeforeAppend bool
+	expiredBeforeAppend bool
+	stalled             bool // the stall watchdog cancelled this attempt's request
+	err                 error
 }
 
 func (e *uploadStatusError) Error() string { return e.err.Error() }
@@ -134,19 +142,20 @@ func (e *uploadStatusError) Unwrap() error { return e.err }
 // ShouldReassignUpload reports whether an upload error means the client should
 // ask for a fresh volume assignment and retry on another volume.
 //
-// On the write path a volume server only 5xxs on a ReplicatedWrite failure
-// (local disk, replica peer down, or under-replication) — all of which a
-// different volume dodges — so any 5xx is reassignable. A status of 0 means the
-// assigned target never answered (down/unreachable), also reassignable. A 4xx
-// is a genuine client error and is surfaced. Errors without a status come from
-// the AssignVolume RPC or request setup; retry only transient transport ones.
+// Transport and 5xx failures retain their existing retry policy. A conflict
+// requires explicit proof that the upload was refused before append.
 func ShouldReassignUpload(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Another assign gets the same verdict. The text below names the path, so
+	// a path with "transport" in it must not turn the verdict into a retry.
+	if errors.Is(err, filer_pb.ErrReadOnly) {
+		return false
+	}
 	var se *uploadStatusError
 	if errors.As(err, &se) {
-		return se.StatusCode == 0 || se.StatusCode >= 500
+		return se.StatusCode == 0 || se.StatusCode >= 500 || (se.StatusCode == http.StatusConflict && se.refusedBeforeAppend) || (se.StatusCode == http.StatusUnauthorized && se.expiredBeforeAppend)
 	}
 	return strings.Contains(err.Error(), "transport")
 }
@@ -163,6 +172,13 @@ type HTTPClient interface {
 // Uploader
 type Uploader struct {
 	httpClient HTTPClient
+	// prepareData permits deterministic CPU-work timing at the preparation boundary.
+	prepareData func([]byte, *UploadOption) (*preparedUpload, error)
+	// fastUploadHosts records the wire rate of the last sizeable upload to
+	// each host, so a later upload stalling far below it can be blamed on
+	// that one connection rather than the link and get cancelled for a retry
+	// on a fresh conn.
+	fastUploadHosts sync.Map // host:port → fastHostMark
 }
 
 func NewUploader() (*Uploader, error) {
@@ -196,6 +212,10 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 }
 
 func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	prepared, err := uploader.prepareUploadData(data, uploadOption)
+	if err != nil {
+		return "", nil, err
+	}
 	doUploadFunc := func() error {
 		var host string
 		var auth security.EncodedJwt
@@ -225,17 +245,45 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			}
 		}
 
-		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
+		uploadResult, err = uploader.retriedUploadData(context.Background(), prepared, uploadOption)
 		return err
 	}
 
+	// A credential can expire while the first HTTP request is queued. Bound
+	// expiry-specific reassignment even when unrelated transient retries are
+	// intentionally unbounded. The third marked refusal is final.
+	expiryRefusals := 0
+	shouldRetry := func(err error) bool {
+		var statusErr *uploadStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized && statusErr.expiredBeforeAppend {
+			// A proxy upload already exhausted its bounded same-FID retries in
+			// retriedUploadData (with a fresh filer credential each time); the
+			// filer owns the FID, so a reassignment here is wrong, and counting
+			// exhausted groups would also inflate the refusal budget. Make it
+			// terminal; only direct uploads reassign.
+			if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
+				return false
+			}
+			expiryRefusals++
+			return expiryRefusals < 3
+		}
+		return ShouldReassignUpload(err)
+	}
 	if uploadOption.RetryForever {
 		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
 			glog.V(0).Infof("upload content: %v", err)
+			var statusErr *uploadStatusError
+			if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusConflict || (statusErr.StatusCode == http.StatusUnauthorized && statusErr.expiredBeforeAppend)) {
+				return shouldRetry(err)
+			}
+			// Forever is for failures that clear. A read-only path does not.
+			if errors.Is(err, filer_pb.ErrReadOnly) {
+				return false
+			}
 			return true
 		})
 	} else {
-		err = util.RetryOnError("uploadWithRetry", ShouldReassignUpload, doUploadFunc)
+		err = util.RetryOnError("uploadWithRetry", shouldRetry, doUploadFunc)
 	}
 
 	return
@@ -268,8 +316,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 	// verifies). Under cipher the server never sees the header, but the digest
 	// still becomes the chunk ETag.
 	if uploadOption.WantMd5 && uploadOption.Md5 == "" {
-		digest := md5.Sum(data)
-		uploadOption.Md5 = base64.StdEncoding.EncodeToString(digest[:])
+		uploadOption.Md5 = base64.StdEncoding.EncodeToString(util.Md5(data))
 	}
 
 	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error) {
@@ -283,7 +330,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 				return assignErr
 			}
 			if resp.Error != "" {
-				return fmt.Errorf("assign volume failure %v: %v", assignRequest, resp.Error)
+				return fmt.Errorf("assign volume failure %v: %w", assignRequest, filer_pb.AssignVolumeResponseError(resp))
 			}
 
 			fileId, auth = resp.FileId, security.EncodedJwt(resp.Auth)
@@ -301,9 +348,12 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 }
 
 // Upload sends a POST request to a volume server to upload the content with adjustable compression level
-func (uploader *Uploader) UploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
-	uploadResult, err = uploader.retriedUploadData(ctx, data, option)
-	return
+func (uploader *Uploader) UploadData(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) {
+	prepared, err := uploader.prepareUploadData(data, option)
+	if err != nil {
+		return nil, err
+	}
+	return uploader.retriedUploadData(ctx, prepared, option)
 }
 
 // Upload sends a POST request to a volume server to upload the content with fast compression
@@ -323,11 +373,20 @@ func (uploader *Uploader) doUpload(ctx context.Context, reader io.Reader, option
 			return
 		}
 	}
-	uploadResult, uploadErr := uploader.retriedUploadData(ctx, data, option)
+	prepared, err := uploader.prepareUploadData(data, option)
+	if err != nil {
+		return nil, err, data
+	}
+	uploadResult, uploadErr := uploader.retriedUploadData(ctx, prepared, option)
 	return uploadResult, uploadErr, data
 }
 
-func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
+func (uploader *Uploader) retriedUploadData(ctx context.Context, prepared *preparedUpload, option *UploadOption) (uploadResult *UploadResult, err error) {
+	// A stall disarms the watchdog for this upload's remaining attempts only;
+	// keep that on a per-call option so a caller reusing UploadOption starts
+	// the next upload armed.
+	localOption := *option
+	option = &localOption
 	maxAttempts := option.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -340,7 +399,7 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 			case <-time.After(time.Millisecond * time.Duration(237*(i+1))):
 			}
 		}
-		uploadResult, err = uploader.doUploadData(ctx, data, option)
+		uploadResult, err = uploader.doUploadData(ctx, prepared, option)
 		if err == nil {
 			uploadResult.RetryCount = i
 			return
@@ -348,12 +407,61 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		var statusErr *uploadStatusError
+		if errors.As(err, &statusErr) {
+			// A marked-expiry 401 is terminal here only for a direct volume
+			// upload: its assignment JWT is spent, so recovery needs a fresh
+			// assignment (uploadWithRetryData). A filer-proxy upload instead
+			// mints a fresh volume JWT on each forwarded request, so a bounded
+			// same-FID retry is enough and reassignment is both unnecessary and
+			// wrong (the proxy owns the FID). Keep that same-FID retry for it.
+			if statusErr.StatusCode == http.StatusConflict || (statusErr.StatusCode == http.StatusUnauthorized && statusErr.expiredBeforeAppend && !util_http.IsProxyChunkUrl(option.UploadUrl)) {
+				return nil, err
+			}
+			if statusErr.StatusCode == http.StatusUnauthorized && statusErr.expiredBeforeAppend && util_http.IsProxyChunkUrl(option.UploadUrl) {
+				// The caller's filer credential was minted once and may have
+				// expired alongside the volume JWT (both default to 10s), so
+				// re-mint it before replaying the same FID; otherwise the filer
+				// rejects the retry with an unmarked 401 and recovery stops.
+				if option.FilerJwt != nil {
+					option.Jwt = option.FilerJwt(true)
+				} else {
+					option.Jwt = security.EncodedJwt(util_http.JwtForFilerServer(true))
+				}
+			}
+			if statusErr.stalled {
+				option.stallWatchdogDisarmed = true
+			}
+		}
 		glog.WarningfCtx(ctx, "uploading %d to %s: %v", i, option.UploadUrl, err)
 	}
 	return
 }
 
-func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
+// isGenericBinaryMimeType reports a content type that says nothing about the bytes,
+// such as the application/octet-stream most S3 clients send for unknown files.
+func isGenericBinaryMimeType(mimeType string) bool {
+	mediaType, _, _ := strings.Cut(mimeType, ";")
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "", "application/octet-stream", "binary/octet-stream":
+		return true
+	}
+	return false
+}
+
+// preparedUpload owns the transformed bytes for one buffered chunk. Reusing it
+// across attempts keeps compression and encryption outside assigned JWT lifetimes.
+type preparedUpload struct {
+	mimeType  string
+	data      []byte
+	clearSize int
+	gzip      bool
+	cipherKey []byte
+}
+
+func prepareUploadData(data []byte, option *UploadOption) (prepared *preparedUpload, err error) {
+	localOption := *option
+	option = &localOption
 	contentIsGzipped := option.IsInputCompressed
 	shouldGzipNow := false
 	if !option.IsInputCompressed && !option.IsReplication {
@@ -364,13 +472,13 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 				option.MimeType = ""
 			}
 		}
-		if shouldBeCompressed, iAmSure := util.IsCompressableFileType(filepath.Base(option.Filename), option.MimeType); iAmSure && shouldBeCompressed {
+		if shouldBeCompressed, iAmSure := util.IsCompressableFileType(filepath.Ext(option.Filename), option.MimeType); iAmSure && shouldBeCompressed {
 			shouldGzipNow = true
-		} else if !iAmSure && option.MimeType == "" && len(data) > 16*1024 {
+		} else if !iAmSure && isGenericBinaryMimeType(option.MimeType) && len(data) > 16*1024 {
 			var compressed []byte
 			compressed, err = util.GzipData(data[0:128])
 			if err != nil {
-				return
+				return nil, err
 			}
 			shouldGzipNow = len(compressed)*10 < 128*9 // can not compress to less than 90%
 		}
@@ -386,7 +494,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 		compressed, compressErr := util.GzipData(data)
 		// fmt.Printf("data is compressed from %d ==> %d\n", len(data), len(compressed))
 		if compressErr == nil {
-			if len(compressed) < len(data) {
+			if len(compressed)*10 < len(data)*9 {
 				data = compressed
 				contentIsGzipped = true
 			}
@@ -399,65 +507,81 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 		}
 	}
 
+	prepared = &preparedUpload{data: data, clearSize: clearDataLen, gzip: contentIsGzipped, mimeType: option.MimeType}
 	if option.Cipher {
-		// encrypt(gzip(data))
-
-		// encrypt
-		cipherKey := util.GenCipherKey()
-		encryptedData, encryptionErr := util.Encrypt(data, cipherKey)
-		if encryptionErr != nil {
-			err = fmt.Errorf("encrypt input: %w", encryptionErr)
-			return
+		prepared.cipherKey = util.GenCipherKey()
+		prepared.data, err = util.Encrypt(data, prepared.cipherKey)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt input: %w", err)
 		}
+	}
+	return prepared, nil
+}
 
+func (uploader *Uploader) prepareUploadData(data []byte, option *UploadOption) (*preparedUpload, error) {
+	if uploader.prepareData != nil {
+		return uploader.prepareData(data, option)
+	}
+	return prepareUploadData(data, option)
+}
+
+func (uploader *Uploader) doUploadData(ctx context.Context, prepared *preparedUpload, option *UploadOption) (uploadResult *UploadResult, err error) {
+	localOption := *option
+	option = &localOption
+	option.MimeType = prepared.mimeType
+
+	if prepared.cipherKey != nil {
 		// upload data
 		uploadResult, err = uploader.upload_content(ctx, func(w io.Writer) (err error) {
-			_, err = w.Write(encryptedData)
+			_, err = w.Write(prepared.data)
 			return
-		}, len(encryptedData), &UploadOption{
-			UploadUrl:         option.UploadUrl,
-			Filename:          "",
-			Cipher:            false,
-			IsInputCompressed: false,
-			MimeType:          "",
-			PairMap:           nil,
-			Jwt:               option.Jwt,
-			BytesBuffer:       option.BytesBuffer,
+		}, len(prepared.data), &UploadOption{
+			UploadUrl:             option.UploadUrl,
+			Filename:              "",
+			Cipher:                false,
+			IsInputCompressed:     false,
+			MimeType:              "",
+			PairMap:               nil,
+			Jwt:                   option.Jwt,
+			BytesBuffer:           option.BytesBuffer,
+			stallWatchdogDisarmed: option.stallWatchdogDisarmed,
 		})
 		if uploadResult == nil {
 			return
 		}
 		uploadResult.Name = option.Filename
 		uploadResult.Mime = option.MimeType
-		uploadResult.CipherKey = cipherKey
+		uploadResult.CipherKey = prepared.cipherKey
 		// The volume server only ever hashes the ciphertext it stored, so the
 		// chunk ETag has to come from the caller's plaintext digest.
 		uploadResult.ContentMd5 = option.Md5
-		uploadResult.Size = uint32(clearDataLen)
-		if contentIsGzipped {
+		uploadResult.Size = uint32(prepared.clearSize)
+		if prepared.gzip {
 			uploadResult.Gzip = 1
 		}
 	} else {
 		// upload data
 		uploadResult, err = uploader.upload_content(ctx, func(w io.Writer) (err error) {
-			_, err = w.Write(data)
+			_, err = w.Write(prepared.data)
 			return
-		}, len(data), &UploadOption{
-			UploadUrl:         option.UploadUrl,
-			Filename:          option.Filename,
-			Cipher:            false,
-			IsInputCompressed: contentIsGzipped,
-			MimeType:          option.MimeType,
-			PairMap:           option.PairMap,
-			Jwt:               option.Jwt,
-			Md5:               option.Md5,
-			BytesBuffer:       option.BytesBuffer,
+		}, len(prepared.data), &UploadOption{
+			UploadUrl:             option.UploadUrl,
+			Filename:              option.Filename,
+			Cipher:                false,
+			IsInputCompressed:     prepared.gzip,
+			IsReplication:         option.IsReplication,
+			MimeType:              option.MimeType,
+			PairMap:               option.PairMap,
+			Jwt:                   option.Jwt,
+			Md5:                   option.Md5,
+			BytesBuffer:           option.BytesBuffer,
+			stallWatchdogDisarmed: option.stallWatchdogDisarmed,
 		})
 		if uploadResult == nil {
 			return
 		}
-		uploadResult.Size = uint32(clearDataLen)
-		if contentIsGzipped {
+		uploadResult.Size = uint32(prepared.clearSize)
+		if prepared.gzip {
 			uploadResult.Gzip = 1
 		}
 	}
@@ -482,7 +606,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	// properly handling non-ASCII characters and special characters
 	h.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": option.Filename}))
 	h.Set("Idempotency-Key", option.UploadUrl)
-	if option.MimeType == "" {
+	if option.MimeType == "" && !option.IsReplication {
 		option.MimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(option.Filename)))
 	}
 	if option.MimeType != "" {
@@ -491,7 +615,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	if option.IsInputCompressed {
 		h.Set("Content-Encoding", "gzip")
 	}
-	if option.Md5 != "" {
+	if option.Md5 != "" && !fips140.Enforced() {
 		h.Set("Content-MD5", option.Md5)
 	}
 
@@ -514,7 +638,14 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	} else {
 		reqReader = bytes.NewReader(option.BytesBuffer.Bytes())
 	}
-	req, postErr := http.NewRequestWithContext(ctx, http.MethodPost, option.UploadUrl, reqReader)
+	// bodySize is what the conn must move: originalDataSize counts bytes
+	// before compression, which would inflate both the recorded rate and the
+	// stall budget for a pre-compressed body.
+	bodySize := int64(reqReader.Len())
+	reqCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+
+	req, postErr := http.NewRequestWithContext(reqCtx, http.MethodPost, option.UploadUrl, reqReader)
 	if postErr != nil {
 		glog.V(1).InfofCtx(ctx, "create upload request %s: %v", option.UploadUrl, postErr)
 		return nil, fmt.Errorf("create upload request %s: %v", option.UploadUrl, postErr)
@@ -529,7 +660,46 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 
 	request_id.InjectToRequest(ctx, req)
 
+	var uploadDone atomic.Bool
+	defer uploadDone.Store(true)
+	// bodySentAt marks when the transport finished draining the request body;
+	// past it the wait is server-side commit, which the transport's response
+	// header timeout already bounds — the stall watchdog only blames a conn
+	// that is still trickling the body.
+	var curBodySentAt atomic.Pointer[atomic.Int64]
+	bodySentAt := &atomic.Int64{}
+	curBodySentAt.Store(bodySentAt)
+	req.Body = &watchdogBody{ReadCloser: req.Body, sentAt: bodySentAt}
+	mark, hostWasFast := uploader.fastUploadHosts.Load(req.URL.Host)
+	hostWasFast = hostWasFast && !option.stallWatchdogDisarmed && time.Since(time.Unix(0, mark.(fastHostMark).at)) < fastUploadHostMemory
+	stallFired := func() {
+		if !uploadDone.CompareAndSwap(false, true) {
+			return
+		}
+		// The host was moving bodies at full rate a moment ago, so an
+		// upload still trickling far below that rate rides a wedged pooled
+		// conn; cancel drops the conn so the retry dials a fresh one.
+		// CompareAndDelete leaves a newer mark a concurrent success stored.
+		uploader.fastUploadHosts.CompareAndDelete(req.URL.Host, mark)
+		glog.WarningfCtx(ctx, "upload %d bytes to %s stalled on a pooled connection, retrying on a fresh one", originalDataSize, option.UploadUrl)
+		cancelUpload()
+	}
+	var stallTimer *time.Timer
+	if hostWasFast {
+		defer func() {
+			if stallTimer != nil {
+				stallTimer.Stop()
+			}
+		}()
+		stallTimer = time.AfterFunc(uploadStallTimeout(bodySize, mark.(fastHostMark).bps), func() {
+			if curBodySentAt.Load().Load() == 0 {
+				stallFired()
+			}
+		})
+	}
+
 	// print("+")
+	started := time.Now()
 	resp, post_err := uploader.httpClient.Do(req)
 	defer util_http.CloseResponse(resp)
 	if post_err != nil {
@@ -548,7 +718,13 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 			// "connection reset" error with a misleading "Body length 0".
 			if req.GetBody != nil {
 				if newBody, gbErr := req.GetBody(); gbErr == nil {
-					req.Body = newBody
+					bodySentAt = &atomic.Int64{}
+					curBodySentAt.Store(bodySentAt)
+					started = time.Now()
+					if stallTimer != nil && !uploadDone.Load() {
+						stallTimer.Reset(uploadStallTimeout(bodySize, mark.(fastHostMark).bps))
+					}
+					req.Body = &watchdogBody{ReadCloser: newBody, sentAt: bodySentAt}
 					resp, post_err = uploader.httpClient.Do(req)
 					defer util_http.CloseResponse(resp)
 				} else {
@@ -561,36 +737,62 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	}
 	if post_err != nil {
 		stats.UploadErrorCounter.WithLabelValues("0").Inc()
-		return nil, &uploadStatusError{StatusCode: 0, err: fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)}
+		return nil, &uploadStatusError{StatusCode: 0, stalled: reqCtx.Err() != nil && ctx.Err() == nil, err: fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)}
 	}
+	// Rate is bounded by elapsed-to-response: the server cannot answer before
+	// the body lands, so this can only understate link speed — a drain-time
+	// reading mistakes kernel-buffer absorption for wire speed and would mark
+	// a slow link fast. The mark still only lands on a verified upload: a
+	// fast rejection says nothing about how the conn drains.
+	movedIn := time.Since(started)
+
 	// print("-")
 
 	var ret UploadResult
 	etag := getEtag(resp)
 	if resp.StatusCode == http.StatusNoContent {
+		if bps := uploadObservedBps(bodySize, movedIn); bps > 0 {
+			uploader.fastUploadHosts.Store(req.URL.Host, fastHostMark{at: time.Now().UnixNano(), bps: bps})
+		}
 		ret.ETag = etag
-		ret.ContentMd5 = resp.Header.Get("Content-MD5")
+		ret.ContentMd5 = uploadedContentMd5(resp, option)
 		return &ret, nil
 	}
 
+	if stallTimer != nil {
+		// The header timeout does not cover the response body: keep the
+		// watchdog armed for the read so a conn that wedges mid-reply gets
+		// cancelled for a fresh retry.
+		respStallTimer := time.AfterFunc(uploadStallMinWait, stallFired)
+		defer respStallTimer.Stop()
+	}
+	refusedBeforeAppend := resp.StatusCode == http.StatusConflict && resp.Header.Get(util_http.WriteOutcomeHeader) == util_http.WriteOutcomeRefusedBeforeAppend
+	expiredBeforeAppend := resp.StatusCode == http.StatusUnauthorized && resp.Header.Get(util_http.WriteOutcomeHeader) == util_http.WriteOutcomeExpiredJwtBeforeAppend
 	resp_body, ra_err := io.ReadAll(resp.Body)
+	uploadDone.Store(true)
 	if ra_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)}
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, refusedBeforeAppend: refusedBeforeAppend, expiredBeforeAppend: expiredBeforeAppend, stalled: reqCtx.Err() != nil && ctx.Err() == nil, err: fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)}
 	}
 
 	unmarshal_err := json.Unmarshal(resp_body, &ret)
 	if unmarshal_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		glog.ErrorfCtx(ctx, "unmarshal %s: %v", option.UploadUrl, string(resp_body))
-		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)}
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, refusedBeforeAppend: refusedBeforeAppend, expiredBeforeAppend: expiredBeforeAppend, err: fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)}
+	}
+	if (resp.StatusCode == http.StatusConflict || expiredBeforeAppend) && ret.Error == "" {
+		ret.Error = http.StatusText(resp.StatusCode)
 	}
 	if ret.Error != "" {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)}
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, refusedBeforeAppend: refusedBeforeAppend, expiredBeforeAppend: expiredBeforeAppend, err: fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)}
+	}
+	if bps := uploadObservedBps(bodySize, movedIn); bps > 0 {
+		uploader.fastUploadHosts.Store(req.URL.Host, fastHostMark{at: time.Now().UnixNano(), bps: bps})
 	}
 	ret.ETag = etag
-	ret.ContentMd5 = resp.Header.Get("Content-MD5")
+	ret.ContentMd5 = uploadedContentMd5(resp, option)
 	return &ret, nil
 }
 
@@ -600,4 +802,79 @@ func getEtag(r *http.Response) (etag string) {
 		etag = etag[1 : len(etag)-1]
 	}
 	return
+}
+
+// uploadRateMinBytes is the smallest body whose measured rate can mark a
+// host: smaller uploads are dominated by round-trip and commit overhead, not
+// wire speed.
+const uploadRateMinBytes = int64(256 << 10)
+
+var (
+	// uploadStallSlowFactor is how far below the host's last observed rate an
+	// upload may run before its conn is presumed wedged: at 8, a host that
+	// just moved a body at 8MiB/s tolerates down to 1MiB/s.
+	uploadStallSlowFactor = int64(8)
+	uploadStallMinWait    = 10 * time.Second
+	fastUploadHostMemory  = time.Minute
+)
+
+// fastHostMark remembers the wire rate of a host's last sizeable upload, so a
+// later upload running far below it blames the pooled conn rather than the
+// link — no fixed rate fits every deployment's links.
+type fastHostMark struct {
+	at  int64 // UnixNano
+	bps int64 // wire bytes/sec measured elapsed-to-response
+}
+
+// uploadStallTimeout is the most an upload may take on a conn whose host last
+// proved bps: the time the body needs at an uploadStallSlowFactor of that
+// rate, with a floor so a fast conn is not raced on small bodies.
+func uploadStallTimeout(size, bps int64) time.Duration {
+	if bps > 0 {
+		if d := time.Duration(size/bps) * time.Duration(uploadStallSlowFactor) * time.Second; d > uploadStallMinWait {
+			return d
+		}
+	}
+	return uploadStallMinWait
+}
+
+// uploadObservedBps returns the wire rate a completed upload proved on its
+// host, or 0 when the body was too small to measure. Elapsed-to-response can
+// only understate the link's speed, which keeps the mark — and the stall
+// budget derived from it — conservative.
+func uploadObservedBps(size int64, elapsed time.Duration) int64 {
+	if size < uploadRateMinBytes || elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(size) / elapsed.Seconds())
+}
+
+// watchdogBody records when the transport drains the request body: before that
+// a stuck send blames the conn; after it the wait is the server's.
+type watchdogBody struct {
+	io.ReadCloser
+	sentAt *atomic.Int64
+}
+
+func (b *watchdogBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.sentAt.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (b *watchdogBody) Close() error {
+	b.sentAt.Store(time.Now().UnixNano())
+	return b.ReadCloser.Close()
+}
+
+// uploadedContentMd5 is the Content-MD5 the volume server checked and echoed.
+// Under fips140=only the digest is not an MD5 and is never sent, so the
+// caller's own digest stands.
+func uploadedContentMd5(resp *http.Response, option *UploadOption) string {
+	if fips140.Enforced() {
+		return option.Md5
+	}
+	return resp.Header.Get("Content-MD5")
 }

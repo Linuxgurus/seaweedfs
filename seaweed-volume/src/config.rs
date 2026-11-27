@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::ffi::OsString;
 use std::net::UdpSocket;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::security::tls::TlsPolicy;
 
@@ -138,7 +138,8 @@ pub struct Cli {
     #[arg(long = "concurrentUploadLimitMB", default_value_t = 0)]
     pub concurrent_upload_limit_mb: u32,
 
-    /// Limit total concurrent download size in MB, 0 means unlimited.
+    /// Limit total concurrent download size in MB, 0 means unlimited; reads over
+    /// the limit are sent to a replica unless readMode is local.
     #[arg(long = "concurrentDownloadLimitMB", default_value_t = 0)]
     pub concurrent_download_limit_mb: u32,
 
@@ -233,6 +234,25 @@ pub struct Cli {
     #[arg(long = "volume.allowUntrustedRemoteEndpoints", default_value_t = false)]
     pub allow_untrusted_remote_endpoints: bool,
 
+    /// Minimum bytes an fsync batch gathers before a drained queue flushes
+    /// without waiting.
+    #[arg(long = "fsyncMinBatchBytes", default_value_t = 1024 * 1024)]
+    pub fsync_min_batch_bytes: u64,
+
+    /// Minimum requests an fsync batch gathers before a drained queue flushes
+    /// without waiting.
+    #[arg(long = "fsyncMinBatchRequests", default_value_t = 128)]
+    pub fsync_min_batch_requests: usize,
+
+    /// How long a below-minimum fsync batch waits for more requests once the
+    /// queue drains; 0 flushes immediately.
+    #[arg(
+        long = "fsyncBatchWait",
+        default_value = "500us",
+        value_parser = parse_go_duration
+    )]
+    pub fsync_batch_wait: std::time::Duration,
+
     /// A file of command line options, each line in optionName=optionValue format.
     #[arg(long = "options", default_value = "")]
     pub options: String,
@@ -286,6 +306,8 @@ pub struct VolumeServerConfig {
     pub ui_enabled: bool,
     pub jwt_signing_key: Vec<u8>,
     pub jwt_signing_expires_seconds: i64,
+    pub jwt_previous_signing_key: Vec<u8>,
+    pub jwt_previous_read_signing_key: Vec<u8>,
     pub jwt_read_signing_key: Vec<u8>,
     pub jwt_read_signing_expires_seconds: i64,
     pub https_cert_file: String,
@@ -308,6 +330,14 @@ pub struct VolumeServerConfig {
     /// If true, FetchAndWriteNeedle skips remote S3 endpoint validation
     /// (allows loopback / link-local / metadata hosts).
     pub allow_untrusted_remote_endpoints: bool,
+    /// Minimum bytes an fsync batch gathers before a drained queue flushes
+    /// without waiting.
+    pub fsync_min_batch_bytes: u64,
+    /// Minimum requests an fsync batch gathers before a drained queue flushes
+    /// without waiting.
+    pub fsync_min_batch_requests: usize,
+    /// How long a below-minimum fsync batch waits for stragglers.
+    pub fsync_batch_wait: std::time::Duration,
 }
 
 pub use crate::storage::needle_map::NeedleMapKind;
@@ -323,6 +353,25 @@ pub enum ReadMode {
 pub enum MinFreeSpace {
     Percent(f64),
     Bytes(u64),
+}
+
+impl MinFreeSpace {
+    /// Mirrors Go's MinFreeSpace.IsLow.
+    pub fn is_low(&self, free_bytes: u64, total_bytes: u64) -> bool {
+        match self {
+            MinFreeSpace::Percent(pct) => free_bytes as f64 / total_bytes as f64 * 100.0 < *pct,
+            MinFreeSpace::Bytes(min) => free_bytes < *min,
+        }
+    }
+
+    /// Free bytes above the floor; mirrors Go's MinFreeSpace.AvailableSpace.
+    pub fn available_space(&self, free_bytes: u64, total_bytes: u64) -> u64 {
+        let floor = match self {
+            MinFreeSpace::Percent(pct) => (total_bytes as f64 * pct / 100.0) as u64,
+            MinFreeSpace::Bytes(min) => *min,
+        };
+        free_bytes.saturating_sub(floor)
+    }
 }
 
 /// Convert single-dash long options to double-dash for clap compatibility.
@@ -938,6 +987,9 @@ fn resolve_config_with_env(cli: Cli, env: EnvLookup<'_>) -> VolumeServerConfig {
         concurrent_download_limit: cli.concurrent_download_limit_mb as i64 * 1024 * 1024,
         inflight_upload_data_timeout: cli.inflight_upload_data_timeout,
         inflight_download_data_timeout: cli.inflight_download_data_timeout,
+        fsync_min_batch_bytes: cli.fsync_min_batch_bytes,
+        fsync_min_batch_requests: cli.fsync_min_batch_requests,
+        fsync_batch_wait: cli.fsync_batch_wait,
         has_slow_read: cli.has_slow_read,
         read_buffer_size_mb: cli.read_buffer_size_mb,
         ldb_timeout: cli.ldb_timeout,
@@ -949,6 +1001,8 @@ fn resolve_config_with_env(cli: Cli, env: EnvLookup<'_>) -> VolumeServerConfig {
         ui_enabled: sec.jwt_signing_key.is_empty() || sec.access_ui,
         jwt_signing_key: sec.jwt_signing_key,
         jwt_signing_expires_seconds: sec.jwt_signing_expires,
+        jwt_previous_signing_key: sec.jwt_previous_signing_key,
+        jwt_previous_read_signing_key: sec.jwt_previous_read_signing_key,
         jwt_read_signing_key: sec.jwt_read_signing_key,
         jwt_read_signing_expires_seconds: sec.jwt_read_signing_expires,
         https_cert_file: sec.https_cert_file,
@@ -980,6 +1034,8 @@ fn default_volume_dir() -> String {
 pub struct SecurityConfig {
     pub jwt_signing_key: Vec<u8>,
     pub jwt_signing_expires: i64,
+    pub jwt_previous_signing_key: Vec<u8>,
+    pub jwt_previous_read_signing_key: Vec<u8>,
     pub jwt_read_signing_key: Vec<u8>,
     pub jwt_read_signing_expires: i64,
     pub https_cert_file: String,
@@ -998,11 +1054,11 @@ pub struct SecurityConfig {
     pub grpc_volume_allowed_common_names: Vec<String>,
     pub tls_policy: TlsPolicy,
     pub access_ui: bool,
+    /// The file was read; otherwise only defaults and WEED_ overrides are set.
+    pub file_read: bool,
     /// IPs from [guard] white_list in security.toml
     pub guard_white_list: Vec<String>,
 }
-
-const SECURITY_CONFIG_FILE_NAME: &str = "security.toml";
 
 /// Parse a security.toml file to extract JWT signing keys and TLS configuration.
 /// Format:
@@ -1128,10 +1184,11 @@ fn parse_security_config_with_env(path: &str, env: EnvLookup<'_>) -> SecurityCon
 
         if let Some((key, value)) = trimmed.split_once('=') {
             let key = key.trim();
-            let value = value.trim().trim_matches('"');
+            let value: &str = &toml_value_text(value);
             match section {
                 Section::JwtSigningRead => match key {
                     "key" => cfg.jwt_read_signing_key = value.as_bytes().to_vec(),
+                    "previous_key" => cfg.jwt_previous_read_signing_key = value.as_bytes().to_vec(),
                     "expires_after_seconds" => {
                         cfg.jwt_read_signing_expires = value.parse().unwrap_or(60)
                     }
@@ -1139,6 +1196,7 @@ fn parse_security_config_with_env(path: &str, env: EnvLookup<'_>) -> SecurityCon
                 },
                 Section::JwtSigning => match key {
                     "key" => cfg.jwt_signing_key = value.as_bytes().to_vec(),
+                    "previous_key" => cfg.jwt_previous_signing_key = value.as_bytes().to_vec(),
                     "expires_after_seconds" => {
                         cfg.jwt_signing_expires = value.parse().unwrap_or(10)
                     }
@@ -1214,8 +1272,23 @@ fn parse_security_config_with_env(path: &str, env: EnvLookup<'_>) -> SecurityCon
     // prefix WEED_, uppercase, replace . with _).
     // e.g. WEED_JWT_SIGNING_KEY overrides [jwt.signing] key
     apply_env_overrides(&mut cfg, env);
+    cfg.file_read = true;
 
     cfg
+}
+
+/// Reads the right-hand side of `key = value` the way TOML (and so Go) does:
+/// escapes decoded, literal strings kept as written, a trailing comment
+/// dropped. Text TOML rejects keeps the plain quote trimming.
+fn toml_value_text(raw: &str) -> String {
+    match format!("v = {raw}").parse::<toml::Table>() {
+        Ok(mut table) => match table.remove("v") {
+            Some(toml::Value::String(text)) => text,
+            Some(other) => other.to_string(),
+            None => String::new(),
+        },
+        Err(_) => raw.trim().trim_matches('"').to_string(),
+    }
 }
 
 fn resolve_security_config_path(path: &str, env: EnvLookup<'_>) -> Option<PathBuf> {
@@ -1223,39 +1296,10 @@ fn resolve_security_config_path(path: &str, env: EnvLookup<'_>) -> Option<PathBu
         return Some(PathBuf::from(path));
     }
 
-    default_security_config_candidates(
+    seaweed_common::security_config::find(
         std::env::current_dir().ok().as_deref(),
-        home_dir_from_env(env).as_deref(),
+        seaweed_common::security_config::home_dir(env).as_deref(),
     )
-    .into_iter()
-    .find(|candidate| candidate.is_file())
-}
-
-fn default_security_config_candidates(
-    current_dir: Option<&Path>,
-    home_dir: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = current_dir {
-        candidates.push(dir.join(SECURITY_CONFIG_FILE_NAME));
-    }
-    if let Some(home) = home_dir {
-        candidates.push(home.join(".seaweedfs").join(SECURITY_CONFIG_FILE_NAME));
-    }
-    candidates.push(PathBuf::from("/usr/local/etc/seaweedfs").join(SECURITY_CONFIG_FILE_NAME));
-    candidates.push(PathBuf::from("/etc/seaweedfs").join(SECURITY_CONFIG_FILE_NAME));
-    candidates
-}
-
-fn home_dir_from_env(env: EnvLookup<'_>) -> Option<PathBuf> {
-    env("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env("USERPROFILE")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
 }
 
 /// Apply WEED_ environment variable overrides to a SecurityConfig.
@@ -1266,6 +1310,12 @@ fn apply_env_overrides(cfg: &mut SecurityConfig, env: EnvLookup<'_>) {
     }
     if let Some(v) = env_string(env, "WEED_JWT_SIGNING_EXPIRES_AFTER_SECONDS") {
         cfg.jwt_signing_expires = v.parse().unwrap_or(cfg.jwt_signing_expires);
+    }
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_PREVIOUS_KEY") {
+        cfg.jwt_previous_signing_key = v.into_bytes();
+    }
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_READ_PREVIOUS_KEY") {
+        cfg.jwt_previous_read_signing_key = v.into_bytes();
     }
     if let Some(v) = env_string(env, "WEED_JWT_SIGNING_READ_KEY") {
         cfg.jwt_read_signing_key = v.into_bytes();
@@ -1354,7 +1404,9 @@ fn detect_host_address() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seaweed_common::security_config::SECURITY_CONFIG_FILE_NAME;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// Serialises the tests that move the process working directory against
@@ -1849,6 +1901,34 @@ ui = true
     }
 
     #[test]
+    fn test_parse_security_config_reads_toml_strings() {
+        for (encoded, expected) in [
+            (r#""plain""#, "plain"),
+            (r#""key\n""#, "key\n"),
+            (r#""quote\"slash\\tab\t""#, "quote\"slash\\tab\t"),
+            (r#""key""#, "key"),
+            ("'literal\\key'", "literal\\key"),
+            (r#""key" # comment"#, "key"),
+            (r#""YWJj==""#, "YWJj=="),
+            ("unquoted", "unquoted"),
+        ] {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                tmp.path(),
+                format!(
+                    "[jwt.signing]\nkey = {encoded}\n\n[jwt.signing.read]\nkey = {encoded}\n\
+                     expires_after_seconds = 30 # seconds\n"
+                ),
+            )
+            .unwrap();
+            let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+            assert_eq!(cfg.jwt_signing_key, expected.as_bytes(), "{encoded}");
+            assert_eq!(cfg.jwt_read_signing_key, expected.as_bytes(), "{encoded}");
+            assert_eq!(cfg.jwt_read_signing_expires, 30, "{encoded}");
+        }
+    }
+
+    #[test]
     fn test_parse_security_config_discovers_current_directory_default() {
         let _guard = process_state_lock();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2111,6 +2191,50 @@ cipher_suites = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
         let _guard = process_state_lock();
         let env = fake_env(&[("WEED_JWT_SIGNING_KEY", "env-secret")]);
         let cfg = parse_security_config_with_env("", &env);
+        assert_eq!(cfg.jwt_signing_key, b"env-secret");
+    }
+
+    #[test]
+    fn test_previous_signing_keys_from_file_and_env() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[jwt.signing]
+key = "write-new"
+previous_key = "write-old"
+[jwt.signing.read]
+key = "read-new"
+previous_key = "read-old"
+"#,
+        )
+        .unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let cfg = parse_security_config_with_env(path, &fake_env(&[]));
+        assert_eq!(cfg.jwt_previous_signing_key, b"write-old");
+        assert_eq!(cfg.jwt_previous_read_signing_key, b"read-old");
+
+        let env = fake_env(&[
+            ("WEED_JWT_SIGNING_PREVIOUS_KEY", "env-write-old"),
+            ("WEED_JWT_SIGNING_READ_PREVIOUS_KEY", "env-read-old"),
+        ]);
+        let cfg = parse_security_config_with_env(path, &env);
+        assert_eq!(cfg.jwt_previous_signing_key, b"env-write-old");
+        assert_eq!(cfg.jwt_previous_read_signing_key, b"env-read-old");
+    }
+
+    #[test]
+    fn test_security_config_file_read() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "[jwt.signing]\nkey = \"secret\"\n").unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        assert!(parse_security_config_with_env(&path, &fake_env(&[])).file_read);
+
+        drop(tmp);
+        let env = fake_env(&[("WEED_JWT_SIGNING_KEY", "env-secret")]);
+        let cfg = parse_security_config_with_env(&path, &env);
+        assert!(!cfg.file_read);
         assert_eq!(cfg.jwt_signing_key, b"env-secret");
     }
 

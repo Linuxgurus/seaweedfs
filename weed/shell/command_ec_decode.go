@@ -60,7 +60,7 @@ func (c *commandEcDecode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	checkMinFreeSpace := decodeCommand.Bool("checkMinFreeSpace", true, "check min free space when selecting the decode target")
 	batchSize := decodeCommand.Int("batchSize", DefaultEcBatchSize, "decode up to this many volumes per topology refresh (0 = one snapshot for all volumes)")
 	if err = decodeCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 	if *batchSize < 0 {
 		return fmt.Errorf("-batchSize must be >= 0")
@@ -113,7 +113,9 @@ func (c *commandEcDecode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 			fmt.Printf("ec decode batch %d/%d: %v\n", i+1, len(batches), batch)
 		}
 		for _, vid := range batch {
-			if err = ec.DoEcDecode(env, topologyInfo, *collection, vid, diskType, *checkMinFreeSpace, diskUsageState); err != nil {
+			// -collection is a selector, not the volume's collection
+			volumeCollection, _ := ec.FindEcVolumeCollection(topologyInfo, vid)
+			if err = ec.DoEcDecode(env, topologyInfo, volumeCollection, vid, diskType, *checkMinFreeSpace, diskUsageState); err != nil {
 				return err
 			}
 		}

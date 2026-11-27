@@ -6,14 +6,15 @@ on:
       - 'weed/s3api/**'
       - 'test/s3/delete/**'
       - 'test/s3/distributed_lock/**'
+      - 'test/s3/sqlite_cbs/**'
       - 'test/s3/versioning/**'
       - 'test/volume_server/framework/**'
       - 'docker/compose/s3.json'
       - '.github/workflows/s3-mutation-regression-tests.yml'
 
 concurrency:
-  group: ${{ github.head_ref }}/s3-mutation-regression-tests
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ permissions:
 jobs:
   s3-versioning-regressions:
     name: S3 Versioning Regression Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
 
     steps:
@@ -32,6 +33,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
 
       - name: Run S3 versioning regression tests
         timeout-minutes: 20
@@ -74,7 +76,7 @@ jobs:
 
   s3-delete-regressions:
     name: S3 Delete Regression Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -85,6 +87,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
 
       - name: Run S3 delete regression tests
         timeout-minutes: 15
@@ -112,7 +115,7 @@ jobs:
 
   s3-distributed-lock-regressions:
     name: S3 Distributed Lock Regression Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -123,6 +126,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
 
       - name: Build SeaweedFS
         run: |
@@ -145,4 +149,42 @@ jobs:
         with:
           name: s3-distributed-lock-regression-logs
           path: test/s3/distributed_lock/tmp/seaweedfs_s3_distributed_lock_*
+          retention-days: 3
+
+  s3-sqlite-cbs-regressions:
+    name: S3 SQLite CBS Regression Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Build SeaweedFS
+        run: |
+          go build -o weed/weed -buildvcs=false ./weed
+
+      - name: Run sqlite cbs regressions
+        timeout-minutes: 15
+        env:
+          TMPDIR: ${{ github.workspace }}/test/s3/sqlite_cbs/tmp
+          S3_SQLITE_CBS_KEEP_LOGS: "1"
+          WEED_BINARY: ${{ github.workspace }}/weed/weed
+        run: |
+          set -x
+          mkdir -p "$TMPDIR"
+          go test -v -count=1 -timeout=12m ./test/s3/sqlite_cbs
+
+      - name: Upload sqlite cbs logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-sqlite-cbs-regression-logs
+          path: test/s3/sqlite_cbs/tmp/seaweedfs_sqlite_cbs_*
           retention-days: 3

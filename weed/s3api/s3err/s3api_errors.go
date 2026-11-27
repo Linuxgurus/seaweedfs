@@ -68,6 +68,7 @@ const (
 	ErrInvalidMaxKeys
 	ErrInvalidMaxBuckets
 	ErrInvalidContinuationToken
+	ErrInvalidEncodingMethod
 	ErrInvalidMaxUploads
 	ErrInvalidMaxParts
 	ErrInvalidMaxDeleteObjects
@@ -178,6 +179,7 @@ const (
 	ErrAccessControlListNotSupported
 	// The request's snapshot changed during a conditional write; clients can retry.
 	ErrConditionalRequestConflict
+	ErrNoSuchPublicAccessBlockConfiguration
 )
 
 // Error message constants for checksum validation
@@ -254,6 +256,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidContinuationToken: {
 		Code:           "InvalidArgument",
 		Description:    "The continuation token provided is incorrect",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidEncodingMethod: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid Encoding Method specified in Request",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidMaxParts: {
@@ -763,6 +770,12 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrNoSuchConfiguration: {
 		Code:           "NoSuchConfiguration",
 		Description:    "The specified configuration does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+
+	ErrNoSuchPublicAccessBlockConfiguration: {
+		Code:           "NoSuchPublicAccessBlockConfiguration",
+		Description:    "The public access block configuration was not found",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 }

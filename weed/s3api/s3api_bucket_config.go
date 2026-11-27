@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 )
 
 // BucketConfig represents cached bucket configuration. Only fields parsed
@@ -34,6 +36,7 @@ type BucketConfig struct {
 	Name             string
 	Versioning       string // "Enabled", "Suspended", or ""
 	Ownership        string
+	OwnershipDeleted bool // DeleteBucketOwnershipControls removed it; GET reports none
 	ACL              []byte
 	Owner            string
 	IdentityId       string // identity that created the bucket
@@ -56,8 +59,10 @@ type BucketConfig struct {
 	LifecycleTransitionMinSize string
 	Tags                       map[string]string              // parsed from entry content
 	Encryption                 *s3_pb.EncryptionConfiguration // parsed from entry content
+	DeclaredEncryption         *s3_pb.EncryptionConfiguration // declared by a table bucket's record
 	KMSKeyCache                *BucketKMSCache                // Per-bucket KMS key cache for SSE-KMS operations
 	LastModified               time.Time
+	PublicAccessBlock          *PublicAccessBlockConfiguration
 }
 
 // BucketKMSCache represents per-bucket KMS key caching for SSE-KMS operations
@@ -428,10 +433,12 @@ func (s3a *S3ApiServer) newBucketConfigFromEntry(bucket string, entry *filer_pb.
 		if ownership, exists := entry.Extended[s3_constants.ExtOwnershipKey]; exists {
 			config.Ownership = string(ownership)
 		}
+		config.OwnershipDeleted = len(entry.Extended[s3_constants.ExtOwnershipDeletedKey]) > 0
+		config.PublicAccessBlock = storedPublicAccessBlock(bucket, entry.Extended)
 		if acl, exists := entry.Extended[s3_constants.ExtAmzAclKey]; exists {
 			config.ACL = acl
 			// Parse ACL once and cache public-read status.
-			config.IsPublicRead = parseAndCachePublicReadStatus(acl)
+			config.IsPublicRead = !config.PublicAccessBlock.ignoresPublicAcls() && parseAndCachePublicReadStatus(acl)
 		}
 		config.Owner = bucketOwnerAccountId(s3a.iam, entry)
 		if identityId, exists := entry.Extended[s3_constants.AmzIdentityId]; exists {
@@ -441,6 +448,9 @@ func (s3a *S3ApiServer) newBucketConfigFromEntry(bucket string, entry *filer_pb.
 			config.ObjectLockConfig = objectLockConfig
 		}
 		config.BucketPolicy = loadBucketPolicyFromExtended(entry, bucket)
+		if algorithm := s3tables.DeclaredBucketEncryption(entry); algorithm != "" {
+			config.DeclaredEncryption = &s3_pb.EncryptionConfiguration{SseAlgorithm: algorithm}
+		}
 
 		if lifecycleXML, exists := entry.Extended[bucketLifecycleConfigurationXMLKey]; exists && len(lifecycleXML) > 0 {
 			config.LifecycleXML = lifecycleXML
@@ -504,6 +514,8 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 	}
 
 	config := s3a.newBucketConfigFromEntry(bucket, entry)
+	loadedPAB := config.PublicAccessBlock
+	loadedPABXML, _ := xml.Marshal(loadedPAB)
 
 	// Apply update function
 	if err := updateFn(config); err != nil {
@@ -519,6 +531,10 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 	if err := applyBucketConfigToExtended(config, newExt); err != nil {
 		glog.Errorf("updateBucketConfig: failed to serialize config for bucket %s: %v", bucket, err)
 		return s3err.ErrInternalError
+	}
+	// Keep the stored bytes, readable or not, unless updateFn changed the setting.
+	if loadedPAB != nil && config.PublicAccessBlock == loadedPAB && bytes.Equal(newExt[s3_constants.ExtPublicAccessBlockKey], loadedPABXML) {
+		newExt[s3_constants.ExtPublicAccessBlockKey] = oldExt[s3_constants.ExtPublicAccessBlockKey]
 	}
 
 	// Patch only the changed/removed extended keys, leaving Entry.content
@@ -537,6 +553,9 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 	}
 	glog.V(3).Infof("updateBucketConfig: patching %d/%d extended keys for bucket %s", len(set), len(del), bucket)
 	if err := s3a.patchBucketEntry(bucket, &filer_pb.ObjectMutation{SetExtended: set, DeleteExtended: del}); err != nil {
+		if isBucketNotFoundErr(err) {
+			return s3err.ErrNoSuchBucket
+		}
 		glog.Errorf("updateBucketConfig: failed to patch bucket entry for %s: %v", bucket, err)
 		return s3err.ErrInternalError
 	}
@@ -563,6 +582,20 @@ func applyBucketConfigToExtended(config *BucketConfig, ext map[string][]byte) er
 	}
 	setOrDelete(s3_constants.ExtVersioningKey, []byte(config.Versioning))
 	setOrDelete(s3_constants.ExtOwnershipKey, []byte(config.Ownership))
+	if config.OwnershipDeleted && config.Ownership == "" {
+		ext[s3_constants.ExtOwnershipDeletedKey] = []byte("true")
+	} else {
+		delete(ext, s3_constants.ExtOwnershipDeletedKey)
+	}
+	if config.PublicAccessBlock != nil {
+		data, err := xml.Marshal(config.PublicAccessBlock)
+		if err != nil {
+			return err
+		}
+		ext[s3_constants.ExtPublicAccessBlockKey] = data
+	} else {
+		delete(ext, s3_constants.ExtPublicAccessBlockKey)
+	}
 	setOrDelete(s3_constants.ExtAmzAclKey, config.ACL)
 	setOrDelete(s3_constants.ExtAmzOwnerKey, []byte(config.Owner))
 	setOrDelete(bucketLifecycleConfigurationXMLKey, config.LifecycleXML)
@@ -582,24 +615,32 @@ func applyBucketConfigToExtended(config *BucketConfig, ext map[string][]byte) er
 // patchBucketEntry applies a field-level PATCH_EXTENDED mutation to the bucket's
 // entry via ObjectTransaction, routed to the bucket's owner filer so its per-path
 // lock serializes concurrent config writes cluster-wide rather than racing
-// whole-entry rewrites. A nil/empty mutation is a no-op.
+// whole-entry rewrites. The transaction requires the bucket entry to exist: a
+// PATCH on an absent entry is otherwise a silent no-op, which would acknowledge
+// a config write that never landed. An empty mutation still ships so the
+// existence condition runs on its own.
 func (s3a *S3ApiServer) patchBucketEntry(bucket string, m *filer_pb.ObjectMutation) error {
-	if m == nil || (len(m.SetExtended) == 0 && len(m.DeleteExtended) == 0 && !m.SetContent) {
-		return nil
-	}
 	dir := s3a.option.BucketsPath
 	bucketPath := dir + "/" + bucket
-	m.Type = filer_pb.ObjectMutation_PATCH_EXTENDED
-	m.Directory = dir
-	m.Name = bucket
 	req := &filer_pb.ObjectTransactionRequest{
 		LockKey:   bucketPath,
 		RouteKey:  objectWriteRouteKeyPrefix + bucketPath,
-		Mutations: []*filer_pb.ObjectMutation{m},
+		Condition: clause(filer_pb.WriteCondition_IF_EXISTS),
+	}
+	if m != nil && (len(m.SetExtended) > 0 || len(m.DeleteExtended) > 0 || m.SetContent) {
+		m.Type = filer_pb.ObjectMutation_PATCH_EXTENDED
+		m.Directory = dir
+		m.Name = bucket
+		req.Mutations = []*filer_pb.ObjectMutation{m}
 	}
 	respErr := func(resp *filer_pb.ObjectTransactionResponse, err error) error {
 		if err != nil {
 			return err
+		}
+		// The only precondition on this request is the bucket's own existence,
+		// so a failed condition is a missing bucket, not a policy violation.
+		if resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED || resp.Error == "precondition failed" {
+			return fmt.Errorf("patch bucket %s: %w", bucket, filer_pb.ErrNotFound)
 		}
 		if resp.Error != "" {
 			return fmt.Errorf("patch bucket %s: %s", bucket, resp.Error)
@@ -726,6 +767,9 @@ func (s3a *S3ApiServer) getBucketOwnership(bucket string) (string, s3err.ErrorCo
 	if errCode != s3err.ErrNone {
 		return "", errCode
 	}
+	if config.OwnershipDeleted && config.Ownership == "" {
+		return "", s3err.OwnershipControlsNotFoundError
+	}
 
 	return s3_constants.EffectiveOwnership(config.Ownership), s3err.ErrNone
 }
@@ -755,6 +799,9 @@ func (s3a *S3ApiServer) updateCORSConfiguration(bucket string, corsConfig *cors.
 	// already invalidates the cache synchronously after successful update
 	err := s3a.UpdateBucketCORS(bucket, corsConfig)
 	if err != nil {
+		if isBucketNotFoundErr(err) {
+			return s3err.ErrNoSuchBucket
+		}
 		glog.Errorf("updateCORSConfiguration: failed to update CORS config for bucket %s: %v", bucket, err)
 		return s3err.ErrInternalError
 	}
@@ -769,6 +816,9 @@ func (s3a *S3ApiServer) removeCORSConfiguration(bucket string) s3err.ErrorCode {
 	// already invalidates the cache synchronously after successful update
 	err := s3a.ClearBucketCORS(bucket)
 	if err != nil {
+		if isBucketNotFoundErr(err) {
+			return s3err.ErrNoSuchBucket
+		}
 		glog.Errorf("removeCORSConfiguration: failed to remove CORS config for bucket %s: %v", bucket, err)
 		return s3err.ErrInternalError
 	}
@@ -843,10 +893,10 @@ func corsConfigFromProto(protoConfig *s3_pb.CORSConfiguration) *cors.CORSConfigu
 	}
 }
 
-// getMaxAgeSecondsValue safely extracts max age seconds value
+// getMaxAgeSecondsValue safely extracts max age seconds value; -1 stores an unset MaxAgeSeconds
 func getMaxAgeSecondsValue(maxAge *int) int {
 	if maxAge == nil {
-		return 0
+		return -1
 	}
 	return *maxAge
 }

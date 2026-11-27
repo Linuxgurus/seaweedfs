@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -140,6 +141,8 @@ type ambiguousPutFiler struct {
 	respError     string
 	lookupErr     error
 	lookupFailKey string
+	updateErr     error
+	updateFailKey string
 	nextKey       uint64
 	// supersede, once, swaps in a concurrent write's entry as the routed
 	// transaction commits — issue 11631's client retry. txnNoApply models a
@@ -152,7 +155,8 @@ type ambiguousPutFiler struct {
 	// beforeLookup runs inside LookupDirectoryEntry, letting a test delete a
 	// just-committed entry before recovery reads it.
 	beforeCreate func()
-	beforeLookup func()
+	beforeLookup func(key string)
+	beforeAssign func()
 	stores       int
 	conds        []*filer_pb.WriteCondition
 }
@@ -160,6 +164,9 @@ type ambiguousPutFiler struct {
 func (f *ambiguousPutFiler) AssignVolume(context.Context, *filer_pb.AssignVolumeRequest) (*filer_pb.AssignVolumeResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.beforeAssign != nil {
+		f.beforeAssign()
+	}
 	f.nextKey++
 	return &filer_pb.AssignVolumeResponse{
 		FileId: fmt.Sprintf("3,%016x%08x", f.nextKey, uint32(f.nextKey)),
@@ -225,11 +232,18 @@ func putConditionSatisfied(cond *filer_pb.WriteCondition, current *filer_pb.Entr
 	return true
 }
 
+func (f *ambiguousPutFiler) DeleteEntry(_ context.Context, req *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, req.Directory+"/"+req.Name)
+	return &filer_pb.DeleteEntryResponse{}, nil
+}
+
 func (f *ambiguousPutFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.beforeLookup != nil {
-		f.beforeLookup()
+		f.beforeLookup(req.Directory + "/" + req.Name)
 	}
 	if f.lookupErr != nil && req.Directory+"/"+req.Name == f.lookupFailKey {
 		return nil, f.lookupErr
@@ -272,32 +286,33 @@ func (f *ambiguousPutFiler) ObjectTransaction(_ context.Context, req *filer_pb.O
 			}
 		}
 	}
-	for _, clause := range req.GetCondition().GetClauses() {
-		var md5Hex string
-		if current != nil && current.Attributes != nil {
-			md5Hex = fmt.Sprintf("%x", current.Attributes.Md5)
-		}
-		ok := true
-		switch clause.Kind {
-		case filer_pb.WriteCondition_IF_NOT_EXISTS:
-			ok = current == nil
-		case filer_pb.WriteCondition_IF_EXISTS:
-			ok = current != nil
-		case filer_pb.WriteCondition_IF_ETAG_MATCH:
-			ok = current != nil && slices.Contains(clause.Etags, md5Hex)
-		case filer_pb.WriteCondition_IF_ETAG_NOT_MATCH:
-			ok = current == nil || !slices.Contains(clause.Etags, md5Hex)
-		}
-		if !ok {
-			return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED}, nil
-		}
+	if !txnConditionHolds(req.GetCondition(), current) {
+		return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED}, nil
 	}
 	if !f.txnNoApply {
-		for _, m := range req.Mutations {
-			if m.Type == filer_pb.ObjectMutation_PUT {
+		for i, m := range req.Mutations {
+			if m.Condition != nil {
+				target := m.ConditionKey
+				if target == "" && m.Type == filer_pb.ObjectMutation_PUT {
+					target = m.Directory + "/" + m.Entry.Name
+				} else if target == "" {
+					target = m.Directory + "/" + m.Name
+				}
+				if !txnConditionHolds(m.Condition, f.entries[target]) {
+					failed := int32(i)
+					return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED, FailedMutation: &failed}, nil
+				}
+			}
+			switch m.Type {
+			case filer_pb.ObjectMutation_PUT:
 				entry := proto.Clone(m.Entry).(*filer_pb.Entry)
 				filer_pb.BeforeEntrySerialization(entry.Chunks)
 				f.entries[m.Directory+"/"+m.Entry.Name] = entry
+				f.ensureParents(m.Directory)
+			case filer_pb.ObjectMutation_DELETE:
+				delete(f.entries, m.Directory+"/"+m.Name)
+			case filer_pb.ObjectMutation_RECOMPUTE_LATEST:
+				f.applyRecomputeLatest(m)
 			}
 		}
 	}
@@ -306,6 +321,144 @@ func (f *ambiguousPutFiler) ObjectTransaction(_ context.Context, req *filer_pb.O
 		f.supersede = nil
 	}
 	return &filer_pb.ObjectTransactionResponse{}, f.txnErr
+}
+
+// txnConditionHolds evaluates an ObjectTransaction condition, request-level or
+// on one mutation, the way the filer does for the kinds the tests send.
+func txnConditionHolds(cond *filer_pb.WriteCondition, current *filer_pb.Entry) bool {
+	for _, clause := range cond.GetClauses() {
+		var etag string
+		if v := current.GetExtended()[s3_constants.ExtETagKey]; len(v) > 0 {
+			etag = strings.Trim(string(v), `"`)
+		} else if current != nil && current.Attributes != nil {
+			etag = fmt.Sprintf("%x", current.Attributes.Md5)
+		}
+		ok := true
+		switch clause.Kind {
+		case filer_pb.WriteCondition_IF_NOT_EXISTS:
+			ok = current == nil
+		case filer_pb.WriteCondition_IF_EXISTS:
+			ok = current != nil
+		case filer_pb.WriteCondition_IF_ETAG_MATCH:
+			ok = current != nil && etagCandidateMatch(clause.Etags, etag)
+		case filer_pb.WriteCondition_IF_ETAG_NOT_MATCH:
+			ok = current == nil || !etagCandidateMatch(clause.Etags, etag)
+		case filer_pb.WriteCondition_IF_ENTRY_EQUAL:
+			ok = (current == nil) == (clause.ExpectedEntry == nil) && (current == nil || proto.Equal(current, clause.ExpectedEntry))
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// etagCandidateMatch mirrors the filer's strong-comparison canonicalization:
+// quotes are stripped on both sides and a weak (W/) candidate never matches.
+func etagCandidateMatch(candidates []string, stored string) bool {
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if strings.HasPrefix(c, "W/") || strings.HasPrefix(c, "w/") {
+			continue
+		}
+		if strings.Trim(c, `"`) == stored {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureParents mirrors the filer's InsertEntry, which creates missing parent
+// directory entries for a stored object (e.g. the .versions dir a version file
+// lands under).
+func (f *ambiguousPutFiler) ensureParents(dir string) {
+	for dir != "" && dir != "/" && dir != "." {
+		parent, name := path.Dir(dir), path.Base(dir)
+		if _, exists := f.entries[parent+"/"+name]; exists {
+			return
+		}
+		f.entries[parent+"/"+name] = &filer_pb.Entry{Name: name, IsDirectory: true}
+		dir = parent
+	}
+}
+
+// applyRecomputeLatest mirrors FilerServer.applyRecomputeLatest: re-derive the
+// pointer entry from the children of recompute.scan_dir, copying the mapped
+// extended keys off the chosen child.
+func (f *ambiguousPutFiler) applyRecomputeLatest(m *filer_pb.ObjectMutation) {
+	rc := m.Recompute
+	pointerKey := m.Directory + "/" + m.Name
+	pointer := f.entries[pointerKey]
+	if pointer == nil {
+		return
+	}
+	if pointer.Extended == nil {
+		pointer.Extended = make(map[string][]byte)
+	}
+	priorName := string(pointer.Extended[rc.NameToKey])
+
+	var names []string
+	for key := range f.entries {
+		if path.Dir(key) == rc.ScanDir {
+			names = append(names, path.Base(key))
+		}
+	}
+	slices.Sort(names)
+	var chosen *filer_pb.Entry
+	pick := func(i int) *filer_pb.Entry {
+		return f.entries[rc.ScanDir+"/"+names[i]]
+	}
+	if rc.Descending {
+		for i := len(names) - 1; i >= 0; i-- {
+			if names[i] != rc.ExcludeName {
+				chosen = pick(i)
+				break
+			}
+		}
+	} else {
+		for i := 0; i < len(names); i++ {
+			if names[i] != rc.ExcludeName {
+				chosen = pick(i)
+				break
+			}
+		}
+	}
+
+	if chosen == nil {
+		for pointerKey := range rc.CopyExtended {
+			delete(pointer.Extended, pointerKey)
+		}
+		for _, k := range []string{rc.NameToKey, rc.SizeToKey, rc.MtimeToKey} {
+			if k != "" {
+				delete(pointer.Extended, k)
+			}
+		}
+	} else {
+		for pointerKey, sourceKey := range rc.CopyExtended {
+			if v, ok := chosen.Extended[sourceKey]; ok {
+				pointer.Extended[pointerKey] = v
+			} else {
+				delete(pointer.Extended, pointerKey)
+			}
+		}
+		if rc.NameToKey != "" {
+			pointer.Extended[rc.NameToKey] = []byte(chosen.Name)
+		}
+		if rc.SizeToKey != "" && chosen.Attributes != nil {
+			pointer.Extended[rc.SizeToKey] = []byte(strconv.FormatUint(chosen.Attributes.FileSize, 10))
+		}
+		if rc.MtimeToKey != "" && chosen.Attributes != nil {
+			pointer.Extended[rc.MtimeToKey] = []byte(strconv.FormatInt(chosen.Attributes.Mtime, 10))
+		}
+		if rc.DemoteKey != "" && priorName != "" && priorName != chosen.Name {
+			if prior := f.entries[rc.ScanDir+"/"+priorName]; prior != nil {
+				if prior.Extended == nil {
+					prior.Extended = make(map[string][]byte)
+				}
+				prior.Extended[rc.DemoteKey] = rc.DemoteValue
+			}
+		}
+	}
 }
 
 func (f *ambiguousPutFiler) ListEntries(req *filer_pb.ListEntriesRequest, stream filer_pb.SeaweedFiler_ListEntriesServer) error {
@@ -332,7 +485,11 @@ func (f *ambiguousPutFiler) ListEntries(req *filer_pb.ListEntriesRequest, stream
 func (f *ambiguousPutFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.entries[req.Directory+"/"+req.Entry.Name] = proto.Clone(req.Entry).(*filer_pb.Entry)
+	key := req.Directory + "/" + req.Entry.Name
+	if f.updateErr != nil && key == f.updateFailKey {
+		return nil, f.updateErr
+	}
+	f.entries[key] = proto.Clone(req.Entry).(*filer_pb.Entry)
 	return &filer_pb.UpdateEntryResponse{}, nil
 }
 
@@ -784,7 +941,9 @@ func TestPutToFilerRoutedRecoveryCreateStaysOnOwner(t *testing.T) {
 }
 
 // When the owner cannot accept the recovery create, the outcome is uncertain —
-// not a failover create under a different filer's lock.
+// not a failover create under a different filer's lock. The owner may have
+// forwarded the conditional create to a filer the gateway cannot look up, so
+// the chunks stay.
 func TestPutToFilerRoutedRecoveryOwnerDownIsUncertain(t *testing.T) {
 	volume := startFakeVolumeServer(t)
 	filerA := &ambiguousPutFiler{
@@ -812,8 +971,8 @@ func TestPutToFilerRoutedRecoveryOwnerDownIsUncertain(t *testing.T) {
 	if filerB.stores != 0 || len(filerB.conds) != 0 {
 		t.Fatalf("the conditional create failed over to another filer: stores=%d conds=%d", filerB.stores, len(filerB.conds))
 	}
-	if deleted := volume.deleted(); len(deleted) == 0 {
-		t.Fatal("orphaned chunks were not deleted")
+	if deleted := volume.deleted(); len(deleted) != 0 {
+		t.Fatalf("chunks of a recovery create that may have committed were deleted: %v", deleted)
 	}
 }
 
@@ -828,7 +987,7 @@ func TestPutToFilerRoutedAmbiguousEmptyPutAbsentNotRecreated(t *testing.T) {
 		txnErr:  status.Error(codes.Unavailable, "response lost after commit"),
 	}
 	// The committed empty object is deleted before recovery looks it up.
-	filerImpl.beforeLookup = func() {
+	filerImpl.beforeLookup = func(string) {
 		delete(filerImpl.entries, "/buckets/b/o")
 	}
 	filerAddr := startFakeFiler(t, filerImpl)
@@ -944,6 +1103,36 @@ func TestFetchChunkDataDecryptsVolumeCipher(t *testing.T) {
 	plain.Close()
 	if !bytes.Equal(got, plaintext[5:9]) {
 		t.Fatalf("ranged plain read = %q, want %q", got, plaintext[5:9])
+	}
+}
+
+// A truncated chunk keeps its longer needle; full-chunk reads stop at the
+// chunk's recorded size.
+func TestFetchChunkDataStopsAtChunkSize(t *testing.T) {
+	volume := startFakeVolumeServer(t)
+	filerImpl := &ambiguousPutFiler{volume: volume, entries: map[string]*filer_pb.Entry{}}
+	s3a := newPutTestServer(t, startFakeFiler(t, filerImpl))
+
+	stored := bytes.Repeat([]byte("t"), 300)
+	fid := "3,01637037d6"
+	volume.mu.Lock()
+	volume.stored[fid] = stored
+	volume.mu.Unlock()
+
+	view := &filer.ChunkView{FileId: fid, ViewSize: 100, ChunkSize: 100}
+	for name, fetch := range map[string]func(context.Context, *filer.ChunkView) (io.ReadCloser, error){
+		"full": s3a.fetchFullChunk,
+		"view": s3a.fetchChunkViewData,
+	} {
+		r, err := fetch(context.Background(), view)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(r)
+		r.Close()
+		if !bytes.Equal(got, stored[:100]) {
+			t.Fatalf("%s chunk read returned %d bytes, want 100", name, len(got))
+		}
 	}
 }
 
@@ -1120,5 +1309,14 @@ func TestSuspendedPutIfMatchRecheckedWhenAltKeyIgnored(t *testing.T) {
 	}
 	if len(conditionKeys) != 2 || conditionKeys[0] != "" || conditionKeys[1] != "/buckets/b/k.versions/v_v1" {
 		t.Fatalf("condition keys = %v, want [\"\" \"/buckets/b/k.versions/v_v1\"]", conditionKeys)
+	}
+}
+
+func TestTxnConditionHoldsQuotedStoredETag(t *testing.T) {
+	stored := &filer_pb.Entry{Extended: map[string][]byte{s3_constants.ExtETagKey: []byte(`"abc123"`)}}
+	match := &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"abc123"`}}}}
+	notMatch := &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ETAG_NOT_MATCH, Etags: []string{"abc123"}}}}
+	if !txnConditionHolds(match, stored) || txnConditionHolds(notMatch, stored) {
+		t.Fatalf("a quoted stored ETag must compare equal to the same ETag")
 	}
 }

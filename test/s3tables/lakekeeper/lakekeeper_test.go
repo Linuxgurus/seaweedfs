@@ -205,7 +205,7 @@ func (env *TestEnvironment) StartSeaweedFS(t *testing.T) {
 	env.weedCancel = cancel
 
 	// Start weed mini with both S3 config (standard IAM) and IAM config (advanced IAM/STS)
-	cmd := exec.CommandContext(ctx, env.weedBinary, "-v", "4", "mini",
+	miniArgs := append([]string{"-v", "4", "mini",
 		"-master.port", fmt.Sprintf("%d", env.masterPort),
 		"-master.port.grpc", fmt.Sprintf("%d", env.masterGrpcPort),
 		"-volume.port", fmt.Sprintf("%d", env.volumePort),
@@ -220,7 +220,9 @@ func (env *TestEnvironment) StartSeaweedFS(t *testing.T) {
 		"-ip", env.bindIP,
 		"-ip.bind", "0.0.0.0",
 		"-dir", env.dataDir,
-	)
+	}, testutil.MiniAdminArgs(testutil.MustFreeMiniPort(t, "admin"))...)
+	miniArgs = append(miniArgs, "-webdav=false", "-s3.port.lance=0", "-s3.port.iceberg=0")
+	cmd := exec.CommandContext(ctx, env.weedBinary, miniArgs...)
 	cmd.Dir = env.dataDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -382,7 +384,15 @@ func runLakekeeperTableBucketRepro(t *testing.T, env *TestEnvironment) {
 		t.Fatalf("Create S3 client failed: %v", err)
 	}
 
-	objectKey := fmt.Sprintf("%s/%s/data/part-%d.parquet", namespaceName, tableName, time.Now().UnixNano())
+	table, err := client.GetTable(ctx, bucketARN, namespaceName, tableName)
+	if err != nil {
+		t.Fatalf("GetTable failed: %v", err)
+	}
+	tableDir := strings.TrimPrefix(table.WarehouseLocation, "s3://"+bucketName+"/")
+	if tableDir == "" || tableDir == table.WarehouseLocation {
+		t.Fatalf("unexpected warehouse location %q", table.WarehouseLocation)
+	}
+	objectKey := fmt.Sprintf("%s/data/part-%d.parquet", tableDir, time.Now().UnixNano())
 	createResp, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(objectKey),
@@ -552,6 +562,18 @@ func (c *s3TablesClient) CreateTable(ctx context.Context, bucketARN, namespace, 
 	}
 	path := "/tables/" + url.PathEscape(bucketARN) + "/" + url.PathEscape(namespace)
 	return c.doRequest(ctx, "CreateTable", http.MethodPut, path, req, nil)
+}
+
+func (c *s3TablesClient) GetTable(ctx context.Context, bucketARN, namespace, name string) (*s3tables.GetTableResponse, error) {
+	query := url.Values{}
+	query.Set("tableBucketARN", bucketARN)
+	query.Set("namespace", namespace)
+	query.Set("name", name)
+	var resp s3tables.GetTableResponse
+	if err := c.doRequest(ctx, "GetTable", http.MethodGet, "/get-table?"+query.Encode(), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 func (c *s3TablesClient) DeleteTable(ctx context.Context, bucketARN, namespace, name string) error {

@@ -3,12 +3,14 @@ package s3tables
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
@@ -137,12 +139,63 @@ func ValidateMetadataLocation(metadataLocation, bucketName, namespace string) er
 	if metadataLocation == "" {
 		return nil
 	}
-	bucket, tablePath, err := parseS3Location(metadataLocation)
+	tablePath, err := validateMetadataLocationShape(metadataLocation, bucketName)
 	if err != nil {
 		return err
 	}
+	if !strings.HasPrefix(tablePath, namespace+"/") {
+		return fmt.Errorf("metadata location must be within namespace %s", namespace)
+	}
+	return nil
+}
+
+// validateUpdatedMetadataLocation is ValidateMetadataLocation for an update of
+// the record at recordPath, whose stored metadata is current. A location
+// outside the record's namespace is accepted only when it keeps the record in
+// the directory it already holds its files under and rootShared reports that
+// no other record keeps its files there: a rename across namespaces moves the
+// record and leaves its files behind, while a record written before locations
+// were confined and claimed may share another table's directory. A location
+// that moves the record to another directory must lie inside the namespace,
+// and the update still refuses one another record claims.
+func validateUpdatedMetadataLocation(metadataLocation, bucketName, namespace, recordPath string, current *tableMetadataInternal, rootShared func(root string) (bool, error)) error {
+	err := ValidateMetadataLocation(metadataLocation, bucketName, namespace)
+	if err == nil {
+		return nil
+	}
+	// A malformed location is refused whatever directory it cleans up to.
+	if _, shapeErr := validateMetadataLocationShape(metadataLocation, bucketName); shapeErr != nil {
+		return shapeErr
+	}
+	// The directory the location itself names, with no fallback: CatalogRecordRoot
+	// replaces a directory outside the bucket subtree (s3://bucket/metadata/...)
+	// with the record's warehouse or name path, which would match the current
+	// root and let a location no load can resolve skip the namespace check.
+	dir := TableDataDirFromMetadataLocation(metadataLocation)
+	if !strings.HasPrefix(dir, GetTableBucketPath(bucketName)+"/") || dir != current.root(bucketName, recordPath) {
+		return err
+	}
+	if shared, sharedErr := rootShared(dir); sharedErr != nil {
+		return sharedErr
+	} else if shared {
+		return err
+	}
+	return nil
+}
+
+// validateMetadataLocationShape checks what a metadata location must satisfy
+// whatever record it belongs to: it names the table bucket and a table path of
+// safe segments. It returns that path. An empty location passes.
+func validateMetadataLocationShape(metadataLocation, bucketName string) (string, error) {
+	if metadataLocation == "" {
+		return "", nil
+	}
+	bucket, tablePath, err := parseS3Location(metadataLocation)
+	if err != nil {
+		return "", err
+	}
 	if bucket != bucketName {
-		return fmt.Errorf("metadata location must be within bucket %s", bucketName)
+		return "", fmt.Errorf("metadata location must be within bucket %s", bucketName)
 	}
 	hasSegment := false
 	for _, segment := range strings.Split(tablePath, "/") {
@@ -150,17 +203,69 @@ func ValidateMetadataLocation(metadataLocation, bucketName, namespace string) er
 			continue
 		}
 		if segment == "." || segment == ".." || strings.ContainsAny(segment, "\\\x00") {
-			return fmt.Errorf("invalid metadata location path")
+			return "", fmt.Errorf("invalid metadata location path")
 		}
 		hasSegment = true
 	}
 	if !hasSegment {
-		return fmt.Errorf("metadata location must include a table path")
+		return "", fmt.Errorf("metadata location must include a table path")
 	}
-	if !strings.HasPrefix(tablePath, namespace+"/") {
-		return fmt.Errorf("metadata location must be within namespace %s", namespace)
+	return tablePath, nil
+}
+
+// ValidateEncryptionConfiguration admits only the AES256 declaration, under the
+// caller's wire name — s3tables sends sseAlgorithm, s3vectors sends sseType. A
+// caller-chosen key is never read back by the storage path, so recording one
+// would claim protection the data does not get.
+func ValidateEncryptionConfiguration(cfg map[string]interface{}, sseField string) error {
+	if len(cfg) == 0 {
+		return nil
+	}
+	otherField := "sseAlgorithm"
+	if sseField == otherField {
+		otherField = "sseType"
+	}
+	if _, ok := cfg[otherField]; ok {
+		return fmt.Errorf("encryptionConfiguration field is %s", sseField)
+	}
+	value, ok := cfg[sseField].(string)
+	if !ok {
+		return fmt.Errorf("encryptionConfiguration requires %s", sseField)
+	}
+	if value != "AES256" {
+		return fmt.Errorf("unsupported %s %q", sseField, value)
+	}
+	if _, ok := cfg["kmsKeyArn"]; ok {
+		return fmt.Errorf("kmsKeyArn is not supported")
 	}
 	return nil
+}
+
+// DeclaredBucketEncryption returns the sseAlgorithm a table bucket's record
+// declares, for the S3 write path to apply, when the bucket's format leaves
+// every file to its clients. An ICEBERG bucket gets "": its catalog reads the
+// manifests clients upload straight from the filer, past S3 decryption.
+func DeclaredBucketEncryption(entry *filer_pb.Entry) string {
+	if !IsTableBucketEntry(entry) {
+		return ""
+	}
+	var metadata tableBucketMetadata
+	if json.Unmarshal(entry.Extended[ExtendedKeyMetadata], &metadata) != nil {
+		return ""
+	}
+	return DeclaredEncryption(metadata.Format, metadata.EncryptionConfiguration)
+}
+
+// DeclaredEncryption is DeclaredBucketEncryption for a bucket record already
+// read: its format and encryption configuration.
+func DeclaredEncryption(format string, encryption map[string]interface{}) string {
+	if !IsCatalogOnlyFormat(format) {
+		return ""
+	}
+	if algorithm, _ := encryption["sseAlgorithm"].(string); algorithm == "AES256" {
+		return algorithm
+	}
+	return ""
 }
 
 func parseS3Location(location string) (bucket, tablePath string, err error) {
@@ -196,10 +301,11 @@ func GetTableObjectBucketPath(bucketName string) string {
 // Metadata structures
 
 type tableBucketMetadata struct {
-	Name           string    `json:"name"`
-	CreatedAt      time.Time `json:"createdAt"`
-	OwnerAccountID string    `json:"ownerAccountId"`
-	Format         string    `json:"format,omitempty"`
+	Name                    string                 `json:"name"`
+	CreatedAt               time.Time              `json:"createdAt"`
+	OwnerAccountID          string                 `json:"ownerAccountId"`
+	Format                  string                 `json:"format,omitempty"`
+	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
 }
 
 // namespaceMetadata stores metadata for a namespace
@@ -222,6 +328,9 @@ type tableMetadataInternal struct {
 	MetadataVersion  int            `json:"metadataVersion"`
 	MetadataLocation string         `json:"metadataLocation,omitempty"`
 	Metadata         *TableMetadata `json:"metadata,omitempty"`
+	// WarehouseLocation is where a table created without a location keeps
+	// its files. Records written before it existed keep them under their path.
+	WarehouseLocation string `json:"warehouseLocation,omitempty"`
 }
 
 // IsTableBucketEntry returns true when the entry is marked as a table bucket.
@@ -372,17 +481,25 @@ func arnPartitionForRegion(region string) string {
 
 // ValidateTags validates tags for S3 Tables.
 func ValidateTags(tags map[string]string) error {
-	if len(tags) > 10 {
-		return fmt.Errorf("validate tags: %d tags more than 10", len(tags))
+	return ValidateTagsWithLimit(tags, 10)
+}
+
+// ValidateTagsWithLimit validates a tag set that may hold up to maxTags tags.
+func ValidateTagsWithLimit(tags map[string]string, maxTags int) error {
+	if len(tags) > maxTags {
+		return fmt.Errorf("validate tags: %d tags more than %d", len(tags), maxTags)
 	}
 	for k, v := range tags {
-		if len(k) > 128 {
+		if len(k) == 0 {
+			return fmt.Errorf("validate tags: empty tag key")
+		}
+		if utf8.RuneCountInString(k) > 128 {
 			return fmt.Errorf("validate tags: tag key longer than 128")
 		}
 		if !tagPattern.MatchString(k) {
 			return fmt.Errorf("validate tags key %s error, incorrect key", k)
 		}
-		if len(v) > 256 {
+		if utf8.RuneCountInString(v) > 256 {
 			return fmt.Errorf("validate tags: tag value longer than 256")
 		}
 		if !tagPattern.MatchString(v) {

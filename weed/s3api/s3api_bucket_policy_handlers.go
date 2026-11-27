@@ -15,6 +15,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // Bucket policy metadata key for storing policies in filer.
@@ -114,8 +117,14 @@ func (s3a *S3ApiServer) PutBucketPolicyHandler(w http.ResponseWriter, r *http.Re
 
 	// Store bucket policy
 	if err := s3a.setBucketPolicy(bucket, &policyDoc); err != nil {
-		glog.Errorf("Failed to store bucket policy for %s: %v", bucket, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		if errors.Is(err, ErrBucketNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else if errors.Is(err, errPublicPolicyBlocked) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		} else {
+			glog.Errorf("Failed to store bucket policy for %s: %v", bucket, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		}
 		return
 	}
 
@@ -129,7 +138,7 @@ func (s3a *S3ApiServer) PutBucketPolicyHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Update IAM integration with new bucket policy
-	if s3a.iam.iamIntegration != nil {
+	if s3a.iam != nil && s3a.iam.iamIntegration != nil {
 		if err := s3a.updateBucketPolicyInIAM(bucket, &policyDoc); err != nil {
 			glog.Errorf("Failed to update IAM with bucket policy: %v", err)
 			// Don't fail the request, but log the warning
@@ -171,8 +180,12 @@ func (s3a *S3ApiServer) DeleteBucketPolicyHandler(w http.ResponseWriter, r *http
 
 	// Delete bucket policy
 	if err := s3a.deleteBucketPolicy(bucket); err != nil {
-		glog.Errorf("Failed to delete bucket policy for %s: %v", bucket, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		if errors.Is(err, ErrBucketNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else {
+			glog.Errorf("Failed to delete bucket policy for %s: %v", bucket, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		}
 		return
 	}
 
@@ -186,7 +199,7 @@ func (s3a *S3ApiServer) DeleteBucketPolicyHandler(w http.ResponseWriter, r *http
 	}
 
 	// Update IAM integration to remove bucket policy
-	if s3a.iam.iamIntegration != nil {
+	if s3a.iam != nil && s3a.iam.iamIntegration != nil {
 		if err := s3a.removeBucketPolicyFromIAM(bucket); err != nil {
 			glog.Errorf("Failed to remove bucket policy from IAM: %v", err)
 			// Don't fail the request, but log the warning
@@ -198,23 +211,20 @@ func (s3a *S3ApiServer) DeleteBucketPolicyHandler(w http.ResponseWriter, r *http
 
 // Helper functions for bucket policy storage and retrieval
 
-// getBucketPolicy retrieves a bucket policy from filer metadata
 // getBucketPolicy retrieves the bucket policy from filer
 func (s3a *S3ApiServer) getBucketPolicy(bucket string) (*policy_engine.PolicyDocument, error) {
 
 	var policyDoc policy_engine.PolicyDocument
 	err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
+		resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: s3a.bucketRoot(bucket),
 			Name:      bucket,
 		})
 		if err != nil {
-			// Return sentinel error for bucket not found
-			return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
-		}
-
-		if resp.Entry == nil {
-			return ErrPolicyNotFound
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
+			}
+			return err
 		}
 
 		policyJSON, exists := resp.Entry.Extended[BUCKET_POLICY_METADATA_KEY]
@@ -245,30 +255,52 @@ func (s3a *S3ApiServer) setBucketPolicy(bucket string, policyDoc *policy_engine.
 	}
 
 	return s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		// First, get the current entry to preserve other attributes
-		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
-			Directory: s3a.bucketRoot(bucket),
-			Name:      bucket,
-		})
-		if err != nil {
-			return fmt.Errorf("bucket not found: %v", err)
+		for attempt := 1; ; attempt++ {
+			// First, get the current entry to preserve other attributes
+			resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
+				Directory: s3a.bucketRoot(bucket),
+				Name:      bucket,
+			})
+			if err != nil {
+				if errors.Is(err, filer_pb.ErrNotFound) {
+					return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
+				}
+				return err
+			}
+
+			entry := resp.Entry
+			if storedPublicAccessBlock(bucket, entry.Extended).blocksPublicPolicy() && isPublicPolicy(policyDoc) {
+				return errPublicPolicyBlocked
+			}
+			// The write lands only over the entry checked above, so neither a public
+			// access block nor any other bucket setting written since is lost.
+			expected := proto.Clone(entry).(*filer_pb.Entry)
+			if entry.Extended == nil {
+				entry.Extended = make(map[string][]byte)
+			}
+
+			// Set the bucket policy metadata
+			entry.Extended[BUCKET_POLICY_METADATA_KEY] = policyJSON
+
+			// Update the entry with new metadata; a bucket deleted between the
+			// lookup above and this write surfaces as a filer NotFound.
+			_, err = client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
+				Directory: s3a.bucketRoot(bucket),
+				Entry:     entry,
+				Condition: &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
+					Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+					ExpectedEntry: expected,
+				}}},
+			})
+			if status.Code(err) == codes.FailedPrecondition && attempt < 3 {
+				continue
+			}
+			if err != nil && isBucketNotFoundErr(err) {
+				return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
+			}
+
+			return err
 		}
-
-		entry := resp.Entry
-		if entry.Extended == nil {
-			entry.Extended = make(map[string][]byte)
-		}
-
-		// Set the bucket policy metadata
-		entry.Extended[BUCKET_POLICY_METADATA_KEY] = policyJSON
-
-		// Update the entry with new metadata
-		_, err = client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
-			Directory: s3a.bucketRoot(bucket),
-			Entry:     entry,
-		})
-
-		return err
 	})
 }
 
@@ -276,12 +308,15 @@ func (s3a *S3ApiServer) setBucketPolicy(bucket string, policyDoc *policy_engine.
 func (s3a *S3ApiServer) deleteBucketPolicy(bucket string) error {
 	return s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		// Get the current entry
-		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
+		resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: s3a.bucketRoot(bucket),
 			Name:      bucket,
 		})
 		if err != nil {
-			return fmt.Errorf("bucket not found: %v", err)
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
+			}
+			return err
 		}
 
 		entry := resp.Entry
@@ -292,11 +327,15 @@ func (s3a *S3ApiServer) deleteBucketPolicy(bucket string) error {
 		// Remove the bucket policy metadata
 		delete(entry.Extended, BUCKET_POLICY_METADATA_KEY)
 
-		// Update the entry
+		// Update the entry; a bucket deleted between the lookup above and this
+		// write surfaces as a filer NotFound.
 		_, err = client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
 			Directory: s3a.bucketRoot(bucket),
 			Entry:     entry,
 		})
+		if err != nil && isBucketNotFoundErr(err) {
+			return fmt.Errorf("%w: %v", ErrBucketNotFound, err)
+		}
 
 		return err
 	})
@@ -460,13 +499,61 @@ func bucketPolicyMirrorOps(oldEntry, newEntry *filer_pb.Entry) (removeName, upda
 // GetPublicAccessBlockHandler Retrieves the PublicAccessBlock configuration for an S3 bucket
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetPublicAccessBlock.html
 func (s3a *S3ApiServer) GetPublicAccessBlockHandler(w http.ResponseWriter, r *http.Request) {
-	s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	config, errCode := s3a.getBucketConfig(bucket)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	if config.PublicAccessBlock == nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchPublicAccessBlockConfiguration)
+		return
+	}
+	response := *config.PublicAccessBlock
+	response.XMLNS = s3_constants.S3Namespace
+	writeSuccessResponseXML(w, r, response)
 }
 
+// PutPublicAccessBlockHandler https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutPublicAccessBlock.html
 func (s3a *S3ApiServer) PutPublicAccessBlockHandler(w http.ResponseWriter, r *http.Request) {
-	s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	if err := s3a.checkBucket(r, bucket); err != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, err)
+		return
+	}
+	body, err := readRequestBody(r, maxPublicAccessBlockConfigurationSize)
+	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrEntityTooLarge)
+			return
+		}
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		return
+	}
+	config, err := parsePublicAccessBlock(body)
+	if err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrMalformedXML)
+		return
+	}
+	if errCode := s3a.updateBucketConfig(bucket, func(bucketConfig *BucketConfig) error {
+		bucketConfig.PublicAccessBlock = config
+		return nil
+	}); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	writeSuccessResponseEmpty(w, r)
 }
 
+// DeletePublicAccessBlockHandler https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeletePublicAccessBlock.html
 func (s3a *S3ApiServer) DeletePublicAccessBlockHandler(w http.ResponseWriter, r *http.Request) {
-	s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	if errCode := s3a.updateBucketConfig(bucket, func(bucketConfig *BucketConfig) error {
+		bucketConfig.PublicAccessBlock = nil
+		return nil
+	}); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)
 }

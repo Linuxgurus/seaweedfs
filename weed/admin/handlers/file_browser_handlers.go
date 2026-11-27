@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,9 +53,14 @@ func NewFileBrowserHandlers(adminServer *dash.AdminServer) *FileBrowserHandlers 
 // ShowFileBrowser renders the file browser page
 func (h *FileBrowserHandlers) ShowFileBrowser(w http.ResponseWriter, r *http.Request) {
 	// Get path from query parameter, default to root
-	path := defaultQuery(r.URL.Query().Get("path"), "/")
-	// Normalize Windows-style paths for consistency
-	path = util.CleanWindowsPath(path)
+	dirPath := path.Clean(util.CleanWindowsPath(defaultQuery(r.URL.Query().Get("path"), "/")))
+	if !strings.HasPrefix(dirPath, "/") {
+		dirPath = "/" + dirPath
+	}
+	if dash.IsReadOnlyRole(dash.RoleFromContext(r.Context())) && restrictedBrowserPath(dirPath) {
+		http.Redirect(w, r, dash.P(r.Context(), "/admin?error=Insufficient permissions"), http.StatusSeeOther)
+		return
+	}
 
 	// Get pagination parameters
 	lastFileName := r.URL.Query().Get("lastFileName")
@@ -66,7 +74,7 @@ func (h *FileBrowserHandlers) ShowFileBrowser(w http.ResponseWriter, r *http.Req
 	}
 
 	// Get file browser data with cursor-based pagination
-	browserData, err := h.adminServer.GetFileBrowser(path, "", lastFileName, pageSize)
+	browserData, err := h.adminServer.GetFileBrowser(dirPath, "", lastFileName, pageSize)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "Failed to get file browser data: "+err.Error())
 		return
@@ -214,7 +222,7 @@ func (h *FileBrowserHandlers) CreateFolder(w http.ResponseWriter, r *http.Reques
 
 	// Create folder via filer
 	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-		_, err := client.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{
+		err := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 			Directory: path.Dir(fullPath),
 			Entry: &filer_pb.Entry{
 				Name:        path.Base(fullPath),
@@ -241,17 +249,28 @@ func (h *FileBrowserHandlers) CreateFolder(w http.ResponseWriter, r *http.Reques
 
 // UploadFile handles file upload requests
 func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request) {
-	// Get the current path
+	maxSize := h.adminServer.GetUploadMaxSize()
+	if maxSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxSize+uploadFormOverhead)
+	}
+
+	// Parts beyond 32MB spill to temporary files instead of memory
+	err := r.ParseMultipartForm(32 << 20)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, uploadTooLargeMessage(maxSize))
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to parse multipart form: "+err.Error())
+		return
+	}
+	// The router hands us a copy of the request, so the server cannot remove the spooled parts itself
+	defer r.MultipartForm.RemoveAll()
+
 	currentPath := r.FormValue("path")
 	if currentPath == "" {
 		currentPath = "/"
-	}
-
-	// Parse multipart form
-	err := r.ParseMultipartForm(1 << 30) // 1GB max memory for large file uploads
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "Failed to parse multipart form: "+err.Error())
-		return
 	}
 
 	// Get uploaded files (supports multiple files)
@@ -260,14 +279,37 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "No files uploaded")
 		return
 	}
+	if maxSize > 0 {
+		var totalSize int64
+		for _, fileHeader := range files {
+			totalSize += fileHeader.Size
+		}
+		if totalSize > maxSize {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, uploadTooLargeMessage(maxSize))
+			return
+		}
+	}
+
+	// A folder upload names each file by its path inside the folder; the multipart
+	// file name keeps only the base name.
+	var relativePaths []string
+	if v, ok := r.MultipartForm.Value["relativePaths"]; ok {
+		if len(v) != 1 || json.Unmarshal([]byte(v[0]), &relativePaths) != nil || len(relativePaths) != len(files) {
+			writeJSONError(w, http.StatusBadRequest, "relativePaths must list one path per uploaded file")
+			return
+		}
+	}
 
 	var uploadResults []map[string]interface{}
 	var failedUploads []string
 
 	// Process each uploaded file
-	for _, fileHeader := range files {
+	for i, fileHeader := range files {
 		// Validate file name
 		fileName := fileHeader.Filename
+		if relativePaths != nil {
+			fileName = relativePaths[i]
+		}
 		if fileName == "" {
 			failedUploads = append(failedUploads, "invalid filename")
 			continue
@@ -275,6 +317,10 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 
 		// Normalize Windows-style backslashes to forward slashes
 		fileName = util.CleanWindowsPath(fileName)
+		if relativePaths != nil && !isRelativeUploadPath(fileName) {
+			failedUploads = append(failedUploads, fmt.Sprintf("%s: invalid relative path", fileName))
+			continue
+		}
 
 		// Create full path for the file using path.Join for URL path semantics
 		// path.Join handles double slashes and is not OS-specific like filepath.Join
@@ -321,6 +367,25 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// isRelativeUploadPath reports whether name stays inside the upload directory.
+func isRelativeUploadPath(name string) bool {
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// uploadFormOverhead allows for the multipart headers and the path field on
+// top of the file bytes an upload may carry. Go's multipart parser accepts at
+// most 1000 parts, whose headers take about half of this.
+const uploadFormOverhead = 1 << 20
+
+func uploadTooLargeMessage(maxSize int64) string {
+	return fmt.Sprintf("Total upload size exceeds the %d MB limit", maxSize>>20)
+}
+
 // uploadFileToFiler uploads a file to the cluster via filer gRPC + volume
 // HTTP. This works whether or not the filer is running with -disableHttp=true,
 // since the bytes never traverse the filer's HTTP listener. The multipart
@@ -356,12 +421,44 @@ func (h *FileBrowserHandlers) validateAndCleanFilePath(filePath string) (string,
 		cleanPath = "/" + cleanPath
 	}
 
-	// Prevent path traversal attacks
-	if strings.Contains(cleanPath, "..") {
+	// Reject parent-directory components; names merely containing ".." are valid
+	if slices.Contains(strings.Split(cleanPath, "/"), "..") {
 		return "", fmt.Errorf("path traversal not allowed")
 	}
 
 	return cleanPath, nil
+}
+
+// restrictedBrowserPath reports whether a cleaned path lies inside the filer's
+// /etc tree, which holds the credential store and cluster configuration.
+func restrictedBrowserPath(cleanPath string) bool {
+	return cleanPath == strings.TrimSuffix(filer.DirectoryEtcRoot, "/") ||
+		strings.HasPrefix(cleanPath, filer.DirectoryEtcRoot)
+}
+
+// cleanReadPath validates the request's path parameter; read-only sessions are
+// denied the /etc tree so the file browser cannot serve stored credentials.
+func (h *FileBrowserHandlers) cleanReadPath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	cleanPath, err := h.validateAndCleanFilePath(r.URL.Query().Get("path"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return "", false
+	}
+	if dash.IsReadOnlyRole(dash.RoleFromContext(r.Context())) && restrictedBrowserPath(cleanPath) {
+		writeJSONError(w, http.StatusForbidden, "Access to this path requires admin access")
+		return "", false
+	}
+	return cleanPath, true
+}
+
+// exportExcludedPrefixes lists the subtrees a metadata export skips; read-only
+// sessions also lose /etc so stored credentials stay out of the dump.
+func exportExcludedPrefixes(r *http.Request) []string {
+	prefixes := []string{filer.SystemLogDir}
+	if dash.IsReadOnlyRole(dash.RoleFromContext(r.Context())) {
+		prefixes = append(prefixes, strings.TrimSuffix(filer.DirectoryEtcRoot, "/"))
+	}
+	return prefixes
 }
 
 // fetchFileContent fetches file content via the filer gRPC service. It is
@@ -377,9 +474,8 @@ func (h *FileBrowserHandlers) fetchFileContent(filePath string, timeout time.Dur
 // gRPC service, so the admin file browser keeps working even when the filer
 // is started with -disableHttp=true.
 func (h *FileBrowserHandlers) DownloadFile(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		writeJSONError(w, http.StatusBadRequest, "File path is required")
+	filePath, ok := h.cleanReadPath(w, r)
+	if !ok {
 		return
 	}
 	inline := r.URL.Query().Get("inline") == "true"
@@ -419,9 +515,8 @@ func (t *responseWriteTracker) Write(p []byte) (int, error) {
 
 // ViewFile handles file viewing requests (for text files, images, etc.)
 func (h *FileBrowserHandlers) ViewFile(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		writeJSONError(w, http.StatusBadRequest, "File path is required")
+	filePath, ok := h.cleanReadPath(w, r)
+	if !ok {
 		return
 	}
 
@@ -524,9 +619,8 @@ func (h *FileBrowserHandlers) ViewFile(w http.ResponseWriter, r *http.Request) {
 
 // GetFileProperties handles file properties requests
 func (h *FileBrowserHandlers) GetFileProperties(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		writeJSONError(w, http.StatusBadRequest, "File path is required")
+	filePath, ok := h.cleanReadPath(w, r)
+	if !ok {
 		return
 	}
 
@@ -630,23 +724,18 @@ func (h *FileBrowserHandlers) GetFileProperties(w http.ResponseWriter, r *http.R
 // FullEntry stream — the format weed shell fs.meta.load reads. Directories are
 // walked recursively via the filer BFS metadata stream.
 func (h *FileBrowserHandlers) ExportMetadata(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		writeJSONError(w, http.StatusBadRequest, "File path is required")
+	cleanPath, ok := h.cleanReadPath(w, r)
+	if !ok {
 		return
 	}
-	cleanPath, err := h.validateAndCleanFilePath(filePath)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	excludedPrefixes := exportExcludedPrefixes(r)
 
 	tracker := &responseWriteTracker{ResponseWriter: w}
 
-	err = h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		stream, err := client.TraverseBfsMetadata(r.Context(), &filer_pb.TraverseBfsMetadataRequest{
 			Directory:        cleanPath,
-			ExcludedPrefixes: []string{filer.SystemLogDir},
+			ExcludedPrefixes: excludedPrefixes,
 		})
 		if err != nil {
 			return err

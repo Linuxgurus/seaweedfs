@@ -3,21 +3,24 @@ package leveldb
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"crypto/md5"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/syndtr/goleveldb/leveldb"
-	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/storage"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/leveldb_handle"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
@@ -33,9 +36,10 @@ func init() {
 
 type LevelDB3Store struct {
 	dir      string
-	dbs      map[string]*leveldb.DB
+	dbs      map[string]*leveldb_handle.DB
 	dbsLock  sync.RWMutex
 	ReadOnly bool
+	emptyDB  *leveldb_handle.DB
 
 	blockCacheSizeMB      int
 	writeBufferSizeMB     int
@@ -104,8 +108,14 @@ func (store *LevelDB3Store) buildOptions(name string) *opt.Options {
 func (store *LevelDB3Store) initialize(dir string) (err error) {
 	glog.Infof("filer store leveldb3 dir: %s", dir)
 	os.MkdirAll(dir, 0755)
-	if err := weed_util.TestFolderWritable(dir); err != nil {
-		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+	if weed_util.IsReadOnlyMount(dir) {
+		glog.V(0).Infof("filer store %s is on a read-only filesystem, opening it read-only", dir)
+		store.ReadOnly = true
+	}
+	if !store.ReadOnly {
+		if err := weed_util.TestFolderWritable(dir); err != nil {
+			return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+		}
 	}
 	store.dir = dir
 
@@ -113,29 +123,30 @@ func (store *LevelDB3Store) initialize(dir string) (err error) {
 	if loadDbErr != nil {
 		return loadDbErr
 	}
-	store.dbs = make(map[string]*leveldb.DB)
+	store.dbs = make(map[string]*leveldb_handle.DB)
 	store.dbs[DEFAULT] = db
 
 	return
 }
 
-func (store *LevelDB3Store) loadDB(name string) (*leveldb.DB, error) {
+func (store *LevelDB3Store) loadDB(name string) (*leveldb_handle.DB, error) {
 	opts := store.buildOptions(name)
 
 	dbFolder := fmt.Sprintf("%s/%s", store.dir, name)
 	os.MkdirAll(dbFolder, 0755)
-	db, dbErr := leveldb.OpenFile(dbFolder, opts)
-	if leveldb_errors.IsCorrupted(dbErr) {
-		db, dbErr = leveldb.RecoverFile(dbFolder, opts)
-	}
+	db, dbErr := leveldb_handle.OpenFile(dbFolder, opts)
 	if dbErr != nil {
 		glog.Errorf("filer store open dir %s: %v", dbFolder, dbErr)
 		return nil, dbErr
 	}
+	if err := leveldb_handle.CheckKeyHash([]*leveldb_handle.DB{db}, fips140.Enforced(), store.ReadOnly); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
 }
 
-func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bool) (*leveldb.DB, string, weed_util.FullPath, error) {
+func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bool) (*leveldb_handle.DB, string, weed_util.FullPath, error) {
 
 	store.dbsLock.RLock()
 
@@ -159,9 +170,7 @@ func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bo
 		shortPath = weed_util.FullPath(bucketAndObjectKey[t:])
 	}
 
-	// Dot-prefixed entries directly under /buckets (e.g. .system) are internal
-	// folders, not S3 buckets; keep them in the default DB by full path.
-	if strings.HasPrefix(bucket, ".") {
+	if !isBucketFolder(bucket) {
 		store.dbsLock.RUnlock()
 		return defaultDB, DEFAULT, fullpath, nil
 	}
@@ -173,12 +182,41 @@ func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bo
 
 	store.dbsLock.RUnlock()
 
+	// A bucket with no db directory has no entries. Opening it read-only
+	// cannot create the directory, so serve its reads from an empty
+	// in-memory db; the store's write methods refuse mutations.
+	if store.ReadOnly && !weed_util.FolderExists(fmt.Sprintf("%s/%s", store.dir, bucket)) {
+		db, err := store.emptyBucketDB()
+		return db, bucket, shortPath, err
+	}
+
 	db, err := store.createDB(bucket)
 
 	return db, bucket, shortPath, err
 }
 
-func (store *LevelDB3Store) createDB(bucket string) (*leveldb.DB, error) {
+func (store *LevelDB3Store) emptyBucketDB() (*leveldb_handle.DB, error) {
+	store.dbsLock.Lock()
+	defer store.dbsLock.Unlock()
+	if store.emptyDB == nil {
+		db, err := leveldb_handle.Open(storage.NewMemStorage(), nil)
+		if err != nil {
+			return nil, err
+		}
+		store.emptyDB = db
+	}
+	return store.emptyDB, nil
+}
+
+// Dot-prefixed entries directly under /buckets (e.g. .system) are internal
+// folders, not S3 buckets; they stay in the default DB by full path. A bucket
+// also names a single folder under store.dir, so it cannot hold a separator;
+// "\" is an ordinary name character on Unix and only rejected where it separates.
+func isBucketFolder(bucket string) bool {
+	return !strings.HasPrefix(bucket, ".") && filepath.IsLocal(bucket) && !strings.ContainsAny(bucket, "/"+string(os.PathSeparator))
+}
+
+func (store *LevelDB3Store) createDB(bucket string) (*leveldb_handle.DB, error) {
 
 	store.dbsLock.Lock()
 	defer store.dbsLock.Unlock()
@@ -232,6 +270,9 @@ func writeOptions(ctx context.Context) *opt.WriteOptions {
 
 func (store *LevelDB3Store) InsertEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, _, shortPath, err := store.findDB(entry.FullPath, false)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", entry.FullPath, err)
@@ -299,6 +340,9 @@ func (store *LevelDB3Store) FindEntry(ctx context.Context, fullpath weed_util.Fu
 
 func (store *LevelDB3Store) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, _, shortPath, err := store.findDB(fullpath, false)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", fullpath, err)
@@ -317,6 +361,9 @@ func (store *LevelDB3Store) DeleteEntry(ctx context.Context, fullpath weed_util.
 
 func (store *LevelDB3Store) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, bucket, shortPath, err := store.findDB(fullpath, true)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", fullpath, err)
@@ -346,7 +393,11 @@ func (store *LevelDB3Store) DeleteFolderChildren(ctx context.Context, fullpath w
 		}
 		batch.Delete(append(directoryPrefix, []byte(fileName)...))
 	}
+	iterErr := iter.Error()
 	iter.Release()
+	if iterErr != nil {
+		return fmt.Errorf("delete %s : %v", fullpath, iterErr)
+	}
 
 	err = db.Write(batch, writeOptions(ctx))
 
@@ -370,7 +421,7 @@ func (store *LevelDB3Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 
 	directoryPrefix := genDirectoryKeyPrefix(shortPath, prefix)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart = genDirectoryKeyPrefix(shortPath, startFileName)
 	}
 
@@ -413,6 +464,9 @@ func (store *LevelDB3Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 			break
 		}
 	}
+	if err == nil {
+		err = iter.Error()
+	}
 	iter.Release()
 
 	return lastFileName, err
@@ -440,7 +494,7 @@ func getNameFromKey(key []byte) string {
 
 // hash directory
 func hashToBytes(dir string) []byte {
-	h := md5.New()
+	h := weed_util.NewMd5()
 	io.WriteString(h, dir)
 	b := h.Sum(nil)
 	return b
@@ -449,5 +503,8 @@ func hashToBytes(dir string) []byte {
 func (store *LevelDB3Store) Shutdown() {
 	for _, db := range store.dbs {
 		db.Close()
+	}
+	if store.emptyDB != nil {
+		store.emptyDB.Close()
 	}
 }

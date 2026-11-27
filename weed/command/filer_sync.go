@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -222,7 +223,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 			if state == nil || state.processor == nil {
 				return
 			}
-			offsetTsNs := state.processor.processedTsWatermark.Load()
+			offsetTsNs := resumeTsNsFor(state.processor)
 			if offsetTsNs == 0 {
 				return
 			}
@@ -475,7 +476,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		lastProgressedTsNs = offsetTsNs
 		// collect synchronous offset
 		statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(offsetTsNs))
-		return setOffset(targetGrpcDialOption, targetFiler, signaturePrefix, sourceFilerSignature, offsetTsNs)
+		return setOffset(targetGrpcDialOption, targetFiler, signaturePrefix, sourceFilerSignature, resumeTsNsFor(processor))
 	})
 
 	prefix := sourcePath
@@ -494,8 +495,9 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		StartTsNs:              sourceFilerOffsetTsNs,
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		FilerJwtProvider:       sourceJwtProvider,
 		GetResumeTsNs: func() int64 {
-			return processor.processedTsWatermark.Load()
+			return resumeTsNsFor(processor)
 		},
 		Resubscribe: processor.ResubscribeCh(),
 		// While the source has only read activity it emits no metadata events, so
@@ -576,16 +578,77 @@ func getOffsetWithFallback(grpcDialOption grpc.DialOption, filer pb.ServerAddres
 	return lastOffsetTsNs, err
 }
 
-func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32, offsetTsNs int64) error {
-	return pb.WithFilerClient(false, signature, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+// A checkpoint write can outlive its caller's wait and land beside the next
+// subscription attempt's writes; issued concurrently they may be applied out
+// of order, moving saved progress backward or forward past events still owed
+// a replay. Writes to the same persisted key are serialized and each is
+// ordered by issuance: a write issued before the last one to land is stale
+// and dropped. Deliberate regressions — resume floors, operator seeds — are
+// issued after the writes they supersede, so they still apply. State is keyed
+// by target filer so unrelated streams — or the two directions of a
+// bidirectional sync — never block or shadow each other.
+var offsetCheckpointWrites = struct {
+	sync.Mutex
+	byKey map[string]*offsetCheckpoint
+}{byKey: map[string]*offsetCheckpoint{}}
 
-		syncKey := []byte(signaturePrefix + "____")
-		util.Uint32toBytes(syncKey[len(signaturePrefix):len(signaturePrefix)+4], uint32(signature))
+type offsetCheckpoint struct {
+	sync.Mutex
+	lastSeq int64
+}
+
+// resumeTsNsFor floors the processed watermark by the earliest failure the
+// processor saw: a redelivery can clear the pin, but events dropped while it
+// was stopped only replay if the resume position stays behind it. It also
+// stays one tick below the newest timestamp seen — a watermark on the
+// frontier can have finished every job it admitted while more events at the
+// same timestamp still sit unread in the log, and an exclusive resume there
+// would skip them.
+func resumeTsNsFor(p *MetadataProcessor) int64 {
+	ts := p.processedTsWatermark.Load()
+	if newestTsNs := p.NewestSeenTsNs(); newestTsNs > 0 && ts >= newestTsNs {
+		ts = newestTsNs - 1
+	}
+	if failedTsNs := p.EarliestFailedTsNs(); failedTsNs > 0 && failedTsNs-1 < ts {
+		ts = failedTsNs - 1
+	}
+	return ts
+}
+
+// offsetWriteSeq numbers checkpoint writes in issuance order so a write that
+// lands late can be told apart from the fresher write it would shadow.
+var offsetWriteSeq atomic.Int64
+
+func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32, offsetTsNs int64) error {
+	syncKey := []byte(signaturePrefix + "____")
+	util.Uint32toBytes(syncKey[len(signaturePrefix):len(signaturePrefix)+4], uint32(signature))
+	key := string(filer) + "\x00" + string(syncKey)
+
+	offsetCheckpointWrites.Lock()
+	checkpoint := offsetCheckpointWrites.byKey[key]
+	if checkpoint == nil {
+		checkpoint = &offsetCheckpoint{}
+		offsetCheckpointWrites.byKey[key] = checkpoint
+	}
+	offsetCheckpointWrites.Unlock()
+
+	seq := offsetWriteSeq.Add(1)
+	checkpoint.Lock()
+	defer checkpoint.Unlock()
+	if seq < checkpoint.lastSeq {
+		return nil
+	}
+	checkpoint.lastSeq = seq
+
+	return pb.WithFilerClient(false, signature, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
 		valueBuf := make([]byte, 8)
 		util.Uint64toBytes(valueBuf, uint64(offsetTsNs))
 
-		resp, err := client.KvPut(context.Background(), &filer_pb.KvPutRequest{
+		// a stalled KvPut must not hold a caller's drain or persistence loop
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := client.KvPut(ctx, &filer_pb.KvPutRequest{
 			Key:   syncKey,
 			Value: valueBuf,
 		})
@@ -600,7 +663,6 @@ func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signature
 		return nil
 
 	})
-
 }
 
 func genProcessFunction(sourcePath string, targetPath string, excludePaths []string, reExcludeFileName *regexp.Regexp, excludeFileNames []*wildcard.WildcardMatcher, excludePathPatterns []*wildcard.WildcardMatcher, dataSink sink.ReplicationSink, doDeleteFiles bool, debug bool) func(resp *filer_pb.SubscribeMetadataResponse) error {
@@ -620,9 +682,13 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 		if message.NewEntry != nil {
 			sourceNewKey = util.FullPath(targetDir).Child(message.NewEntry.Name)
 		}
+		mutationTsNs := resp.MutationTsNs
+		if mutationTsNs == 0 {
+			mutationTsNs = resp.TsNs
+		}
 
 		if debug {
-			glog.V(0).Infof("received %v", resp)
+			glog.V(0).Infof("received %s ts_ns=%d", resp.Directory, resp.TsNs)
 		}
 
 		if isMultipartUploadDir(resp.Directory + "/") {
@@ -672,7 +738,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				return nil
 			}
 			key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-			return sink.DeleteEntry(dataSink, key, message.OldEntry.IsDirectory, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
+			return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
 		}
 
 		// handle new entries
@@ -707,14 +773,14 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 						oldKey := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
 						if mover, ok := dataSink.(sink.EntryMover); ok {
 							// native atomic move: no re-copy, no descendant gap, no chunk leak.
-							return mover.MoveEntry(oldKey, newKey, message.NewEntry, message.Signatures)
+							return mover.MoveEntry(oldKey, newKey, message.OldEntry, message.NewEntry, message.Signatures)
 						}
 						// no native move: create the new entry first, then delete the
 						// old, so a crash between the two leaves the entry visible.
 						if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
 							return fmt.Errorf("create entry2 : %w", err)
 						}
-						if err := dataSink.DeleteEntry(oldKey, message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
+						if err := sink.DeleteEntryVersion(dataSink, oldKey, message.OldEntry, mutationTsNs, false, false, message.Signatures); err != nil {
 							return fmt.Errorf("delete old entry %v: %w", oldKey, err)
 						}
 						return nil
@@ -756,7 +822,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				// new key is outside the watched directory
 				if doDeleteFiles {
 					key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-					return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
+					return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, false, message.Signatures)
 				}
 			}
 		} else {

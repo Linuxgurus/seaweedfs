@@ -1,15 +1,30 @@
 package s3api
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 func TestValidateRetention(t *testing.T) {
@@ -856,4 +871,425 @@ func TestStoreObjectLockConfigurationClearsStaleYears(t *testing.T) {
 // Helper function to create a time pointer
 func timePtr(t time.Time) *time.Time {
 	return &t
+}
+
+// retentionTestFiler serves the two filer calls a lock write needs: the lookup
+// that resolves the version and the update that persists the modified entry.
+type retentionTestFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+
+	mu         sync.Mutex
+	entries    map[string]*filer_pb.Entry
+	updates    []string
+	lookupErrs map[string]error
+}
+
+func (f *retentionTestFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err, ok := f.lookupErrs[req.Directory+"/"+req.Name]; ok {
+		return nil, err
+	}
+	if entry, ok := f.entries[req.Directory+"/"+req.Name]; ok {
+		return &filer_pb.LookupDirectoryEntryResponse{Entry: proto.Clone(entry).(*filer_pb.Entry)}, nil
+	}
+	return &filer_pb.LookupDirectoryEntryResponse{}, nil
+}
+
+func (f *retentionTestFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates = append(f.updates, req.Directory+"/"+req.Entry.Name)
+	f.entries[req.Directory+"/"+req.Entry.Name] = req.Entry
+	return &filer_pb.UpdateEntryResponse{}, nil
+}
+
+func newRetentionTestServer(t *testing.T, f *retentionTestFiler) *S3ApiServer {
+	t.Helper()
+	addr := startFakeFiler(t, f)
+	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
+	return &S3ApiServer{
+		option: &S3ApiServerOption{
+			Filers:         []pb.ServerAddress{addr},
+			GrpcDialOption: dialOption,
+			BucketsPath:    "/buckets",
+		},
+		filerClient:       wdclient.NewFilerClient([]pb.ServerAddress{addr}, dialOption, ""),
+		bucketConfigCache: NewBucketConfigCache(time.Minute),
+	}
+}
+
+// A "null" version id resolves to the pre-versioning entry under the plain
+// object key, the same place getSpecificObjectVersion reads it from. Writing
+// the lock under .versions/v_null leaves the real entry unlocked.
+func TestNullVersionLockWritesToPlainEntry(t *testing.T) {
+	f := &retentionTestFiler{entries: map[string]*filer_pb.Entry{
+		"/buckets/b/key": {
+			Name:    "key",
+			Chunks:  []*filer_pb.FileChunk{{FileId: "1,0000000000000001"}},
+			Content: []byte("inline"),
+			Attributes: &filer_pb.FuseAttributes{
+				Mime: "text/plain",
+				Md5:  []byte("etagmd5"),
+			},
+			Extended: map[string][]byte{
+				"ETag": []byte("\"etagmd5\""),
+			},
+		},
+	}}
+	s3a := newRetentionTestServer(t, f)
+
+	retainUntil := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	err := s3a.setObjectRetention("b", "key", "null", &ObjectRetention{
+		Mode:            s3_constants.RetentionModeCompliance,
+		RetainUntilDate: &retainUntil,
+	}, false)
+	if err != nil {
+		t.Fatalf("setObjectRetention: %v", err)
+	}
+	if len(f.updates) != 1 || f.updates[0] != "/buckets/b/key" {
+		t.Fatalf("retention write landed on %v, want /buckets/b/key", f.updates)
+	}
+	updated := f.entries["/buckets/b/key"]
+	if got := string(updated.Extended[s3_constants.ExtObjectLockModeKey]); got != s3_constants.RetentionModeCompliance {
+		t.Fatalf("plain entry lock mode = %q, want COMPLIANCE", got)
+	}
+	if updated.Attributes.Mime != "text/plain" || len(updated.Content) == 0 || len(updated.Chunks) != 1 || string(updated.Extended["ETag"]) != "\"etagmd5\"" {
+		t.Fatalf("lock write dropped entry fields: %+v", updated)
+	}
+
+	f.updates = nil
+	if err := s3a.setObjectLegalHold("b", "key", "null", &ObjectLegalHold{Status: "ON"}); err != nil {
+		t.Fatalf("setObjectLegalHold: %v", err)
+	}
+	if len(f.updates) != 1 || f.updates[0] != "/buckets/b/key" {
+		t.Fatalf("legal hold write landed on %v, want /buckets/b/key", f.updates)
+	}
+	if got := string(f.entries["/buckets/b/key"].Extended[s3_constants.ExtLegalHoldKey]); got != "ON" {
+		t.Fatalf("plain entry legal hold = %q, want ON", got)
+	}
+}
+
+// getObjectEntry must only report ErrObjectNotFound for a genuine miss. A
+// transient filer error used to be collapsed into ErrObjectNotFound, which
+// LifecycleDelete resolves permanently as NOOP_RESOLVED - one flaky read at
+// dispatch time would silently skip the object's expiration.
+func TestGetObjectEntryPreservesTransientErrors(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {Name: "b", IsDirectory: true},
+		},
+		lookupErrs: map[string]error{
+			"/buckets/b/key": status.Error(codes.Unavailable, "filer overloaded"),
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	_, err := s3a.getObjectEntry("b", "key", "")
+	if err == nil {
+		t.Fatal("expected error for transient lookup failure")
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, filer_pb.ErrNotFound) {
+		t.Fatalf("transient lookup error must not collapse to not-found: %v", err)
+	}
+}
+
+// A transport failure whose status text happens to carry the filer not-found
+// sentinel (e.g. a proxy re-wrapping a miss as Unavailable) is a failed read,
+// not a miss - LookupEntry must not normalize it to ErrNotFound.
+func TestGetObjectEntryPreservesUnavailableWithNotFoundMessage(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {Name: "b", IsDirectory: true},
+		},
+		lookupErrs: map[string]error{
+			"/buckets/b/key": status.Error(codes.Unavailable, filer_pb.ErrNotFound.Error()),
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	_, err := s3a.getObjectEntry("b", "key", "")
+	if err == nil {
+		t.Fatal("expected error for unavailable lookup")
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, filer_pb.ErrNotFound) {
+		t.Fatalf("unavailable lookup must not collapse to not-found: %v", err)
+	}
+}
+
+// Only miss-shaped statuses may carry the not-found text into ErrObjectNotFound:
+// a raw sentinel crossing gRPC arrives as codes.Unknown, while the same text on
+// codes.Internal is a failed read.
+func TestGetObjectEntryNotFoundTextStatusGate(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantMiss bool
+	}{
+		{"unknown keeps sentinel text", status.Error(codes.Unknown, filer_pb.ErrNotFound.Error()), true},
+		{"internal with sentinel text", status.Error(codes.Internal, filer_pb.ErrNotFound.Error()), false},
+		{"not-found status", status.Error(codes.NotFound, "entry gone"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &retentionTestFiler{
+				entries: map[string]*filer_pb.Entry{
+					"/buckets/b": {Name: "b", IsDirectory: true},
+				},
+				lookupErrs: map[string]error{
+					"/buckets/b/key": tc.err,
+				},
+			}
+			s3a := newRetentionTestServer(t, f)
+
+			_, err := s3a.getObjectEntry("b", "key", "")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if got := errors.Is(err, ErrObjectNotFound); got != tc.wantMiss {
+				t.Fatalf("isObjectEntryMiss = %v, want %v: %v", got, tc.wantMiss, err)
+			}
+		})
+	}
+}
+
+// A pre-versioning object under a now-versioned bucket has no .versions
+// directory; when the plain-object fallback read fails transiently, that
+// failure must surface instead of the directory's not-found error.
+func TestGetObjectEntryPreservesTransientFallbackError(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {
+				Name:        "b",
+				IsDirectory: true,
+				Extended:    map[string][]byte{s3_constants.ExtVersioningKey: []byte(s3_constants.VersioningEnabled)},
+			},
+		},
+		lookupErrs: map[string]error{
+			"/buckets/b/key": status.Error(codes.Unavailable, "filer overloaded"),
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	_, err := s3a.getObjectEntry("b", "key", "")
+	if err == nil {
+		t.Fatal("expected error for transient fallback lookup failure")
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, filer_pb.ErrNotFound) {
+		t.Fatalf("transient fallback error must not collapse to not-found: %v", err)
+	}
+}
+
+func TestGetObjectEntryInvalidVersionIdStillNotFound(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {Name: "b", IsDirectory: true},
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	_, err := s3a.getObjectEntry("b", "key", "not/../a-version")
+	if !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("invalid version id must report ErrObjectNotFound, got: %v", err)
+	}
+}
+
+func TestGetObjectEntryMissStillNotFound(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {Name: "b", IsDirectory: true},
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	_, err := s3a.getObjectEntry("b", "missing", "")
+	if !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("missing object must report ErrObjectNotFound, got: %v", err)
+	}
+}
+
+func putLegalHoldStatus(t *testing.T, s3a *S3ApiServer, object, versionId string) int {
+	t.Helper()
+	target := "http://localhost:8333/b/" + object + "?legal-hold"
+	if versionId != "" {
+		target += "&versionId=" + versionId
+	}
+	body := `<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>`
+	req := httptest.NewRequest(http.MethodPut, target, strings.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"bucket": "b", "object": object})
+	rec := httptest.NewRecorder()
+	s3a.PutObjectLegalHoldHandler(rec, req)
+	return rec.Code
+}
+
+// PutObjectLegalHold on a key with no version in a versioned bucket is a miss,
+// answered like PutObjectRetention with NoSuchKey rather than InternalError.
+func TestPutObjectLegalHoldMissingObjectIsNoSuchKey(t *testing.T) {
+	f := &retentionTestFiler{entries: map[string]*filer_pb.Entry{
+		"/buckets/b": {
+			Name:        "b",
+			IsDirectory: true,
+			Extended:    map[string][]byte{s3_constants.ExtVersioningKey: []byte(s3_constants.VersioningEnabled)},
+		},
+	}}
+	s3a := newRetentionTestServer(t, f)
+
+	if got := putLegalHoldStatus(t, s3a, "missing", ""); got != http.StatusNotFound {
+		t.Fatalf("PutObjectLegalHold on a missing key = %d, want 404", got)
+	}
+	if len(f.updates) != 0 {
+		t.Fatalf("missing key must not be written, got %v", f.updates)
+	}
+}
+
+// A failed read of the target version is not a miss: the lock write must
+// surface it as a server error the client can retry, not NoSuchKey.
+func TestPutObjectLegalHoldFailedReadIsNotNoSuchKey(t *testing.T) {
+	f := &retentionTestFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/b": {
+				Name:        "b",
+				IsDirectory: true,
+				Extended:    map[string][]byte{s3_constants.ExtVersioningKey: []byte(s3_constants.VersioningEnabled)},
+			},
+		},
+		lookupErrs: map[string]error{
+			"/buckets/b/key.versions/v_v1": status.Error(codes.Internal, "disk read failed"),
+		},
+	}
+	s3a := newRetentionTestServer(t, f)
+
+	err := s3a.setObjectLegalHold("b", "key", "v1", &ObjectLegalHold{Status: "ON"})
+	if err == nil || errors.Is(err, ErrVersionNotFound) {
+		t.Fatalf("failed read must not report ErrVersionNotFound, got: %v", err)
+	}
+	if got := putLegalHoldStatus(t, s3a, "key", "v1"); got != http.StatusInternalServerError {
+		t.Fatalf("PutObjectLegalHold on a failed read = %d, want 500", got)
+	}
+}
+
+func deleteMarkerTestFiler(markerExtended map[string][]byte) *retentionTestFiler {
+	marker := map[string][]byte{
+		s3_constants.ExtDeleteMarkerKey: []byte("true"),
+		s3_constants.ExtVersionIdKey:    []byte("m1"),
+	}
+	for k, v := range markerExtended {
+		marker[k] = v
+	}
+	return &retentionTestFiler{entries: map[string]*filer_pb.Entry{
+		"/buckets/b": {
+			Name:        "b",
+			IsDirectory: true,
+			Extended:    map[string][]byte{s3_constants.ExtVersioningKey: []byte(s3_constants.VersioningEnabled)},
+		},
+		"/buckets/b/key.versions": {
+			Name:        "key.versions",
+			IsDirectory: true,
+			Extended: map[string][]byte{
+				s3_constants.ExtLatestVersionIdKey:       []byte("m1"),
+				s3_constants.ExtLatestVersionFileNameKey: []byte("v_m1"),
+			},
+		},
+		"/buckets/b/key.versions/v_m1": {Name: "v_m1", Extended: marker},
+	}}
+}
+
+// A key whose current version is a delete marker does not exist, and a marker
+// takes no lock of its own: reading or writing its legal hold is NoSuchKey.
+func TestLegalHoldOnDeleteMarkerIsNoSuchKey(t *testing.T) {
+	f := deleteMarkerTestFiler(nil)
+	s3a := newRetentionTestServer(t, f)
+
+	if got := putLegalHoldStatus(t, s3a, "key", ""); got != http.StatusNotFound {
+		t.Fatalf("PutObjectLegalHold on a deleted key = %d, want 404", got)
+	}
+	if got := putLegalHoldStatus(t, s3a, "key", "m1"); got != http.StatusNotFound {
+		t.Fatalf("PutObjectLegalHold on a delete marker version = %d, want 404", got)
+	}
+	if len(f.updates) != 0 {
+		t.Fatalf("delete marker must not be written, got %v", f.updates)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8333/b/key?legal-hold", nil)
+	req = mux.SetURLVars(req, map[string]string{"bucket": "b", "object": "key"})
+	rec := httptest.NewRecorder()
+	s3a.GetObjectLegalHoldHandler(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GetObjectLegalHold on a deleted key = %d, want 404", rec.Code)
+	}
+
+	retainUntil := time.Now().Add(time.Hour)
+	err := s3a.setObjectRetention("b", "key", "", &ObjectRetention{Mode: s3_constants.RetentionModeGovernance, RetainUntilDate: &retainUntil}, false)
+	if !errors.Is(err, ErrLatestVersionNotFound) {
+		t.Fatalf("setObjectRetention on a deleted key = %v, want ErrLatestVersionNotFound", err)
+	}
+	if _, err := s3a.getObjectRetention("b", "key", "m1"); !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("getObjectRetention on a delete marker = %v, want ErrObjectNotFound", err)
+	}
+}
+
+// A lock left on a delete marker by an older server must not keep the marker
+// from being removed: markers are never WORM-protected.
+func TestLockOnDeleteMarkerDoesNotBlockRemoval(t *testing.T) {
+	retainUntil := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
+	f := deleteMarkerTestFiler(map[string][]byte{
+		s3_constants.ExtLegalHoldKey:          []byte(s3_constants.LegalHoldOn),
+		s3_constants.ExtObjectLockModeKey:     []byte(s3_constants.RetentionModeCompliance),
+		s3_constants.ExtRetentionUntilDateKey: []byte(retainUntil),
+	})
+	f.entries["/buckets/b"].Extended[s3_constants.ExtObjectLockEnabledKey] = []byte(s3_constants.ObjectLockEnabled)
+	s3a := newRetentionTestServer(t, f)
+
+	for _, versionId := range []string{"m1", ""} {
+		if err := s3a.enforceObjectLockProtections(nil, "b", "key", versionId, false); err != nil {
+			t.Fatalf("enforceObjectLockProtections(versionId=%q) on a locked delete marker = %v, want nil", versionId, err)
+		}
+	}
+}
+
+type deleteMarkerTxnFiler struct {
+	*retentionTestFiler
+	txns []*filer_pb.ObjectTransactionRequest
+}
+
+func (f *deleteMarkerTxnFiler) ObjectTransaction(_ context.Context, req *filer_pb.ObjectTransactionRequest) (*filer_pb.ObjectTransactionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txns = append(f.txns, req)
+	return &filer_pb.ObjectTransactionResponse{}, nil
+}
+
+// The routed version delete carries the WORM guards to the owner filer, which
+// would refuse a marker that holds a lock; a marker is deleted without them.
+func TestRoutedDeleteOfLockedDeleteMarkerSkipsWormGuard(t *testing.T) {
+	retainUntil := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
+	base := deleteMarkerTestFiler(map[string][]byte{
+		s3_constants.ExtLegalHoldKey:          []byte(s3_constants.LegalHoldOn),
+		s3_constants.ExtObjectLockModeKey:     []byte(s3_constants.RetentionModeCompliance),
+		s3_constants.ExtRetentionUntilDateKey: []byte(retainUntil),
+	})
+	base.entries["/buckets/b"].Extended[s3_constants.ExtObjectLockEnabledKey] = []byte(s3_constants.ObjectLockEnabled)
+	f := &deleteMarkerTxnFiler{retentionTestFiler: base}
+	addr := startFakeFiler(t, f)
+	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
+	s3a := &S3ApiServer{
+		option:            &S3ApiServerOption{Filers: []pb.ServerAddress{addr}, GrpcDialOption: dialOption, BucketsPath: "/buckets"},
+		filerClient:       wdclient.NewFilerClient([]pb.ServerAddress{addr}, dialOption, ""),
+		bucketConfigCache: NewBucketConfigCache(time.Minute),
+	}
+	s3a.objectWriteLockClient = cluster.NewLockClient(dialOption, addr)
+	s3a.objectWriteLockClient.SetRing([]pb.ServerAddress{addr}, 1)
+
+	req := httptest.NewRequest(http.MethodDelete, "http://localhost:8333/b/key?versionId=m1", nil)
+	req = mux.SetURLVars(req, map[string]string{"bucket": "b", "object": "key"})
+	rec := httptest.NewRecorder()
+	s3a.DeleteObjectHandler(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DeleteObject of a locked delete marker = %d, want 204: %s", rec.Code, rec.Body.String())
+	}
+	if len(f.txns) != 1 {
+		t.Fatalf("expected one routed delete, got %d", len(f.txns))
+	}
+	if cond := f.txns[0].GetCondition(); cond != nil {
+		t.Fatalf("delete marker removal must not carry WORM guards, got %+v", cond)
+	}
 }

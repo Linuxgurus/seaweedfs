@@ -13,6 +13,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/viant/ptrie"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -116,6 +118,16 @@ func (c *FileChunk) GetFileIdString() string {
 	return ""
 }
 
+// FileIdsString lists chunks by file id only, for logging that must not print
+// per-chunk fields like CipherKey.
+func FileIdsString(chunks []*FileChunk) []string {
+	fileIds := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		fileIds = append(fileIds, chunk.GetFileIdString())
+	}
+	return fileIds
+}
+
 func BeforeEntrySerialization(chunks []*FileChunk) {
 
 	for _, chunk := range chunks {
@@ -161,6 +173,11 @@ func CreateEntryWithResponse(ctx context.Context, client SeaweedFilerClient, req
 	resp, err := client.CreateEntry(ctx, request)
 	if err != nil {
 		glog.V(1).InfofCtx(ctx, "create entry %s/%s %v: %v", request.Directory, request.Entry.Name, request.OExcl, err)
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unknown {
+			if readOnly := LegacyReadOnlyError(st.Message()); readOnly != nil {
+				return nil, fmt.Errorf("CreateEntry %s/%s: %w", request.Directory, request.Entry.Name, readOnly)
+			}
+		}
 		return nil, fmt.Errorf("CreateEntry: %w", err)
 	}
 	if resp.ErrorCode != FilerError_OK {
@@ -210,7 +227,18 @@ func UpdateEntryWithResponse(ctx context.Context, client SeaweedFilerClient, req
 func LookupEntry(ctx context.Context, client SeaweedFilerClient, request *LookupDirectoryEntryRequest) (*LookupDirectoryEntryResponse, error) {
 	resp, err := client.LookupDirectoryEntry(ctx, request)
 	if err != nil {
-		if err == ErrNotFound || strings.Contains(err.Error(), ErrNotFound.Error()) {
+		if err == ErrNotFound {
+			return nil, ErrNotFound
+		}
+		// The filer converts its own miss to codes.NotFound; a raw sentinel
+		// crossing gRPC arrives as codes.Unknown carrying only its text. The
+		// same text on any other status is a failed read, not a miss.
+		if st, ok := util.ServerStatus(err); ok {
+			if st.Code() == codes.NotFound ||
+				(st.Code() == codes.Unknown && strings.Contains(st.Message(), ErrNotFound.Error())) {
+				return nil, ErrNotFound
+			}
+		} else if strings.Contains(err.Error(), ErrNotFound.Error()) {
 			return nil, ErrNotFound
 		}
 		glog.V(3).InfofCtx(ctx, "read %s/%v: %v", request.Directory, request.Name, err)
@@ -269,6 +297,36 @@ func AssignVolumeResponseError(resp *AssignVolumeResponse) error {
 		return nil
 	}
 	return &codedError{msg: resp.Error, sentinel: FilerErrorToSentinel(resp.ErrorCode)}
+}
+
+// IsFilerVerdict reports whether err carries a sentinel that a filer response
+// code maps to (see FilerErrorToSentinel). The filer answered over a working
+// channel, so the failure is neither transient nor a broken connection,
+// whatever its message says. The message names a path, which can contain a
+// word such as "transport" that text-based classifiers take for a network
+// failure.
+func IsFilerVerdict(err error) bool {
+	if err == nil {
+		return false
+	}
+	for code := range FilerError_name {
+		if sentinel := FilerErrorToSentinel(FilerError(code)); sentinel != nil && errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
+// LegacyReadOnlyError returns an error matching ErrReadOnly when msg is how an
+// older filer refused a create on a read-only path, or nil otherwise. Such a
+// filer has no FilerError_READ_ONLY in CreateEntryResponse. It fails the create
+// with a status-less error instead: codes.Unknown over unary gRPC, or a bare
+// message over StreamMutateEntry. The text is the only thing left to match.
+func LegacyReadOnlyError(msg string) error {
+	if msg != ErrReadOnly.Error() && !strings.HasPrefix(msg, ErrReadOnly.Error()+": ") {
+		return nil
+	}
+	return &codedError{msg: msg, sentinel: ErrReadOnly}
 }
 
 // codedError is a filer error message paired with the sentinel of the code
@@ -390,6 +448,44 @@ func metadataEventMatchesPath(fullPath, dirPath, pathPrefix string, pathPrefixes
 		return true
 	}
 	return strings.HasPrefix(fullPath, pathPrefix)
+}
+
+// MetadataDirectoryMayMatchSubscription reports whether an event in dir could
+// match the subscription, before the event is decoded. It errs toward true.
+func MetadataDirectoryMayMatchSubscription(dir []byte, pathPrefix string, pathPrefixes []string, directories []string) bool {
+	if pathPrefix == "" || len(dir) == 0 || directoryMayHavePrefix(dir, pathPrefix) {
+		return true
+	}
+	for _, p := range pathPrefixes {
+		if directoryMayHavePrefix(dir, p) {
+			return true
+		}
+	}
+	for _, d := range directories {
+		if string(dir) == d {
+			return true
+		}
+	}
+	// matching cleans the joined path, so only a clean dir can be ruled out
+	for i := 0; i+1 < len(dir); i++ {
+		if dir[i] == '/' && (dir[i+1] == '/' || dir[i+1] == '.') {
+			return true
+		}
+	}
+	return false
+}
+
+// directoryMayHavePrefix reports whether some path dir/<name> can start with
+// prefix: dir+"/" and prefix agree on their common length.
+func directoryMayHavePrefix(dir []byte, prefix string) bool {
+	n := min(len(dir), len(prefix))
+	if string(dir[:n]) != prefix[:n] {
+		return false
+	}
+	if len(prefix) <= len(dir) || dir[len(dir)-1] == '/' {
+		return true
+	}
+	return prefix[len(dir)] == '/'
 }
 
 func hasPrefixIn(text string, prefixes []string) bool {

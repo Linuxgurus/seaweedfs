@@ -112,7 +112,7 @@ func GetAuthenticated(ctx context.Context, url, jwt string) ([]byte, bool, error
 	response, err := GetGlobalHttpClient().Do(request)
 	if err != nil {
 		if ctx.Err() == nil {
-			recordUnreachable(request.URL.Host)
+			recordUnreachable(request.URL.Host, err)
 		}
 		return nil, true, err
 	}
@@ -188,6 +188,9 @@ func Delete(url string, jwt string) error {
 		if s, ok := m["error"].(string); ok {
 			return errors.New(s)
 		}
+	}
+	if len(body) == 0 {
+		return errors.New(resp.Status)
 	}
 	return errors.New(string(body))
 }
@@ -401,7 +404,7 @@ func ReadUrlAsStream(ctx context.Context, fileUrl, jwt string, cipherKey []byte,
 	r, err := GetGlobalHttpClient().Do(req)
 	if err != nil {
 		if ctx.Err() == nil {
-			recordUnreachable(req.URL.Host)
+			recordUnreachable(req.URL.Host, err)
 		}
 		return true, err
 	}
@@ -430,6 +433,11 @@ func ReadUrlAsStream(ctx context.Context, fileUrl, jwt string, cipherKey []byte,
 	default:
 		reader = r.Body
 	}
+	var body io.Reader = reader
+	if size > 0 {
+		// a truncated chunk's needle can hold more than the chunk's recorded size
+		body = io.LimitReader(reader, int64(size))
+	}
 
 	var (
 		m int
@@ -445,11 +453,15 @@ func ReadUrlAsStream(ctx context.Context, fileUrl, jwt string, cipherKey []byte,
 		default:
 		}
 
-		m, err = reader.Read(buf)
+		m, err = body.Read(buf)
 		if m > 0 {
 			fn(buf[:m])
 		}
 		if err == io.EOF {
+			// a needle that fails its checksum aborts the response at the end
+			if _, err = io.Copy(io.Discard, reader); err != nil {
+				return true, err
+			}
 			return false, nil
 		}
 		if err != nil {
@@ -477,7 +489,7 @@ func readEncryptedUrl(ctx context.Context, fileUrl, jwt string, cipherKey []byte
 	if len(decryptedData) < int(offset)+size {
 		return false, fmt.Errorf("read decrypted %s size %d [%d, %d)", fileUrl, len(decryptedData), offset, int(offset)+size)
 	}
-	if isFullChunk {
+	if isFullChunk && size == 0 {
 		fn(decryptedData)
 	} else {
 		sliceEnd := int(offset) + size
@@ -526,15 +538,23 @@ func ReadUrlAsReaderCloser(fileUrl string, jwt string, rangeHeader string) (*htt
 }
 
 // StatusError adds the message a server writes into the body of a failed
-// request, such as a volume server CRC mismatch, to the status line.
+// request, such as a volume server CRC mismatch, to the status line. It waits
+// at most unwantedBodyTimeout for that message and otherwise returns the
+// status alone.
 func StatusError(fileUrl string, r *http.Response) error {
-	var reader io.Reader = r.Body
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		if gz, err := gzip.NewReader(r.Body); err == nil {
-			reader = gz
+	var body []byte
+	read := func() {
+		var reader io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			if gz, err := gzip.NewReader(r.Body); err == nil {
+				reader = gz
+			}
 		}
+		body, _ = io.ReadAll(io.LimitReader(reader, 1024))
 	}
-	body, _ := io.ReadAll(io.LimitReader(reader, 1024))
+	if !readUnwantedBody(r, read) {
+		return fmt.Errorf("%s: %s", fileUrl, r.Status)
+	}
 	msg := strings.TrimSpace(string(body))
 	var m struct {
 		Error string `json:"error"`
@@ -548,12 +568,53 @@ func StatusError(fileUrl string, r *http.Response) error {
 	return fmt.Errorf("%s: %s: %s", fileUrl, r.Status, msg)
 }
 
+// unwantedBodyTimeout is how long CloseResponse and StatusError wait for a
+// response body. A server can send its headers and then stop sending the body.
+// The client has no deadline of its own for that, so a read on such a body
+// blocks until the request's context ends, and many callers never end it.
+var unwantedBodyTimeout = 5 * time.Second
+
+// readUnwantedBody runs read, which reads from the response body, and reports
+// whether it finished within unwantedBodyTimeout. When it did not, the body is
+// closed, which drops the connection, and what read collected must not be used.
+func readUnwantedBody(resp *http.Response, read func()) bool {
+	if !resp.Uncompressed {
+		// closing the body fails a read blocked on it
+		timer := time.AfterFunc(unwantedBodyTimeout, func() { resp.Body.Close() })
+		read()
+		return timer.Stop()
+	}
+	// The transport is decoding gzip, and closing that body does not always
+	// fail a read: up to Go 1.26 the decoder reads the gzip header under a
+	// lock that Close also takes, so a response stalled there keeps both
+	// waiting until the connection dies. Leave them behind in that case.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		read()
+	}()
+	timer := time.NewTimer(unwantedBodyTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		go resp.Body.Close()
+		return false
+	}
+}
+
+// CloseResponse reads what is left of the body, so that the connection can be
+// reused, and closes it. It gives up on a body that does not end within
+// unwantedBodyTimeout: the connection is then closed instead of reused.
 func CloseResponse(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
 	reader := &CountingReader{reader: resp.Body}
-	io.Copy(io.Discard, reader)
+	if !readUnwantedBody(resp, func() { io.Copy(io.Discard, reader) }) {
+		return
+	}
 	resp.Body.Close()
 	if reader.BytesRead > 0 {
 		glog.V(1).Infof("response leftover %d bytes", reader.BytesRead)
@@ -671,14 +732,6 @@ func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []stri
 				urlString = url.PathEscape(urlString)
 			}
 			shouldRetry, err = ReadUrlAsStream(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), string(jwt), cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
-				// Check for context cancellation during data processing
-				select {
-				case <-ctx.Done():
-					// Stop processing data when context is cancelled
-					return
-				default:
-				}
-
 				if n < len(buffer) {
 					x := copy(buffer[n:], data)
 					n += x
@@ -792,7 +845,7 @@ func readUrlDirectToBuffer(ctx context.Context, fileUrl, jwt string, buffer []by
 	r, err := GetGlobalHttpClient().Do(req)
 	if err != nil {
 		if ctx.Err() == nil {
-			recordUnreachable(req.URL.Host)
+			recordUnreachable(req.URL.Host, err)
 		}
 		return 0, true, err
 	}

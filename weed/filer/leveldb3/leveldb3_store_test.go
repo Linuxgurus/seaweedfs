@@ -3,6 +3,8 @@ package leveldb
 import (
 	"context"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -181,4 +183,95 @@ func TestEmptyRoot(t *testing.T) {
 		return
 	}
 
+}
+
+func TestListDirectoryPrefixedEntries_StartBelowPrefix(t *testing.T) {
+	store := &LevelDB3Store{}
+	store.initialize(t.TempDir())
+	defer store.Shutdown()
+
+	ctx := context.Background()
+	for _, name := range []string{"item-a", "item-a.versions", "item-b.versions"} {
+		if err := store.InsertEntry(ctx, &filer.Entry{FullPath: util.FullPath("/d/" + name)}); err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+	}
+
+	var names []string
+	_, err := store.ListDirectoryPrefixedEntries(ctx, util.FullPath("/d"), "item", true, 100, "item-b", func(entry *filer.Entry) (bool, error) {
+		names = append(names, entry.Name())
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(names) != 1 || names[0] != "item-b.versions" {
+		t.Fatalf("want [item-b.versions], got %v", names)
+	}
+}
+
+func TestBucketEventsStayInsideStoreDir(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "store")
+	store := &LevelDB3Store{}
+	if err := store.initialize(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Shutdown()
+
+	sentinel := filepath.Join(parent, "keep")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Checked after each create, before the matching delete could remove the
+	// evidence of a db opened in the wrong place.
+	assertNothingEscaped := func(bucket string) {
+		t.Helper()
+		for _, p := range []string{filepath.Join(parent, "outside"), filepath.Join(parent, "CURRENT"), filepath.Join(dir, "x", "y")} {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Fatalf("bucket %q event created %s: %v", bucket, p, err)
+			}
+		}
+	}
+	store.OnBucketCreation("x")
+	for _, bucket := range []string{"..", ".", "../outside", "", DEFAULT, "x/../" + DEFAULT, "x/y"} {
+		store.OnBucketCreation(bucket)
+		assertNothingEscaped(bucket)
+		store.OnBucketDeletion(bucket)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("bucket events removed %s: %v", sentinel, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, DEFAULT)); err != nil {
+		t.Fatalf("default db folder missing: %v", err)
+	}
+	ctx := context.Background()
+	if err := store.InsertEntry(ctx, &filer.Entry{FullPath: "/a/b"}); err != nil {
+		t.Fatalf("default db unusable after bucket events: %v", err)
+	}
+}
+
+func TestUnavailableDatabaseFailsListAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	store := &LevelDB3Store{}
+	if err := store.initialize(dir); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.InsertEntry(ctx, &filer.Entry{FullPath: "/dir/file"}); err != nil {
+		t.Fatal(err)
+	}
+	store.dbs[DEFAULT].Close()
+
+	listed := 0
+	_, err := store.ListDirectoryEntries(ctx, "/dir", "", true, 10, func(*filer.Entry) (bool, error) {
+		listed++
+		return true, nil
+	})
+	if err == nil || listed != 0 {
+		t.Fatalf("list on a closed database: %d entries, err %v", listed, err)
+	}
+	if err := store.DeleteFolderChildren(ctx, "/dir"); err == nil {
+		t.Fatal("delete children on a closed database succeeded")
+	}
 }

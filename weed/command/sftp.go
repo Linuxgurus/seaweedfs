@@ -3,8 +3,6 @@ package command
 import (
 	"context"
 	"fmt"
-	"net"
-	"os"
 	"runtime"
 	"time"
 
@@ -27,7 +25,9 @@ var (
 type SftpOptions struct {
 	filer                 *string
 	bindIp                *string
+	listenOnLocalhost     *bool
 	port                  *int
+	idleTimeout           *int
 	sshPrivateKey         *string
 	hostKeysFolder        *string
 	authMethods           *string
@@ -63,6 +63,7 @@ func init() {
 	sftpOptionsStandalone.filer = cmdSftp.Flag.String("filer", "localhost:8888", "filer server address (ip:port)")
 	sftpOptionsStandalone.bindIp = cmdSftp.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to 0.0.0.0.")
 	sftpOptionsStandalone.port = cmdSftp.Flag.Int("port", 2022, "SFTP server listen port")
+	sftpOptionsStandalone.idleTimeout = cmdSftp.Flag.Int("idleTimeout", 10, "connection idle seconds")
 	sftpOptionsStandalone.sshPrivateKey = cmdSftp.Flag.String("sshPrivateKey", "", "path to the SSH private key file for host authentication")
 	sftpOptionsStandalone.hostKeysFolder = cmdSftp.Flag.String("hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
 	sftpOptionsStandalone.authMethods = cmdSftp.Flag.String("authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, certificate")
@@ -107,6 +108,13 @@ func (sftpOpt *SftpOptions) resolvePaths() {
 }
 
 func (sftpOpt *SftpOptions) startSftpServer() bool {
+	// The loopback companion listener is only kept while -ip.bind is unset.
+	// An explicit -ip.bind pins the port to exactly that address.
+	listenOnLocalhost := *sftpOpt.bindIp == ""
+	if sftpOpt.listenOnLocalhost != nil {
+		listenOnLocalhost = *sftpOpt.listenOnLocalhost
+	}
+	idleTimeout := idleTimeoutSeconds(sftpOpt.idleTimeout)
 	if *sftpOpt.bindIp == "" {
 		*sftpOpt.bindIp = "0.0.0.0"
 	}
@@ -180,27 +188,24 @@ func (sftpOpt *SftpOptions) startSftpServer() bool {
 	// Set up Unix socket if on non-Windows platforms
 	if runtime.GOOS != "windows" {
 		localSocket := *sftpOpt.localSocket
-		if localSocket == "" {
+		explicit := localSocket != ""
+		if !explicit {
 			localSocket = fmt.Sprintf("/tmp/seaweedfs-sftp-%d.sock", *sftpOpt.port)
 		}
-		if err := os.Remove(localSocket); err != nil && !os.IsNotExist(err) {
-			glog.Fatalf("Failed to remove %s, error: %s", localSocket, err.Error())
+		if sftpSocketListener := pb.ListenOnLocalSocket(localSocket); sftpSocketListener != nil {
+			sftpSocketListener = &util.Listener{Listener: sftpSocketListener, Timeout: idleTimeout}
+			go func() {
+				// start on local unix socket
+				if err := service.Serve(sftpSocketListener); err != nil {
+					glog.Fatalf("Failed to serve SFTP on socket %s: %v", localSocket, err)
+				}
+			}()
 		}
-		go func() {
-			// start on local unix socket
-			sftpSocketListener, err := net.Listen("unix", localSocket)
-			if err != nil {
-				glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
-			}
-			if err := service.Serve(sftpSocketListener); err != nil {
-				glog.Fatalf("Failed to serve SFTP on socket %s: %v", localSocket, err)
-			}
-		}()
 	}
 
 	// Start the SFTP service on TCP
 	listenAddress := fmt.Sprintf("%s:%d", *sftpOpt.bindIp, *sftpOpt.port)
-	sftpListener, sftpLocalListener, err := util.NewIpAndLocalListeners(*sftpOpt.bindIp, *sftpOpt.port, time.Duration(10)*time.Second)
+	sftpListener, sftpLocalListener, err := util.NewIpAndLocalListeners(*sftpOpt.bindIp, *sftpOpt.port, idleTimeout, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("SFTP server listener on %s error: %v", listenAddress, err)
 	}

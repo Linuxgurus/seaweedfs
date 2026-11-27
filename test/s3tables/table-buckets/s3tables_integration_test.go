@@ -85,6 +85,10 @@ func TestS3TablesIntegration(t *testing.T) {
 		testTablePolicy(t, client)
 	})
 
+	t.Run("PolicyConditionValidation", func(t *testing.T) {
+		testPolicyConditionValidation(t, client)
+	})
+
 	t.Run("Tagging", func(t *testing.T) {
 		testTagging(t, client)
 	})
@@ -425,6 +429,46 @@ func testTablePolicy(t *testing.T, client *S3TablesClient) {
 	t.Logf("Verified policy deletion")
 }
 
+// A null condition value is refused with InvalidRequest instead of being
+// stored and later panicking the evaluator, and the bucket stays reachable.
+// A well-formed conditional policy is still stored as written.
+func testPolicyConditionValidation(t *testing.T, client *S3TablesClient) {
+	bucketName := "test-policy-cond-" + randomString(8)
+	createBucketResp, err := client.CreateTableBucket(bucketName, nil)
+	require.NoError(t, err, "Failed to create table bucket")
+	defer client.DeleteTableBucket(createBucketResp.ARN)
+	bucketARN := createBucketResp.ARN
+
+	nullCondition := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:*","Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/env":null}}}]}`
+	err = client.PutTableBucketPolicy(bucketARN, nullCondition)
+	require.Error(t, err, "a null condition value must be rejected")
+	assert.Contains(t, err.Error(), s3tables.ErrCodeInvalidRequest)
+
+	_, err = client.GetTableBucket(bucketARN)
+	require.NoError(t, err, "the bucket must stay reachable after the rejected policy")
+	_, err = client.GetTableBucketPolicy(bucketARN)
+	assert.Error(t, err, "the rejected policy must not be stored")
+
+	validCondition := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:DeleteTableBucket","Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}}}]}`
+	require.NoError(t, client.PutTableBucketPolicy(bucketARN, validCondition), "a valid conditional policy must be accepted")
+	getPolicyResp, err := client.GetTableBucketPolicy(bucketARN)
+	require.NoError(t, err)
+	assert.Equal(t, validCondition, getPolicyResp.ResourcePolicy)
+
+	// A null Condition reads as none, so this Allow would grant everyone.
+	allowNull := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3tables:*","Resource":"*","Condition":null}]}`
+	err = client.PutTableBucketPolicy(bucketARN, allowNull)
+	require.Error(t, err, "an Allow with a null Condition must be rejected")
+	assert.Contains(t, err.Error(), s3tables.ErrCodeInvalidRequest)
+	getPolicyResp, err = client.GetTableBucketPolicy(bucketARN)
+	require.NoError(t, err)
+	assert.Equal(t, validCondition, getPolicyResp.ResourcePolicy, "the stored policy must be unchanged")
+
+	_, err = client.GetTableBucket(bucketARN)
+	require.NoError(t, err, "the bucket must stay reachable under a valid conditional policy")
+	require.NoError(t, client.DeleteTableBucketPolicy(bucketARN))
+}
+
 func testTagging(t *testing.T, client *S3TablesClient) {
 	bucketName := "test-tag-bucket-" + randomString(8)
 
@@ -594,10 +638,15 @@ func testTargetOperations(t *testing.T, client *S3TablesClient) {
 // directory. It does not require a *testing.T so it can be called from TestMain.
 // extraArgs are appended to the default mini command flags.
 func startMiniClusterInDir(testDir string, extraArgs []string) (*TestCluster, error) {
-	// We need 10 unique ports: Master(2), Volume(2), Filer(2), S3(2), Admin(2)
-	ports, err := testutil.AllocatePorts(10)
+	// We need 9 unique ports: Master(2), Volume(2), Filer(2), S3(2), Iceberg(1);
+	// the admin pair comes from the mini-safe range.
+	ports, err := testutil.AllocatePorts(9)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find available ports: %v", err)
+	}
+	adminPorts, err := testutil.AllocateMiniPorts(1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate admin port: %v", err)
 	}
 
 	masterPort := ports[0]
@@ -608,8 +657,8 @@ func startMiniClusterInDir(testDir string, extraArgs []string) (*TestCluster, er
 	filerGrpcPort := ports[5]
 	s3Port := ports[6]
 	s3GrpcPort := ports[7]
-	adminPort := ports[8]
-	adminGrpcPort := ports[9]
+	adminPort := adminPorts[0]
+	icebergPort := ports[8]
 
 	// Ensure no configuration file from previous runs
 	configFile := filepath.Join(testDir, "mini.options")
@@ -674,15 +723,16 @@ func startMiniClusterInDir(testDir string, extraArgs []string) (*TestCluster, er
 			"-filer.port.grpc=" + strconv.Itoa(filerGrpcPort),
 			"-s3.port=" + strconv.Itoa(s3Port),
 			"-s3.port.grpc=" + strconv.Itoa(s3GrpcPort),
-			"-admin.port=" + strconv.Itoa(adminPort),
-			"-admin.port.grpc=" + strconv.Itoa(adminGrpcPort),
-			"-webdav.port=0",               // Disable WebDAV
+			"-webdav=false",    // Disable WebDAV
+			"-s3.port.lance=0", // Disable Lance
+			"-s3.port.iceberg=" + strconv.Itoa(icebergPort),
 			"-admin.ui=false",              // Disable admin UI
 			"-master.volumeSizeLimitMB=32", // Small volumes for testing
 			"-ip=127.0.0.1",
 			"-master.peers=none",     // Faster startup
 			"-s3.iam.readOnly=false", // Enable IAM write operations for tests
 		}
+		baseArgs = append(baseArgs, testutil.MiniAdminArgs(adminPort)...)
 		if len(extraArgs) > 0 {
 			baseArgs = append(baseArgs, extraArgs...)
 		}

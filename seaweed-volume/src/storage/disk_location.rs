@@ -10,7 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::MinFreeSpace;
 use crate::storage::erasure_coding::ec_bitrot::remove_bitrot_sidecars;
@@ -40,12 +40,43 @@ pub struct DiskLocation {
     volumes: HashMap<VolumeId, Arc<Volume>>,
     ec_volumes: HashMap<VolumeId, EcVolume>,
     pub is_disk_space_low: Arc<AtomicBool>,
+    /// Go's `DiskLocation.readOnlyMount`: dir or idx_dir is on a read-only
+    /// filesystem. Volumes load read-only and the location offers no free
+    /// slots. Fixed at startup.
+    pub read_only_mount: bool,
     pub available_space: AtomicU64,
+    /// Headroom promised to in-flight copies that statfs cannot see yet.
+    /// Probes keep it out of available_space so they cannot re-spend it; a
+    /// copy that lands ends its charge, one that fails removes only its own.
+    pub reserved_space: AtomicU64,
     // Physical filesystem capacity from the latest check_disk_space probe, reported
     // to the master so balancing can see real disk fullness, not just slot counts.
     pub disk_total_bytes: AtomicU64,
     pub disk_free_bytes: AtomicU64,
     pub min_free_space: MinFreeSpace,
+    /// Go's `DiskLocation.loadGuard`: the server's copy-claim set. A scan
+    /// skips a claimed vid outright and claims any other through its load,
+    /// so a VolumeCopy's .note sweep cannot unlink files it still writes.
+    pub(crate) load_guard: Option<Arc<Mutex<HashSet<VolumeId>>>>,
+    /// The data directory of every disk on this server.
+    pub(crate) store_dirs: Vec<String>,
+}
+
+/// Keeps `vid` in the copy-claim set through one scan load so a VolumeCopy
+/// arriving mid-load sees the claim and backs off — the release half of
+/// Go's loadGuard hook.
+struct LoadClaim {
+    claims: Arc<Mutex<HashSet<VolumeId>>>,
+    vid: VolumeId,
+}
+
+impl Drop for LoadClaim {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.vid);
+    }
 }
 
 impl DiskLocation {
@@ -67,11 +98,19 @@ impl DiskLocation {
             fs::create_dir_all(idx_directory)?;
             idx_directory.to_string()
         };
+        let read_only_mount = is_read_only_mount(directory) || is_read_only_mount(&idx_dir);
+        if read_only_mount {
+            info!(
+                "{} is on a read-only filesystem: its volumes load read-only, no new volumes",
+                directory
+            );
+        }
         let directory_uuid = Self::generate_directory_uuid(directory)?;
 
         Ok(DiskLocation {
             directory: directory.to_string(),
             idx_directory: idx_dir,
+            read_only_mount,
             directory_uuid,
             disk_type,
             tags,
@@ -81,9 +120,12 @@ impl DiskLocation {
             ec_volumes: HashMap::new(),
             is_disk_space_low: Arc::new(AtomicBool::new(false)),
             available_space: AtomicU64::new(0),
+            reserved_space: AtomicU64::new(0),
             disk_total_bytes: AtomicU64::new(0),
             disk_free_bytes: AtomicU64::new(0),
             min_free_space,
+            load_guard: None,
+            store_dirs: Vec::new(),
         })
     }
 
@@ -97,11 +139,59 @@ impl DiskLocation {
         }
 
         let dir_uuid = uuid::Uuid::new_v4().to_string();
-        fs::write(path, &dir_uuid)?;
-        Ok(dir_uuid)
+        match fs::write(&path, &dir_uuid) {
+            Ok(()) => Ok(dir_uuid),
+            // The uuid file cannot be written on a read-only mount; derive a
+            // stable one from the directory plus its device and host so
+            // restarts report the same id and independent disks at the same
+            // path differ.
+            Err(_) if is_read_only_mount(directory) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                directory.hash(&mut h);
+                if let Ok(meta) = fs::metadata(directory) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.dev().hash(&mut h);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                    }
+                }
+                if let Ok(host) = std::env::var("HOSTNAME") {
+                    host.hash(&mut h);
+                }
+                let derived = (h.finish() as u128) << 64 | h.finish() as u128;
+                Ok(uuid::Uuid::from_u128(derived).to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ---- Volume management ----
+
+    /// Go's loadGuard consult: `Ok(_)` lets the load proceed (holding the
+    /// vid's claim through it when the gate is installed), `Err` means a
+    /// VolumeCopy owns the vid and the scan skips it this pass.
+    fn claim_for_load(&self, vid: VolumeId) -> Result<Option<LoadClaim>, ()> {
+        match &self.load_guard {
+            None => Ok(None),
+            Some(claims) => {
+                let mut set = claims.lock().unwrap_or_else(|e| e.into_inner());
+                if set.contains(&vid) {
+                    Err(())
+                } else {
+                    set.insert(vid);
+                    Ok(Some(LoadClaim {
+                        claims: claims.clone(),
+                        vid,
+                    }))
+                }
+            }
+        }
+    }
 
     /// Load existing volumes from the directory.
     ///
@@ -140,9 +230,29 @@ impl DiskLocation {
             }
         }
 
+        // Claims for the queued volumes: held until open_volumes has read
+        // their indexes, so a VolumeCopy cannot take the vid between this
+        // sweep pass and the actual load — the span Go's loadGuard covers.
+        let mut held_claims: Vec<LoadClaim> = Vec::new();
+
         for (collection, vid) in dat_files {
             let volume_name = volume_file_name(&self.directory, &collection, vid);
             let idx_name = volume_file_name(&self.idx_directory, &collection, vid);
+
+            // A copy of this volume may be mid-flight: the sweeps below
+            // would unlink files it is still writing, and a register here
+            // could slip past its own recheck. Skip while a copy owns the
+            // vid and claim it through the load — Go's loadGuard. A vid this
+            // scan already queued is claimed by us: run this collection's
+            // sweeps without re-claiming and merge it into the entry below.
+            let load_claim = if queued.contains_key(&vid) {
+                None
+            } else {
+                match self.claim_for_load(vid) {
+                    Ok(claim) => claim,
+                    Err(()) => continue,
+                }
+            };
 
             // Sweep a leftover empty `.dat` stub (a phantom from the pre-fix
             // loader) before it loads as a phantom volume or blocks startup.
@@ -232,6 +342,7 @@ impl DiskLocation {
                 None => {
                     queued.insert(vid, to_load.len());
                     to_load.push((vid, vec![collection]));
+                    held_claims.extend(load_claim);
                 }
             }
         }
@@ -354,6 +465,13 @@ impl DiskLocation {
             if self.volumes.contains_key(&vid) {
                 continue;
             }
+            // A copy of this id can be mid-flight at the same basenames:
+            // rolling a leftover commit forward would rename compaction
+            // temps over the files it is writing. Same skip the load takes.
+            let _load_claim = match self.claim_for_load(vid) {
+                Ok(claim) => claim,
+                Err(()) => continue,
+            };
             let v = Volume::new_unloaded(&self.directory, &self.idx_directory, &collection, vid);
             if let Err(e) = v.reconcile_compact_state() {
                 warn!(volume_id = vid.0, error = %e, "reconcile interrupted compaction failed");
@@ -371,8 +489,20 @@ impl DiskLocation {
 
         // Custom ratio comes from the volume's own .vif; the server holds no
         // cluster EC config in memory.
-        let data_shards =
-            ec_data_shards_from_vif(&self.directory, &self.idx_directory, collection, vid);
+        let data_shards = ec_data_shards_from_vif(
+            &self.directory,
+            &self.idx_directory,
+            &self.store_dirs,
+            collection,
+            vid,
+        );
+        if data_shards == 0 {
+            warn!(
+                volume_id = vid.0,
+                "sibling .vif files disagree on the encode; keeping EC shards"
+            );
+            return true;
+        }
 
         // On-disk .dat: an empty <= superblock one is a stub; a transient stat
         // error keeps the shards rather than deleting.
@@ -699,6 +829,24 @@ impl DiskLocation {
         self.volumes.len()
     }
 
+    /// Number of local volumes of `collection` that still take writes: not
+    /// read-only and, when `volume_size_limit` is known (non zero), with a .dat
+    /// below it. The .dat size is what the master compares with the limit to
+    /// stop writes. Mirrors Go's WritableCollectionVolumesLen.
+    pub fn writable_collection_volumes_len(
+        &self,
+        collection: &str,
+        volume_size_limit: u64,
+    ) -> usize {
+        self.volumes
+            .values()
+            .filter(|v| v.collection == collection && !v.has_remote_file() && !v.is_read_only())
+            .filter(|v| {
+                volume_size_limit == 0 || v.dat_file_size().unwrap_or(0) < volume_size_limit
+            })
+            .count()
+    }
+
     /// Get all volume IDs, sorted.
     pub fn volume_ids(&self) -> Vec<VolumeId> {
         let mut ids: Vec<VolumeId> = self.volumes.keys().copied().collect();
@@ -715,6 +863,9 @@ impl DiskLocation {
     /// Matches Go's FindFreeLocation formula:
     ///   free = ((MaxVolumeCount - VolumesLen()) * DataShardsCount - EcShardCount()) / DataShardsCount
     pub fn free_volume_count(&self) -> i32 {
+        if self.read_only_mount {
+            return 0;
+        }
         use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
         let max = self.max_volume_count.load(Ordering::Relaxed);
         let free_count = (max as i64 - self.volumes.len() as i64) * DATA_SHARDS_COUNT as i64
@@ -761,15 +912,16 @@ impl DiskLocation {
             return;
         }
         let used = total.saturating_sub(free);
-        let is_low = match &self.min_free_space {
-            MinFreeSpace::Percent(pct) => {
-                let free_pct = (free as f64 / total as f64) * 100.0;
-                free_pct < *pct
-            }
-            MinFreeSpace::Bytes(min_bytes) => free < *min_bytes,
-        };
+        let is_low = self.min_free_space.is_low(free, total);
         self.is_disk_space_low.store(is_low, Ordering::Relaxed);
-        self.available_space.store(free, Ordering::Relaxed);
+        // Go's DiskLocation.AvailableSpace counts only free space above the
+        // -volume.minFreeSpace floor, so space checks stay above it too.
+        self.available_space.store(
+            self.min_free_space
+                .available_space(free, total)
+                .saturating_sub(self.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         self.disk_total_bytes.store(total, Ordering::Relaxed);
         self.disk_free_bytes.store(free, Ordering::Relaxed);
 
@@ -901,7 +1053,9 @@ impl DiskLocation {
         // propagate the error to the caller.
         let created = !self.ec_volumes.contains_key(&vid);
         if created {
-            let ec_vol = EcVolume::new(&dir, idx_dir, collection, vid).map_err(VolumeError::Io)?;
+            let ec_vol =
+                EcVolume::new_with_vif_dirs(&dir, idx_dir, &self.store_dirs, collection, vid)
+                    .map_err(VolumeError::Io)?;
             self.ec_volumes.insert(vid, ec_vol);
         }
         let ec_vol = self.ec_volumes.get_mut(&vid).expect("just inserted above");
@@ -945,6 +1099,32 @@ impl DiskLocation {
                 .inc();
         }
         Ok(())
+    }
+
+    /// Swap the mounted shard's descriptor for a fresh open of its on-disk
+    /// file, keeping the registration — and therefore the master's view —
+    /// untouched. Mirrors Go's `DiskLocation.ReopenEcShard`: the rebuild
+    /// recreates a shard file under a handle that still serves the detached
+    /// inode, and reopening repoints reads at the repaired file without an
+    /// unmount/remount heartbeat flip-flop. Readers holding a cloned fd keep
+    /// the old inode until they finish — the same contract eviction relies on.
+    pub fn reopen_ec_shard(&mut self, vid: VolumeId, shard_id: ShardId) -> Result<bool, VolumeError> {
+        let dir = self.directory.clone();
+        let Some(ec_vol) = self.ec_volumes.get_mut(&vid) else {
+            return Ok(false);
+        };
+        let Some(existing) = ec_vol
+            .shards
+            .get_mut(shard_id as usize)
+            .and_then(|s| s.as_mut())
+        else {
+            return Ok(false);
+        };
+        let mut new_shard = EcVolumeShard::new(&dir, &existing.collection, vid, shard_id);
+        new_shard.disk_type = existing.disk_type.clone();
+        new_shard.open().map_err(VolumeError::Io)?;
+        *existing = new_shard;
+        Ok(true)
     }
 
     /// Unmount EC shards for a volume on this location.
@@ -1173,6 +1353,27 @@ impl DiskLocation {
     }
 }
 
+/// Mirror of Go's `util.IsReadOnlyMount`: access(2) with W_OK answers EROFS
+/// for a filesystem mounted read-only regardless of the permission bits, and
+/// also for root, unlike a permission-bits check.
+#[cfg(unix)]
+pub(crate) fn is_read_only_mount(path: &str) -> bool {
+    use std::ffi::CString;
+    let c_path = match CString::new(path.as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0 {
+        return false;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EROFS)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_read_only_mount(_path: &str) -> bool {
+    false
+}
+
 /// Get total and free disk space for a given path.
 /// Returns (total_bytes, free_bytes).
 pub fn get_disk_stats(path: &str) -> (u64, u64) {
@@ -1275,6 +1476,7 @@ fn rm_if_present(path: String) -> io::Result<()> {
 fn ec_data_shards_from_vif(
     directory: &str,
     idx_directory: &str,
+    store_dirs: &[String],
     collection: &str,
     vid: VolumeId,
 ) -> usize {
@@ -1292,6 +1494,23 @@ fn ec_data_shards_from_vif(
         if directory == idx_directory {
             break;
         }
+    }
+    match crate::storage::erasure_coding::ec_volume::sibling_ec_config_vif(
+        directory,
+        idx_directory,
+        store_dirs,
+        collection,
+        vid,
+    ) {
+        Err(()) => return 0,
+        Ok(Some(vi)) => {
+            if let Some(ds) = vi.ec_shard_config.map(|c| c.data_shards as usize)
+                && ds > 0
+            {
+                return ds;
+            }
+        }
+        Ok(None) => {}
     }
     DATA_SHARDS_COUNT
 }
@@ -1376,7 +1595,7 @@ pub(crate) fn vif_references_remote_file(vif_path: &str) -> bool {
 /// True when a `.vif` records an EC shard config, i.e. the volume was
 /// erasure-coded. Such a volume keeps no local `.dat`, so an empty `.dat`
 /// alongside it is a leftover stub safe to remove.
-fn vif_is_ec_volume(vif_path: &str) -> bool {
+pub(crate) fn vif_is_ec_volume(vif_path: &str) -> bool {
     fs::read_to_string(vif_path)
         .ok()
         .and_then(|s| serde_json::from_str::<VifVolumeInfo>(&s).ok())
@@ -1443,6 +1662,73 @@ mod tests {
         let (total, free) = get_disk_stats(tmp.path().to_str().unwrap());
         assert!(total > 0, "expected total>0, got {total}");
         assert!(free > 0, "expected free>0, got {free}");
+    }
+
+    // Mirrors Go's DiskLocation.AvailableSpace: the cached figure a copy is
+    // checked against counts only free space above the min-free-space floor.
+    #[test]
+    fn test_check_disk_space_counts_only_space_above_floor() {
+        const FLOOR: u64 = 1 << 20;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            loc.disk_free_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(FLOOR)
+        );
+
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(u64::MAX),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), 0);
+    }
+
+    // Mirrors Go's CheckDiskSpace pending subtraction: an in-flight copy's
+    // charge stays out of the cache across a probe, so another copy cannot
+    // re-spend the headroom the live reading still shows as free.
+    #[test]
+    fn test_check_disk_space_keeps_pending_reservation_out_of_cache() {
+        const FLOOR: u64 = 1 << 20;
+        const RESERVED: u64 = 512 * 1024;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.reserved_space.store(RESERVED, Ordering::Relaxed);
+        loc.check_disk_space();
+        let expected = loc
+            .min_free_space
+            .available_space(
+                loc.disk_free_bytes.load(Ordering::Relaxed),
+                loc.disk_total_bytes.load(Ordering::Relaxed),
+            )
+            .saturating_sub(RESERVED);
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), expected);
     }
 
     /// When `-dir.idx` is configured the EC `.vif` may live in the idx
@@ -1641,6 +1927,62 @@ mod tests {
         );
         assert_eq!(parse_volume_filename("notadat.idx"), None);
         assert_eq!(parse_volume_filename("bad.dat"), None);
+    }
+
+    // A volume mid-copy must not be swept or loaded by a reload: a claimed
+    // vid is skipped outright — .note files and all — and an unclaimed vid
+    // is claimed through its load, released when the pass ends. Mirrors
+    // Go's TestLoadExistingVolumeSkipsACopyInFlight.
+    #[test]
+    fn test_load_existing_volumes_skips_a_copy_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        {
+            let mut loc = DiskLocation::new(
+                dir,
+                dir,
+                10,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+            loc.create_volume(VolumeId(9), NeedleMapKind::InMemory, &VolumeSpec::default())
+                .unwrap();
+            loc.close();
+        }
+        // The copy's in-progress marker: unclaimed, the sweep unlinks the files.
+        fs::write(format!("{dir}/9.note"), "copying from test").unwrap();
+
+        let claims = Arc::new(Mutex::new(HashSet::new()));
+        let mut loc = DiskLocation::new(
+            dir,
+            dir,
+            10,
+            DiskType::HardDrive,
+            MinFreeSpace::Percent(1.0),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.load_guard = Some(claims.clone());
+
+        claims.lock().unwrap().insert(VolumeId(9));
+        loc.load_existing_volumes(NeedleMapKind::InMemory).unwrap();
+        assert!(loc.find_volume(VolumeId(9)).is_none());
+        assert!(
+            std::path::Path::new(&format!("{dir}/9.dat")).exists(),
+            "the sweep must not unlink files a VolumeCopy still owns"
+        );
+        assert!(std::path::Path::new(&format!("{dir}/9.note")).exists());
+
+        claims.lock().unwrap().remove(&VolumeId(9));
+        fs::remove_file(format!("{dir}/9.note")).unwrap();
+        loc.load_existing_volumes(NeedleMapKind::InMemory).unwrap();
+        assert!(loc.find_volume(VolumeId(9)).is_some());
+        assert!(
+            claims.lock().unwrap().is_empty(),
+            "the load's claim must release when the pass ends"
+        );
     }
 
     #[test]
@@ -2222,5 +2564,54 @@ mod tests {
                 p,
             );
         }
+    }
+
+    /// Mirrors Go's TestReopenEcShardReadsReplacedFile: a shard file the
+    /// rebuild replaced under its mount keeps serving the old inode through
+    /// the open descriptor; reopen_ec_shard must repoint the mounted shard at
+    /// the new file without dropping its registration.
+    #[test]
+    fn test_reopen_ec_shard_reads_replaced_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut loc = DiskLocation::new(
+            dir,
+            dir,
+            10,
+            DiskType::HardDrive,
+            MinFreeSpace::Percent(0.0),
+            Vec::new(),
+        )
+        .unwrap();
+
+        std::fs::write(format!("{}/pics_5.ecx", dir), [0u8; 16]).unwrap();
+        let shard_path = format!("{}/pics_5.ec00", dir);
+        std::fs::write(&shard_path, b"old bytes").unwrap();
+        loc.mount_ec_shards(VolumeId(5), "pics", &[0], "").unwrap();
+
+        let read_shard = |loc: &DiskLocation| -> Vec<u8> {
+            let ec_vol = loc.find_ec_volume(VolumeId(5)).expect("ec volume mounted");
+            let shard = ec_vol.shards[0].as_ref().expect("shard 0 mounted");
+            let mut buf = vec![0u8; shard.file_size() as usize];
+            let n = shard.read_at(&mut buf, 0).unwrap();
+            buf.truncate(n);
+            buf
+        };
+        assert_eq!(read_shard(&loc), b"old bytes");
+
+        // The rebuild writes a fresh file and renames it over the original:
+        // the mounted descriptor is now on the detached inode.
+        let rebuilt = format!("{}.rebuilding", shard_path);
+        std::fs::write(&rebuilt, b"new bytes").unwrap();
+        std::fs::rename(&rebuilt, &shard_path).unwrap();
+        assert_eq!(read_shard(&loc), b"old bytes", "mounted shard still reads the replaced inode");
+
+        assert!(loc.reopen_ec_shard(VolumeId(5), 0).unwrap());
+        assert_eq!(read_shard(&loc), b"new bytes", "reopened shard should read the regenerated file");
+
+        assert!(
+            !loc.reopen_ec_shard(VolumeId(5), 7).unwrap(),
+            "a shard that is not mounted should report false"
+        );
     }
 }

@@ -1,7 +1,6 @@
 package s3api
 
 import (
-	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -23,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
@@ -59,6 +59,10 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 	}
 	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+	if errCode := s3a.checkVersionFileWrite(bucket, object, "NewMultipartUploadHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
@@ -161,15 +165,19 @@ func (s3a *S3ApiServer) CompleteMultipartUploadHandler(w http.ResponseWriter, r 
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
 	}
+	if errCode := s3a.checkVersionFileWrite(bucket, object, "CompleteMultipartUploadHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 
 	parts := &CompleteMultipartUpload{}
 	if err := xmlDecoder(r.Body, parts, r.ContentLength); err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrMalformedXML)
+		s3err.WriteErrorResponse(w, r, requestBodyErrorCode(err, s3err.ErrMalformedXML))
 		return
 	}
 
 	// Get upload id.
-	uploadID, _, _, _ := getObjectResources(r.URL.Query())
+	uploadID, _, _, _, _ := getObjectResources(r.URL.Query())
 	err := s3a.checkUploadId(object, uploadID)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
@@ -224,7 +232,7 @@ func (s3a *S3ApiServer) AbortMultipartUploadHandler(w http.ResponseWriter, r *ht
 	}
 
 	// Get upload id.
-	uploadID, _, _, _ := getObjectResources(r.URL.Query())
+	uploadID, _, _, _, _ := getObjectResources(r.URL.Query())
 	err := s3a.checkUploadId(object, uploadID)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
@@ -260,10 +268,21 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
+	prefix, multipartKeyMarker, uploadIDMarker, delimiter, maxUploads, encodingType, errCode := getBucketMultipartResources(r.URL.Query())
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 	if maxUploads < 0 {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxUploads)
 		return
+	}
+	// The marker is a raw key: under encoding-type=url clients decode the
+	// escaped response fields and send the key itself back. The token form
+	// only appears when the response could not carry the raw key.
+	keyMarker := multipartKeyMarker
+	if encodingType != s3.EncodingTypeUrl {
+		keyMarker = decodeListContinuationToken(multipartKeyMarker)
 	}
 	if keyMarker != "" {
 		// Marker not common with prefix is not implemented.
@@ -290,8 +309,6 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// TODO handle encodingType
-
 	writeSuccessResponseXML(w, r, response)
 }
 
@@ -305,7 +322,11 @@ func (s3a *S3ApiServer) ListObjectPartsHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	uploadID, partNumberMarker, maxParts, _ := getObjectResources(r.URL.Query())
+	uploadID, partNumberMarker, maxParts, _, errCode := getObjectResources(r.URL.Query())
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 	if partNumberMarker < 0 {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPartNumberMarker)
 		return
@@ -376,6 +397,11 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if _, errCode := validatePutHeaders(r); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
 	dataReader, s3ErrCode := getRequestDataReader(s3a, r)
 	if s3ErrCode != s3err.ErrNone {
 		glog.Errorf("PutObjectPartHandler: getRequestDataReader failed with code %v", s3ErrCode)
@@ -387,7 +413,7 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 	glog.V(2).Infof("PutObjectPartHandler %s %s %04d", bucket, uploadID, partID)
 
 	// Verify the multipart upload exists (rejects parts after abort)
-	uploadEntry, err := s3a.getEntry(s3a.genUploadsFolder(bucket), uploadID)
+	uploadEntry, err := s3a.uploadFiler(bucket, object).getEntry(s3a.genUploadsFolder(bucket), uploadID)
 	if errors.Is(err, filer_pb.ErrNotFound) {
 		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
 		return
@@ -488,7 +514,7 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 	// start the TTL clock before CompleteMultipartUpload ever assembled
 	// the object. filer.conf storage rules are the opposite case: they
 	// place the bytes the part becomes, so they resolve against the object.
-	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, "", partID, 0, nil, false, s3a.toFilerPath(bucket, object))
+	etag, errCode, sseMetadata := s3a.putToFiler(withMultipartPart(r, s3a.uploadFiler(bucket, object)), filePath, dataReader, bucket, "", partID, 0, nil, false, s3a.toFilerPath(bucket, object))
 	if errCode != s3err.ErrNone {
 		glog.Errorf("PutObjectPart: putToFiler failed with error code %v for bucket=%s, object=%s, partNumber=%d",
 			errCode, bucket, object, partID)
@@ -528,25 +554,33 @@ func isMultipartUploadEntry(entry *filer_pb.Entry) bool {
 // part along with the directory it resurrected when an abort was answered while
 // the part was in flight. It reports whether the caller may answer success.
 func (s3a *S3ApiServer) checkUploadStillOpen(w http.ResponseWriter, r *http.Request, bucket, object, uploadID string) bool {
-	entry, err := s3a.getEntry(s3a.genUploadsFolder(bucket), uploadID)
-	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
-		glog.Errorf("checkUploadStillOpen %s/%s: %v", bucket, uploadID, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+	if code := s3a.uploadStillOpen(bucket, object, uploadID); code != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, code)
 		return false
 	}
+	return true
+}
+
+// uploadStillOpen is checkUploadStillOpen for a caller that writes its own
+// answer: ErrNone, or the error the client must hear.
+func (s3a *S3ApiServer) uploadStillOpen(bucket, object, uploadID string) s3err.ErrorCode {
+	entry, err := s3a.uploadFiler(bucket, object).getEntry(s3a.genUploadsFolder(bucket), uploadID)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		glog.Errorf("checkUploadStillOpen %s/%s: %v", bucket, uploadID, err)
+		return s3err.ErrInternalError
+	}
 	if isMultipartUploadEntry(entry) {
-		return true
+		return s3err.ErrNone
 	}
 	// the upload is gone either way, so the client still hears NoSuchUpload
 	if _, code := s3a.abortMultipartUpload(&s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(bucket),
 		Key:      objectKey(aws.String(object)),
 		UploadId: aws.String(uploadID),
-	}); code != s3err.ErrNone {
+	}); code != s3err.ErrNone && code != s3err.ErrNoSuchUpload {
 		glog.Warningf("checkUploadStillOpen %s/%s: part left behind, cleanup failed", bucket, uploadID)
 	}
-	s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
-	return false
+	return s3err.ErrNoSuchUpload
 }
 
 // getMultipartSSEAlgorithm returns the canonical SSE algorithm ("AES256" or
@@ -554,8 +588,8 @@ func (s3a *S3ApiServer) checkUploadStillOpen(w http.ResponseWriter, r *http.Requ
 // if the upload entry is not found or had no SSE. It is used by the bucket
 // policy engine to evaluate s3:x-amz-server-side-encryption conditions for
 // UploadPart and UploadPartCopy, which do not re-send the SSE header.
-func (s3a *S3ApiServer) getMultipartSSEAlgorithm(bucket, uploadID string) string {
-	entry, err := s3a.getEntry(s3a.genUploadsFolder(bucket), uploadID)
+func (s3a *S3ApiServer) getMultipartSSEAlgorithm(bucket, object, uploadID string) string {
+	entry, err := s3a.uploadFiler(bucket, object).getEntry(s3a.genUploadsFolder(bucket), uploadID)
 	if err != nil || entry == nil || entry.Extended == nil {
 		return ""
 	}
@@ -579,7 +613,7 @@ func (s3a *S3ApiServer) genPartUploadPath(bucket, uploadID string, partID int) s
 func (s3a *S3ApiServer) generateUploadID(object string) string {
 
 	object = strings.TrimPrefix(object, "/")
-	h := sha1.New()
+	h := util.NewSha1()
 	h.Write([]byte(object))
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
@@ -616,30 +650,50 @@ func isLowerHex(value string) bool {
 }
 
 // Parse bucket url queries for ?uploads
-func getBucketMultipartResources(values url.Values) (prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int, encodingType string) {
+func getBucketMultipartResources(values url.Values) (prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int, encodingType string, errCode s3err.ErrorCode) {
 	prefix = values.Get("prefix")
 	keyMarker = values.Get("key-marker")
 	uploadIDMarker = values.Get("upload-id-marker")
 	delimiter = values.Get("delimiter")
 	if values.Get("max-uploads") != "" {
-		maxUploads, _ = strconv.Atoi(values.Get("max-uploads"))
+		parsed, err := strconv.ParseInt(values.Get("max-uploads"), 10, 32)
+		if err != nil {
+			errCode = s3err.ErrInvalidMaxUploads
+		}
+		maxUploads = int(parsed)
 	} else {
 		maxUploads = maxUploadsList
 	}
 	encodingType = values.Get("encoding-type")
+	if _, encodingErr := parseEncodingType(values); encodingErr != s3err.ErrNone && errCode == s3err.ErrNone {
+		errCode = encodingErr
+	}
 	return
 }
 
 // Parse object url queries
-func getObjectResources(values url.Values) (uploadID string, partNumberMarker, maxParts int, encodingType string) {
+func getObjectResources(values url.Values) (uploadID string, partNumberMarker, maxParts int, encodingType string, errCode s3err.ErrorCode) {
 	uploadID = values.Get("uploadId")
-	partNumberMarker, _ = strconv.Atoi(values.Get("part-number-marker"))
+	if values.Get("part-number-marker") != "" {
+		parsed, err := strconv.ParseInt(values.Get("part-number-marker"), 10, 32)
+		if err != nil {
+			errCode = s3err.ErrInvalidPartNumberMarker
+		}
+		partNumberMarker = int(parsed)
+	}
 	if values.Get("max-parts") != "" {
-		maxParts, _ = strconv.Atoi(values.Get("max-parts"))
+		parsed, err := strconv.ParseInt(values.Get("max-parts"), 10, 32)
+		if err != nil {
+			errCode = s3err.ErrInvalidMaxParts
+		}
+		maxParts = int(parsed)
 	} else {
 		maxParts = maxPartsList
 	}
 	encodingType = values.Get("encoding-type")
+	if _, encodingErr := parseEncodingType(values); encodingErr != s3err.ErrNone && errCode == s3err.ErrNone {
+		errCode = encodingErr
+	}
 	return
 }
 

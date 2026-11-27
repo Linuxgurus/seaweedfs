@@ -3,6 +3,7 @@ package erasure_coding
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -98,7 +99,7 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 		WorkerConfigForm: &plugin_pb.ConfigForm{
 			FormId:      "erasure-coding-worker",
 			Title:       "Erasure Coding Worker Config",
-			Description: "Worker-side detection thresholds.",
+			Description: "Worker-side detection and shard placement.",
 			Sections: []*plugin_pb.ConfigSection{
 				{
 					SectionId:   "thresholds",
@@ -133,6 +134,13 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 							Required:    true,
 							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
 						},
+					},
+				},
+				{
+					SectionId:   "placement",
+					Title:       "Shard Placement",
+					Description: "Where EC shards go: disk tags, replica-placement caps, Place ranking.",
+					Fields: []*plugin_pb.ConfigField{
 						{
 							Name:        "preferred_tags",
 							Label:       "Preferred Tags",
@@ -170,11 +178,34 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
 						},
 						{
+							Name:        "free_slots_deadband",
+							Label:       "Free Volume Deadband (M)",
+							Description: "Nodes whose free volume slots differ by at most M are a tie; then fewer live shards wins. Applied as M × data shards (10+4 → ×10). 0 = always pick more free slots.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0}},
+							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 100000}},
+						},
+						{
 							Name:        "strict_placement",
 							Label:       "Strict Placement",
 							Description: "Fail EC planning when the placement constraints cannot be met instead of relaxing them.",
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_BOOL,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_TOGGLE,
+						},
+					},
+				},
+				{
+					SectionId:   "shard_distribution",
+					Title:       "Shard distribution",
+					Description: "How many EC shard copies are in flight. The checkbox is presentation only; the saved value is max_shard_transfers.",
+					Fields: []*plugin_pb.ConfigField{
+						{
+							Name:        "max_shard_transfers",
+							Label:       "Parallel shard distribution",
+							Description: "Unchecked sends shards sequentially. Checked with an empty max uses one in-flight copy per destination disk. A number is a global cap, still one copy per disk.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
 						},
 					},
 				},
@@ -204,6 +235,9 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 				"strict_placement": {
 					Kind: &plugin_pb.ConfigValue_BoolValue{BoolValue: false},
 				},
+				"free_slots_deadband": {
+					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0},
+				},
 			},
 		},
 		AdminRuntimeDefaults: &plugin_pb.AdminRuntimeDefaults{
@@ -230,6 +264,9 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 			},
 			"preferred_tags": {
 				Kind: &plugin_pb.ConfigValue_StringValue{StringValue: ""},
+			},
+			"free_slots_deadband": {
+				Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0},
 			},
 		},
 	}
@@ -558,6 +595,8 @@ func (h *ErasureCodingHandler) Execute(
 		h.grpcDialOption,
 	)
 	task.workerAddress = h.workerAddress
+	task.masterAddresses = request.GetClusterContext().GetMasterGrpcAddresses()
+	task.maxShardTransfers = deriveErasureCodingWorkerConfig(request.GetWorkerConfigValues()).TaskConfig.MaxShardTransfers
 	execCtx, execCancel := context.WithCancel(ctx)
 	defer execCancel()
 	task.SetProgressCallback(func(progress float64, stage string) {
@@ -677,9 +716,38 @@ func deriveErasureCodingWorkerConfig(values map[string]*plugin_pb.ConfigValue) *
 	applyConfiguredEcRatio(values, taskConfig)
 	taskConfig.StrictPlacement = pluginworker.ReadBoolConfig(values, "strict_placement", taskConfig.StrictPlacement)
 
+	deadband := pluginworker.ReadIntConfig(values, "free_slots_deadband", taskConfig.FreeSlotsDeadband)
+	if deadband < 0 {
+		deadband = 0
+	} else if deadband > 100000 {
+		deadband = 100000
+	}
+	taskConfig.FreeSlotsDeadband = deadband
+	taskConfig.MaxShardTransfers = maxShardTransfersFromValues(values)
+
 	return &erasureCodingWorkerConfig{
 		TaskConfig: taskConfig,
 	}
+}
+
+// maxShardTransfersFromValues returns nil when the key is absent so shard
+// distribution keeps the uncapped default. 0 is sequential; N>0 is a global cap.
+func maxShardTransfersFromValues(values map[string]*plugin_pb.ConfigValue) *int {
+	if values == nil {
+		return nil
+	}
+	value, ok := values["max_shard_transfers"]
+	if !ok || value == nil {
+		return nil
+	}
+	n := pluginworker.ReadInt64Config(values, "max_shard_transfers", 0)
+	v := 0
+	if n > math.MaxInt32 {
+		v = math.MaxInt32
+	} else if n > 0 {
+		v = int(n)
+	}
+	return &v
 }
 
 func buildErasureCodingProposal(

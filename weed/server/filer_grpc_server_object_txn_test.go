@@ -229,6 +229,90 @@ func TestObjectTransactionPreconditionAborts(t *testing.T) {
 	}
 }
 
+// A mutation's own precondition is checked under the same lock just before the
+// mutation applies; a failure aborts the transaction at that mutation and is
+// reported through failed_mutation, leaving earlier mutations' work visible.
+func TestObjectTransactionMutationCondition(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	fs, store := newTxnTestServer(t, map[string]*filer.Entry{
+		"/buckets/bkt/obj": {
+			Attr: filer.Attr{Inode: 1, Mtime: now, Crtime: now, Mode: 0644},
+		},
+	})
+
+	mkReq := func() *filer_pb.ObjectTransactionRequest {
+		return &filer_pb.ObjectTransactionRequest{
+			LockKey: "/buckets/bkt/obj",
+			Mutations: []*filer_pb.ObjectMutation{
+				{Type: filer_pb.ObjectMutation_PUT, Directory: "/buckets/bkt", Entry: &filer_pb.Entry{
+					Name:       "other",
+					Attributes: &filer_pb.FuseAttributes{Mtime: now.Unix(), FileMode: 0644, Inode: 2},
+				}, Condition: &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{
+					{Kind: filer_pb.WriteCondition_IF_NOT_EXISTS},
+				}}, ConditionKey: "/buckets/bkt/obj"},
+				{Type: filer_pb.ObjectMutation_DELETE, Directory: "/buckets/bkt", Name: "obj"},
+			},
+		}
+	}
+
+	resp, err := fs.ObjectTransaction(context.Background(), mkReq())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resp.ErrorCode != filer_pb.FilerError_PRECONDITION_FAILED {
+		t.Fatalf("want PRECONDITION_FAILED, got %v (%q)", resp.ErrorCode, resp.Error)
+	}
+	if resp.FailedMutation == nil || *resp.FailedMutation != 0 {
+		t.Fatalf("want failed_mutation=0, got %v", resp.FailedMutation)
+	}
+	if _, ok := store.entries["/buckets/bkt/other"]; ok {
+		t.Errorf("PUT whose condition failed must not store an entry")
+	}
+	if _, ok := store.entries["/buckets/bkt/obj"]; !ok {
+		t.Errorf("a failed mutation condition must abort before later mutations run")
+	}
+
+	// With the slot absent the same transaction applies both mutations.
+	delete(store.entries, "/buckets/bkt/obj")
+	resp, err = fs.ObjectTransaction(context.Background(), mkReq())
+	if err != nil || resp.Error != "" {
+		t.Fatalf("txn failed: err=%v resp=%q", err, resp.Error)
+	}
+	if _, ok := store.entries["/buckets/bkt/other"]; !ok {
+		t.Errorf("condition satisfied: PUT entry missing")
+	}
+}
+
+// The request-level condition keeps reporting no failed_mutation, so callers
+// can tell it apart from a mutation's own guard.
+func TestObjectTransactionMutationConditionVsRequest(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	fs, _ := newTxnTestServer(t, map[string]*filer.Entry{
+		"/buckets/bkt/obj": {
+			Attr: filer.Attr{Inode: 1, Mtime: now, Crtime: now, Mode: 0644},
+		},
+	})
+
+	resp, err := fs.ObjectTransaction(context.Background(), &filer_pb.ObjectTransactionRequest{
+		LockKey: "/buckets/bkt/obj",
+		Condition: &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{
+			{Kind: filer_pb.WriteCondition_IF_NOT_EXISTS},
+		}},
+		Mutations: []*filer_pb.ObjectMutation{
+			{Type: filer_pb.ObjectMutation_DELETE, Directory: "/buckets/bkt", Name: "obj"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resp.ErrorCode != filer_pb.FilerError_PRECONDITION_FAILED {
+		t.Fatalf("want PRECONDITION_FAILED, got %v (%q)", resp.ErrorCode, resp.Error)
+	}
+	if resp.FailedMutation != nil {
+		t.Fatalf("request-level failure must not set failed_mutation, got %d", *resp.FailedMutation)
+	}
+}
+
 // Deleting the latest version and recomputing re-points the pointer at the new
 // highest-named remaining version; the scan runs under the transaction lock.
 func TestObjectTransactionRecomputeLatest(t *testing.T) {
@@ -772,12 +856,11 @@ func TestObjectTransactionRouteKeyOwnerAppliesLocally(t *testing.T) {
 	}
 }
 
-// A forwarded transaction (is_moved over a ring member's connection) applies
-// locally even when the ring names a different owner: is_moved bounds
-// forwarding to a single hop, so two filers that disagree on the owner during
-// a ring change cannot loop. Without the marker this would attempt to dial
-// the bogus owner instead of applying.
-func TestObjectTransactionIsMovedSkipsForward(t *testing.T) {
+// A forwarded transaction (is_moved over a ring member's connection) on a
+// filer whose ring names a different owner is refused, neither applied under
+// this filer's lock nor forwarded again, so two filers that disagree on the
+// owner during a ring change can neither both apply it nor loop.
+func TestObjectTransactionIsMovedRefusedByNonOwner(t *testing.T) {
 	self := pb.ServerAddress("localhost:1")
 	other := pb.ServerAddress("localhost:2")
 	fs, store := newTxnTestServer(t, map[string]*filer.Entry{
@@ -785,7 +868,7 @@ func TestObjectTransactionIsMovedSkipsForward(t *testing.T) {
 	})
 	withRing(fs, self, other) // ring owner is "other", not self
 
-	resp, err := fs.ObjectTransaction(ringPeerCtx(), &filer_pb.ObjectTransactionRequest{
+	_, err := fs.ObjectTransaction(ringPeerCtx(), &filer_pb.ObjectTransactionRequest{
 		LockKey:  "/buckets/b/obj",
 		RouteKey: "s3.object.write:/buckets/b/obj",
 		IsMoved:  true,
@@ -794,18 +877,16 @@ func TestObjectTransactionIsMovedSkipsForward(t *testing.T) {
 			SetExtended: map[string][]byte{"X-Amz-Meta-k": []byte("v")},
 		}},
 	})
-	if err != nil || resp.Error != "" {
-		t.Fatalf("txn failed: err=%v resp=%q", err, resp.Error)
+	if !isNotWriteOwner(err) {
+		t.Fatalf("a forwarded txn on a non-owner must be refused as not the write owner, got err=%v", err)
 	}
-	if string(store.entries["/buckets/b/obj"].Extended["X-Amz-Meta-k"]) != "v" {
-		t.Errorf("forwarded txn should apply locally: %v", store.entries["/buckets/b/obj"].Extended)
+	if _, set := store.entries["/buckets/b/obj"].Extended["X-Amz-Meta-k"]; set {
+		t.Errorf("a refused txn must not apply: %v", store.entries["/buckets/b/obj"].Extended)
 	}
 }
 
 // End-to-end forward hop: a non-owner filer dials the ring owner and the owner
-// applies the transaction. The owner's own ring points back at the (bogus)
-// sender, so it would re-forward and fail to dial unless is_moved is set on the
-// forwarded request — making this also assert that one-hop bound over the wire.
+// applies the transaction.
 func TestObjectTransactionForwardsToOwner(t *testing.T) {
 	owner, ownerStore := newTxnTestServer(t, map[string]*filer.Entry{
 		"/buckets/b/obj": {FullPath: "/buckets/b/obj", Attr: filer.Attr{Inode: 1, Mode: 0644}},
@@ -821,9 +902,7 @@ func TestObjectTransactionForwardsToOwner(t *testing.T) {
 	ownerAddr := pb.NewServerAddressWithGrpcPort(lis.Addr().String(), port)
 	sender := pb.ServerAddress("127.0.0.1:1") // bogus: nothing listens here
 
-	// owner's ring points back at the sender; only is_moved keeps it from
-	// re-forwarding to (and failing to dial) that bogus address.
-	withRing(owner, ownerAddr, sender)
+	withRing(owner, ownerAddr, ownerAddr)
 	owner.grpcDialOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 
 	srv := grpc.NewServer()
@@ -1093,5 +1172,44 @@ func TestObjectTransactionConditionIgnoresDirectory(t *testing.T) {
 	resp, err = fs.ObjectTransaction(context.Background(), req)
 	if err != nil || resp.ErrorCode != filer_pb.FilerError_PRECONDITION_FAILED {
 		t.Fatalf("directory at key with live latest: err=%v code=%v, want precondition failed", err, resp.GetErrorCode())
+	}
+}
+
+// A suspended-versioning write clears the latest-version pointer and leaves
+// the null object at the regular path as current. The prefer-alt condition
+// must keep resolving against that object, not reject on the empty pointer.
+func TestObjectTransactionConditionPreferAltHonorsNullIsLatest(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	seed := map[string]*filer.Entry{
+		"/buckets/bkt/obj": {
+			Attr:     filer.Attr{Inode: 1, Mtime: now, Crtime: now, Mode: 0644},
+			Extended: map[string][]byte{s3_constants.ExtETagKey: []byte("nulletag")},
+		},
+		"/buckets/bkt/obj/.versions": {
+			Attr:     filer.Attr{Inode: 2, Mtime: now, Crtime: now, Mode: 0755},
+			Extended: map[string][]byte{s3_constants.ExtNullVersionIsLatestKey: []byte("true")},
+		},
+	}
+	req := &filer_pb.ObjectTransactionRequest{
+		LockKey:            "/buckets/bkt/obj",
+		ConditionAltKey:    "/buckets/bkt/obj/.versions",
+		ConditionPreferAlt: true,
+		Condition: &filer_pb.WriteCondition{
+			Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"nulletag"`}}},
+		},
+		Mutations: []*filer_pb.ObjectMutation{{
+			Type:      filer_pb.ObjectMutation_PUT,
+			Directory: "/buckets/bkt",
+			Entry:     &filer_pb.Entry{Name: "obj", Attributes: &filer_pb.FuseAttributes{Mtime: now.Unix(), FileMode: 0644, Inode: 9}},
+		}},
+	}
+
+	fs, store := newTxnTestServer(t, seed)
+	resp, err := fs.ObjectTransaction(context.Background(), req)
+	if err != nil || resp.Error != "" {
+		t.Fatalf("null-is-latest: err=%v resp=%q, want applied", err, resp.Error)
+	}
+	if store.entries["/buckets/bkt/obj"] == nil {
+		t.Fatal("mutation did not apply over a null-is-latest .versions")
 	}
 }

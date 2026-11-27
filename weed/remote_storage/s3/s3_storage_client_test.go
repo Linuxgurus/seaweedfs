@@ -3,6 +3,8 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +13,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client/metadata"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -165,15 +169,16 @@ func (m *removeDirectoryMock) ListObjectsV2Pages(input *awss3.ListObjectsV2Input
 	return nil
 }
 
-func (m *removeDirectoryMock) DeleteObjects(input *awss3.DeleteObjectsInput) (*awss3.DeleteObjectsOutput, error) {
+func (m *removeDirectoryMock) DeleteObjectsRequest(input *awss3.DeleteObjectsInput) (*request.Request, *awss3.DeleteObjectsOutput) {
 	m.deleteInputs = append(m.deleteInputs, input)
-	if m.deleteErr != nil {
-		return nil, m.deleteErr
+	out := m.deleteResp
+	if out == nil {
+		out = &awss3.DeleteObjectsOutput{}
 	}
-	if m.deleteResp != nil {
-		return m.deleteResp, nil
-	}
-	return &awss3.DeleteObjectsOutput{}, nil
+	req := request.New(aws.Config{}, metadata.ClientInfo{}, request.Handlers{}, nil,
+		&request.Operation{Name: "DeleteObjects"}, input, out)
+	req.Error = m.deleteErr
+	return req, out
 }
 
 func listPage(keys ...string) *awss3.ListObjectsV2Output {
@@ -262,6 +267,43 @@ func TestS3RemoveDirectoryReturnsPerKeyError(t *testing.T) {
 	err := client.RemoveDirectory(loc)
 	require.ErrorContains(t, err, "2 keys failed")
 	require.ErrorContains(t, err, "testdir/a.bin")
+}
+
+// deleteObjectsProbe answers the listing and delete calls RemoveDirectory
+// makes against a real *s3.S3 client, and captures the DeleteObjects request
+// so the test can check the Content-MD5 header AWS requires.
+type deleteObjectsProbe struct {
+	deleteReq  *http.Request
+	deleteBody []byte
+}
+
+func (c *deleteObjectsProbe) RoundTrip(req *http.Request) (*http.Response, error) {
+	body := `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Contents><Key>testdir/a.bin</Key></Contents></ListBucketResult>`
+	if strings.Contains(req.URL.RawQuery, "delete") {
+		c.deleteReq = req.Clone(req.Context())
+		if req.Body != nil {
+			c.deleteBody, _ = io.ReadAll(req.Body)
+			_ = req.Body.Close()
+		}
+		body = `<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{},
+		Request:    req,
+	}, nil
+}
+
+func TestS3RemoveDirectorySendsContentMD5(t *testing.T) {
+	rt := &deleteObjectsProbe{}
+	client := newS3ClientWithTransport(t, rt, false)
+	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/testdir"}
+
+	require.NoError(t, client.RemoveDirectory(loc))
+	require.NotNil(t, rt.deleteReq, "DeleteObjects should be issued for the listed keys")
+	sum := md5.Sum(rt.deleteBody)
+	require.Equal(t, base64.StdEncoding.EncodeToString(sum[:]), rt.deleteReq.Header.Get("Content-Md5"))
 }
 
 // captureRoundTripper records the PUT request that the s3manager uploader
@@ -364,7 +406,7 @@ func TestS3UpdateFileMetadataSkipsTaggingWhenUnsupported(t *testing.T) {
 	client, rt := newRecordingS3Client(t, false)
 	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
 	plain := &filer_pb.Entry{}
-	tagged := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	tagged := &filer_pb.Entry{Extended: map[string][]byte{"X-Amz-Tagging-k1": []byte("v1")}}
 
 	_, err := client.UpdateFileMetadata(loc, plain, tagged)
 	require.NoError(t, err)
@@ -375,11 +417,22 @@ func TestS3UpdateFileMetadataSkipsTaggingWhenUnsupported(t *testing.T) {
 	require.Empty(t, rt.requests, "removing attributes must not send DeleteObjectTagging")
 }
 
+func TestS3UpdateFileMetadataIgnoresNonTagAttributes(t *testing.T) {
+	client, rt := newRecordingS3Client(t, true)
+	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
+	old := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	updated := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v2")}}
+
+	_, err := client.UpdateFileMetadata(loc, old, updated)
+	require.NoError(t, err)
+	require.Empty(t, rt.requests, "non-tag attribute changes must not send tagging calls")
+}
+
 func TestS3UpdateFileMetadataSendsTaggingWhenSupported(t *testing.T) {
 	client, rt := newRecordingS3Client(t, true)
 	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
 	plain := &filer_pb.Entry{}
-	tagged := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	tagged := &filer_pb.Entry{Extended: map[string][]byte{"X-Amz-Tagging-k1": []byte("v1")}}
 
 	_, err := client.UpdateFileMetadata(loc, plain, tagged)
 	require.NoError(t, err)
@@ -393,6 +446,49 @@ func TestS3UpdateFileMetadataSendsTaggingWhenSupported(t *testing.T) {
 	require.Len(t, rt.requests, 1)
 	require.Equal(t, http.MethodDelete, rt.requests[0].Method)
 	require.Contains(t, rt.requests[0].URL.RawQuery, "tagging")
+}
+
+func TestS3WriteFileSendsOnlyTagAttributes(t *testing.T) {
+	rt := &captureRoundTripper{}
+	client := newS3ClientWithTransport(t, rt, true)
+	loc := &remote_pb.RemoteStorageLocation{
+		Name:   "test",
+		Bucket: "bucket",
+		Path:   "/dir/test.bin",
+	}
+	entry := &filer_pb.Entry{
+		Extended: map[string][]byte{
+			"X-Amz-Tagging-a b":  []byte("x=y"),
+			"Seaweed-X-Amz-Acl":  []byte(`[{"Permission":"FULL_CONTROL"}]`),
+			"Seaweed-X-Amz-ETag": []byte("etag-1"),
+			"Cache-Control":      []byte("no-cache"),
+		},
+	}
+
+	_, err := client.WriteFile(loc, entry, bytes.NewReader([]byte("data")))
+	require.NoError(t, err)
+
+	require.NotNil(t, rt.uploadReq, "uploader should have issued a PUT")
+	require.Equal(t, "a%20b=x%3Dy", rt.uploadReq.Header.Get("X-Amz-Tagging"))
+}
+
+func TestS3WriteFileOmitsTaggingWhenNoTagAttributes(t *testing.T) {
+	rt := &captureRoundTripper{}
+	client := newS3ClientWithTransport(t, rt, true)
+	loc := &remote_pb.RemoteStorageLocation{
+		Name:   "test",
+		Bucket: "bucket",
+		Path:   "/dir/test.bin",
+	}
+	entry := &filer_pb.Entry{
+		Extended: map[string][]byte{"Seaweed-X-Amz-Acl": []byte(`[{"Permission":"FULL_CONTROL"}]`)},
+	}
+
+	_, err := client.WriteFile(loc, entry, bytes.NewReader([]byte("data")))
+	require.NoError(t, err)
+
+	require.NotNil(t, rt.uploadReq, "uploader should have issued a PUT")
+	require.Empty(t, rt.uploadReq.Header.Get("X-Amz-Tagging"))
 }
 
 func TestS3WriteFileOmitsContentTypeWhenMimeMissing(t *testing.T) {
@@ -485,4 +581,24 @@ func TestS3MakeResolvesEnvCredentialsWhenAnonymousDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "env-access", value.AccessKeyID)
 	require.Equal(t, "env-secret", value.SecretAccessKey)
+}
+
+func TestS3DeleteBucketOfAMissingBucketSucceeds(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		code       string
+		wantErr    bool
+	}{
+		{"missing bucket", http.StatusNotFound, "NoSuchBucket", false},
+		{"bucket not empty", http.StatusConflict, "BucketNotEmpty", true},
+		{"access denied", http.StatusForbidden, "AccessDenied", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newS3ClientWithTransport(t, &errorRoundTripper{statusCode: tt.statusCode, code: tt.code}, false)
+			err := client.DeleteBucket("bucket")
+			require.Equal(t, tt.wantErr, err != nil, "DeleteBucket: %v", err)
+		})
+	}
 }

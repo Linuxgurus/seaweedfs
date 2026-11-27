@@ -96,7 +96,7 @@ type movingSink struct {
 
 var _ sink.EntryMover = (*movingSink)(nil)
 
-func (s *movingSink) MoveEntry(oldKey, newKey string, newEntry *filer_pb.Entry, signatures []int32) error {
+func (s *movingSink) MoveEntry(oldKey, newKey string, oldEntry, newEntry *filer_pb.Entry, signatures []int32) error {
 	s.moveCalls = append(s.moveCalls, moveCall{oldKey: oldKey, newKey: newKey})
 	s.ordered = append(s.ordered, "move")
 	return nil
@@ -442,5 +442,41 @@ func TestReplicateMetadataOnlyDeleteKeepsTheRemoteObject(t *testing.T) {
 	}
 	if len(s.deleteCalls) != 1 || s.deleteCalls[0].key != "/dest/dir/gone.bin" {
 		t.Fatalf("ordinary deletes = %+v, want /dest/dir/gone.bin", s.deleteCalls)
+	}
+}
+
+type versionedSink struct {
+	*recordingSink
+	versionCalls []*filer_pb.Entry
+}
+
+var _ sink.VersionedDeleter = (*versionedSink)(nil)
+
+func (s *versionedSink) DeleteEntryVersion(key string, oldEntry *filer_pb.Entry, tsNs int64, deleteIncludeChunks bool, signatures []int32) error {
+	s.versionCalls = append(s.versionCalls, oldEntry)
+	return s.DeleteEntry(key, oldEntry.IsDirectory, deleteIncludeChunks, signatures)
+}
+
+func TestReplicateDeletesHandTheDeletedVersionToTheSink(t *testing.T) {
+	s := &versionedSink{recordingSink: &recordingSink{name: "local", sinkToDirectory: "/dest"}}
+	r := &Replicator{sink: s, source: &source.FilerSource{Dir: "/source"}}
+	deleted := &filer_pb.Entry{Name: "gone.bin", CommitTsNs: 100, Attributes: &filer_pb.FuseAttributes{}}
+	if err := r.Replicate(context.Background(), "/source/dir/gone.bin", &filer_pb.EventNotification{OldEntry: deleted}); err != nil {
+		t.Fatal(err)
+	}
+	renamed := &filer_pb.Entry{Name: "old.bin", CommitTsNs: 200, Attributes: &filer_pb.FuseAttributes{}}
+	if err := r.Replicate(context.Background(), "/source/dir/old.bin", &filer_pb.EventNotification{
+		OldEntry:      renamed,
+		NewEntry:      &filer_pb.Entry{Name: "new.bin", Attributes: &filer_pb.FuseAttributes{}},
+		NewParentPath: "/source/dir",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s.versionCalls) != 2 || s.versionCalls[0] != deleted || s.versionCalls[1] != renamed {
+		t.Fatalf("versioned deletes = %v, want the deleted and the renamed entries", s.versionCalls)
+	}
+	if len(s.deleteCalls) != 2 || s.deleteCalls[0].key != "/dest/dir/gone.bin" || s.deleteCalls[1].key != "/dest/dir/old.bin" {
+		t.Fatalf("deletes = %+v", s.deleteCalls)
 	}
 }

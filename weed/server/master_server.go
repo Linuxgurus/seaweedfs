@@ -54,6 +54,8 @@ type MasterOption struct {
 	FileSizeLimitMB               int
 	VolumePreallocate             bool
 	MaxParallelVacuumPerServer    int
+	MaxParallelVacuumPerRack      int
+	MaxWritableVolumes            int
 	VacuumIntervalSeconds         int
 	VacuumDeleteEmptyAfterSeconds int
 	// PulseSeconds            int
@@ -64,9 +66,21 @@ type MasterOption struct {
 	MetricsAddress          string
 	MetricsIntervalSec      int
 	IsFollower              bool
+	SingleMaster            bool
 	TelemetryUrl            string
 	TelemetryEnabled        bool
 	VolumeGrowthDisabled    bool
+	// ReleaseAllocOnFirstReport lifts the post-mint allocation hold as soon as
+	// one full volume-server inventory has been applied, for setups whose
+	// embedded volume server is the only possible reporter (weed mini).
+	// SingleVolumeReporter pins that reporter's ip:port; any other volume
+	// server trying to register is rejected.
+	ReleaseAllocOnFirstReport bool
+	SingleVolumeReporter      string
+	// ExpectedReporterAddr names the one volume server whose first clean full
+	// inventory lifts the post-mint allocation hold (a single-master weed
+	// server's embedded volume server). Other reporters are still admitted.
+	ExpectedReporterAddr string
 }
 
 type MasterServer struct {
@@ -96,6 +110,8 @@ type MasterServer struct {
 	adminLocks *AdminLocks
 
 	Cluster *cluster.Cluster
+	// orders each stream's cluster list change with its lock ring change
+	clusterNodeLock sync.Mutex
 
 	LockRingManager *cluster.LockRingManager
 
@@ -104,7 +120,6 @@ type MasterServer struct {
 }
 
 func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.ServerAddress) *MasterServer {
-
 	v := util.GetViper()
 	signingKey := v.GetString("jwt.signing.key")
 	v.SetDefault("jwt.signing.expires_after_seconds", 10)
@@ -127,6 +142,13 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	option.VolumeGrowthDisabled = v.GetBool("master.volume_growth.disable")
 	v.SetDefault("master.volume_growth.freeze_on_topology_mismatch", true)
 	v.SetDefault("master.volume_growth.state_loss_recovery_wait", "0s")
+	v.SetDefault("master.vacuum.max_parallel_per_rack", 0)
+	option.MaxParallelVacuumPerRack = v.GetInt("master.vacuum.max_parallel_per_rack")
+	if v.IsSet("master.vacuum.max_parallel_per_server") {
+		option.MaxParallelVacuumPerServer = v.GetInt("master.vacuum.max_parallel_per_server")
+	}
+	v.SetDefault("master.max_writable_volumes_per_layout", option.MaxWritableVolumes)
+	option.MaxWritableVolumes = v.GetInt("master.max_writable_volumes_per_layout")
 
 	topology.VolumeGrowStrategy.Copy1Count = v.GetUint32("master.volume_growth.copy_1")
 	topology.VolumeGrowStrategy.Copy2Count = v.GetUint32("master.volume_growth.copy_2")
@@ -162,9 +184,23 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		glog.Fatalf("create sequencer failed.")
 	}
 	ms.Topo = topology.NewTopology("topo", seq, uint64(ms.option.VolumeSizeLimitMB)*1024*1024, 5, replicationAsMin)
+	ms.Topo.SetMaxWritableVolumes(ms.option.MaxWritableVolumes)
 	ms.Topo.SetGrowthFreezeConfig(
 		v.GetBool("master.volume_growth.freeze_on_topology_mismatch"),
 		v.GetDuration("master.volume_growth.state_loss_recovery_wait"))
+	if str := strings.TrimSpace(v.GetString("master.volume_growth.allocation_deferral")); str != "" {
+		if d, err := time.ParseDuration(str); err != nil {
+			glog.Warningf("invalid master.volume_growth.allocation_deferral %q: %v", str, err)
+		} else {
+			ms.Topo.SetAllocationDeferral(d)
+		}
+	}
+	if option.ReleaseAllocOnFirstReport {
+		ms.Topo.ReleaseAllocationOnFirstReport(option.SingleVolumeReporter)
+	}
+	if option.ExpectedReporterAddr != "" {
+		ms.Topo.ReleaseAllocationOnReport(option.ExpectedReporterAddr)
+	}
 	ms.Topo.QuarantineVolumeFn = func(dn *topology.DataNode, vid needle.VolumeId, readOnly bool) error {
 		err := operation.WithVolumeServerClient(false, dn.ServerAddress(), ms.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -198,7 +234,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.telemetryCollector.StartPeriodicCollection(24 * time.Hour)
 	}
 
-	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
+	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec, "", "")
 
 	handleStaticResources2(r)
 	r.HandleFunc("/healthz", requestIDMiddleware(ms.healthzHandler)).Methods(http.MethodGet, http.MethodHead)
@@ -228,6 +264,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.grpcDialOption,
 		ms.option.GarbageThreshold,
 		ms.option.MaxParallelVacuumPerServer,
+		ms.option.MaxParallelVacuumPerRack,
 		topology.VolumeGrowStrategy.Threshold,
 		ms.preallocateSize,
 		time.Duration(ms.option.VacuumIntervalSeconds)*time.Second,
@@ -403,8 +440,11 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// determine the scheme based on HTTPS client configuration
-		scheme := util_http.GetGlobalHttpClient().GetHttpScheme()
+		// the leader serves HTTPS exactly when this master does
+		scheme := "http"
+		if util.GetViper().GetString("https.master.key") != "" {
+			scheme = "https"
+		}
 
 		targetUrl, err := url.Parse(scheme + "://" + raftServerLeader)
 		if err != nil {
@@ -592,18 +632,20 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 
 // AdmitRaftPeer pulls a master into the raft quorum, if we are the leader and
 // do not have it yet. A master that starts with no raft state cannot campaign
-// under either implementation, so this is its only way in.
-func (ms *MasterServer) AdmitRaftPeer(peerAddress pb.ServerAddress) {
-	if peerAddress.ToHttpAddress() == ms.option.Master.ToHttpAddress() {
-		return
+// under either implementation, so this is its only way in. The returned
+// channel resolves with the admission result, or nil when no admission ran.
+func (ms *MasterServer) AdmitRaftPeer(peerAddress pb.ServerAddress) <-chan error {
+	if ms.option.SingleMaster || peerAddress.ToHttpAddress() == ms.option.Master.ToHttpAddress() {
+		return nil
 	}
 
 	peerName, ok := ms.missingRaftPeerName(peerAddress)
 	if !ok {
-		return
+		return nil
 	}
-	if _, alreadyAdmitting := ms.raftPeerAdmissions.LoadOrStore(peerName, struct{}{}); alreadyAdmitting {
-		return
+	admission := make(chan error, 1)
+	if inFlight, alreadyAdmitting := ms.raftPeerAdmissions.LoadOrStore(peerName, admission); alreadyAdmitting {
+		return inFlight.(chan error)
 	}
 	glog.V(0).Infof("adding new raft server: %s", peerName)
 	// The join commits through raft, which waits on the other peers, so keep it
@@ -611,10 +653,15 @@ func (ms *MasterServer) AdmitRaftPeer(peerAddress pb.ServerAddress) {
 	// handler that a joining master is still blocked in.
 	go func() {
 		defer ms.raftPeerAdmissions.Delete(peerName)
+		defer close(admission)
 		if err := ms.raftAddServer(peerName, peerAddress.ToGrpcAddress(), true); err != nil {
 			glog.Warningf("failed adding raft server %s: %v", peerName, err)
+			admission <- err
+			return
 		}
+		admission <- nil
 	}()
+	return admission
 }
 
 // missingRaftPeerName returns the raft id to admit peerAddress under, and
@@ -687,6 +734,8 @@ func (ms *MasterServer) Reload() {
 		v.GetInt("jwt.signing.expires_after_seconds"),
 		v.GetString("jwt.signing.read.key"),
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
+		"",
+		"",
 	)
 }
 

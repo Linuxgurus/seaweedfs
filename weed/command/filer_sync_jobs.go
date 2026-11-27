@@ -3,6 +3,8 @@ package command
 import (
 	"container/heap"
 	"path"
+	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,6 +127,10 @@ type MetadataProcessor struct {
 	// tsHeap is a min-heap of active job timestamps with lazy deletion,
 	// used for O(log n) amortized watermark tracking.
 	tsHeap tsMinHeap
+	// doneTsHeap holds timestamps of jobs that succeeded while an older job
+	// was still running or failed; the watermark moves over them once
+	// nothing older is left.
+	doneTsHeap tsMinHeap
 
 	// failedTs records every event whose job returned an error and has not
 	// since completed, and oldestFailedTsNs caches its minimum (0 when empty).
@@ -136,6 +142,19 @@ type MetadataProcessor struct {
 	failedTs         map[failedEventKey]struct{}
 	failedSticky     bool
 	oldestFailedTsNs int64
+
+	// earliestFailedTsNs is the smallest timestamp this processor ever failed
+	// on, latched for its lifetime: a redelivery can clear failedTs, but by
+	// then the processor is stopped and has already dropped unrecorded
+	// events — possibly sharing the failure's timestamp — so a resume
+	// position must still sit behind it.
+	earliestFailedTsNs int64
+
+	// newestSeenTsNs is the largest TsNs the stream has offered, job or
+	// marker. A watermark equal to it is not a safe resume point: more
+	// events at the same timestamp can still sit unread in the log, so the
+	// persisted position has to stay one tick below it.
+	newestSeenTsNs int64
 
 	// resubscribeCh closes once a failure has stopped the processor and all
 	// in-flight jobs have drained, asking the metadata follower to drop the
@@ -199,11 +218,38 @@ func (t *MetadataProcessor) OldestFailedTsNs() int64 {
 	return t.oldestFailedTsNs
 }
 
+// EarliestFailedTsNs returns the smallest timestamp this processor has ever
+// failed on, including failures later cleared by a redelivery.
+func (t *MetadataProcessor) EarliestFailedTsNs() int64 {
+	t.activeJobsLock.Lock()
+	defer t.activeJobsLock.Unlock()
+	return t.earliestFailedTsNs
+}
+
+// NewestSeenTsNs returns the largest TsNs the stream has offered so far.
+func (t *MetadataProcessor) NewestSeenTsNs() int64 {
+	t.activeJobsLock.Lock()
+	defer t.activeJobsLock.Unlock()
+	return t.newestSeenTsNs
+}
+
 // ResubscribeCh closes once a job failure has stopped the processor and its
 // in-flight jobs have drained, signaling the metadata follower to drop the
 // stream so a reconnect replays what the watermark still covers.
 func (t *MetadataProcessor) ResubscribeCh() <-chan struct{} {
 	return t.resubscribeCh
+}
+
+// Drain blocks until every admitted job has finished. Callers whose stream
+// just ended use it before reconnecting: a replayed event must not race a
+// still-running job for the same path, or the older write could finish last
+// and clobber the newer one.
+func (t *MetadataProcessor) Drain() {
+	t.activeJobsLock.Lock()
+	defer t.activeJobsLock.Unlock()
+	for t.activeJobCount > 0 {
+		t.activeJobsCond.Wait()
+	}
 }
 
 // pathAncestors returns all proper ancestor directories of p.
@@ -339,6 +385,9 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 		// to it so idle stretches still advance the resume point.
 		t.activeJobsLock.Lock()
 		defer t.activeJobsLock.Unlock()
+		if resp.TsNs > t.newestSeenTsNs {
+			t.newestSeenTsNs = resp.TsNs
+		}
 		if resp.TsNs > t.filteredTsNs {
 			t.filteredTsNs = resp.TsNs
 		}
@@ -353,6 +402,10 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 
 	t.activeJobsLock.Lock()
 	defer t.activeJobsLock.Unlock()
+
+	if resp.TsNs > t.newestSeenTsNs {
+		t.newestSeenTsNs = resp.TsNs
+	}
 
 	p, newPath, kind := extractJobInfo(resp)
 	eventKey := failedEventKey{tsNs: resp.TsNs, path: p, newPath: newPath, kind: kind}
@@ -425,11 +478,14 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 			// whole mechanism exists to remove.
 			t.stopped = true
 			t.activeJobsCond.Broadcast()
+			if t.earliestFailedTsNs == 0 || resp.TsNs < t.earliestFailedTsNs {
+				t.earliestFailedTsNs = resp.TsNs
+			}
 			if t.failedSticky {
 				if resp.TsNs < t.oldestFailedTsNs {
 					t.oldestFailedTsNs = resp.TsNs
 				}
-				glog.Errorf("process %v: %v", resp, jobErr)
+				glog.Errorf("process %s -> %s ts_ns=%d: %v", jobPaths.path, jobPaths.newPath, resp.TsNs, jobErr)
 			} else if _, recorded := t.failedTs[failedKey]; !recorded {
 				if len(t.failedTs) >= maxFailedSyncEvents {
 					t.failedSticky = true
@@ -437,14 +493,14 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 					if resp.TsNs < t.oldestFailedTsNs {
 						t.oldestFailedTsNs = resp.TsNs
 					}
-					glog.Warningf("process %v: %v; over %d unresolved failures, pinning sync offset at %v until restart", resp, jobErr, maxFailedSyncEvents, time.Unix(0, t.oldestFailedTsNs))
+					glog.Warningf("process %s -> %s ts_ns=%d: %v; over %d unresolved failures, pinning sync offset at %v until restart", jobPaths.path, jobPaths.newPath, resp.TsNs, jobErr, maxFailedSyncEvents, time.Unix(0, t.oldestFailedTsNs))
 				} else {
 					t.failedTs[failedKey] = struct{}{}
 					if t.oldestFailedTsNs == 0 || resp.TsNs < t.oldestFailedTsNs {
 						t.oldestFailedTsNs = resp.TsNs
-						glog.Errorf("process %v: %v; holding sync offset at %v so this event is replayed on restart", resp, jobErr, time.Unix(0, resp.TsNs))
+						glog.Errorf("process %s -> %s ts_ns=%d: %v; holding sync offset at %v so this event is replayed on restart", jobPaths.path, jobPaths.newPath, resp.TsNs, jobErr, time.Unix(0, resp.TsNs))
 					} else {
-						glog.Errorf("process %v: %v", resp, jobErr)
+						glog.Errorf("process %s -> %s ts_ns=%d: %v", jobPaths.path, jobPaths.newPath, resp.TsNs, jobErr)
 					}
 				}
 			}
@@ -489,13 +545,24 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 			}
 			heap.Pop(&t.tsHeap)
 		}
-		// If this was the oldest job, advance the watermark, but never to or
-		// past an event that failed: the offset is the durable resume point,
-		// and moving it over a failure drops that event for good.
-		if t.tsHeap.Len() == 0 || resp.TsNs < t.tsHeap[0] {
-			if t.oldestFailedTsNs == 0 || resp.TsNs < t.oldestFailedTsNs {
-				t.processedTsWatermark.Store(resp.TsNs)
+		// Advance the watermark over every finished job older than the oldest
+		// one still running, but never to or past an event that failed: the
+		// offset is the durable resume point, and moving it over a failure
+		// drops that event for good.
+		if jobErr == nil {
+			heap.Push(&t.doneTsHeap, resp.TsNs)
+		}
+		for t.doneTsHeap.Len() > 0 {
+			doneTsNs := t.doneTsHeap[0]
+			if (t.tsHeap.Len() > 0 && doneTsNs >= t.tsHeap[0]) ||
+				(t.oldestFailedTsNs != 0 && doneTsNs >= t.oldestFailedTsNs) {
+				break
 			}
+			heap.Pop(&t.doneTsHeap)
+			t.processedTsWatermark.Store(doneTsNs)
+		}
+		if len(t.doneTsHeap) > 2*(len(t.activeJobTs)+len(t.failedTs))+64 {
+			t.compactDoneTs()
 		}
 		if t.activeJobCount == 0 && t.filteredTsNs > t.processedTsWatermark.Load() &&
 			(t.oldestFailedTsNs == 0 || t.filteredTsNs < t.oldestFailedTsNs) {
@@ -508,6 +575,36 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 		}
 		t.activeJobsCond.Signal()
 	}()
+}
+
+// compactDoneTs keeps only the newest finished timestamp between two
+// consecutive running or failed ones, since the watermark only lands on the
+// newest one below the oldest of them. Without it a long job keeps every later
+// completion. Must be called under activeJobsLock.
+func (t *MetadataProcessor) compactDoneTs() {
+	bounds := make([]int64, 0, len(t.activeJobTs)+len(t.failedTs)+1)
+	for ts := range t.activeJobTs {
+		bounds = append(bounds, ts)
+	}
+	for k := range t.failedTs {
+		bounds = append(bounds, k.tsNs)
+	}
+	if t.oldestFailedTsNs != 0 {
+		bounds = append(bounds, t.oldestFailedTsNs)
+	}
+	slices.Sort(bounds)
+	newest := make(map[int]int64)
+	for _, ts := range t.doneTsHeap {
+		i := sort.Search(len(bounds), func(i int) bool { return bounds[i] > ts })
+		if prev, ok := newest[i]; !ok || ts > prev {
+			newest[i] = ts
+		}
+	}
+	t.doneTsHeap = t.doneTsHeap[:0]
+	for _, ts := range newest {
+		t.doneTsHeap = append(t.doneTsHeap, ts)
+	}
+	heap.Init(&t.doneTsHeap)
 }
 
 // eventDataSize is the chunk data this event will copy: chunks on the new

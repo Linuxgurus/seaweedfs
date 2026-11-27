@@ -7,6 +7,7 @@ import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/grpc/codes"
 )
 
 // asyncFlushItem holds the data needed for a background flush work item.
@@ -56,12 +57,12 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 		fh.inode, fh.fh, fh.savedDir, fh.savedName, fh.dirtyMetadata, fh.isDeleted, fh.isRenamed)
 
 	// Phase 1: Flush dirty pages — seals writable chunks, uploads to volume servers, and waits.
-	// The underlying UploadWithRetry already retries transient HTTP/gRPC errors internally,
-	// so a failure here indicates a persistent issue; the chunk data has been freed.
+	// Writeback uploads retry transient errors until they succeed, so a failure here
+	// is a permanent one and the chunk data has been freed.
 	if err := fh.dirtyPages.FlushData(); err != nil {
 		glog.Errorf("completeAsyncFlush inode %d: data flush failed: %v", fh.inode, err)
-		// Data is lost at this point (chunks freed after internal retry exhaustion).
-		// Proceed to cleanup to avoid resource leaks and unmount hangs.
+		(&contentPublication{failure: fh.writebackContentError}).abandon()
+		// Data is lost at this point. Proceed to cleanup to avoid resource leaks and unmount hangs.
 	} else if fh.dirtyMetadata {
 		// Phase 2: Flush metadata unless the file was explicitly unlinked.
 		//
@@ -101,7 +102,21 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 				fileFullPath = resolvedPath
 			}
 
-			wfs.flushMetadataWithRetry(fh, dir, name, fileFullPath)
+			if err := wfs.flushMetadataWithRetry(fh, dir, name, fileFullPath); err != nil {
+				// close already returned. Do not discard the only pending
+				// references until a private recovery record is durable.
+				// Disk failures keep this drain pending; retry retention only,
+				// never replay the refused publication against a new base.
+				for {
+					path, saveErr := wfs.retainFailedContent(fh, dir, name, err)
+					if saveErr == nil {
+						glog.Errorf("completeAsyncFlush %s: publication failed: %v; recovery request retained at %s (no automatic replay)", fileFullPath, err, path)
+						break
+					}
+					glog.Errorf("completeAsyncFlush %s: retaining pending references in memory: %v; publication failure: %v", fileFullPath, saveErr, err)
+					metadataFlushSleep(context.Background(), util.RetryWaitTime)
+				}
+			}
 		}
 	}
 
@@ -111,22 +126,44 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 	fh.ReleaseHandle()
 }
 
-// flushMetadataWithRetry attempts to flush file metadata to the filer, retrying
-// with exponential backoff on transient errors. The chunk data is already on the
-// volume servers at this point; only the filer metadata reference needs persisting.
-func (wfs *WFS) flushMetadataWithRetry(fh *FileHandle, dir, name string, fileFullPath util.FullPath) {
-	err := retryMetadataFlush(context.Background(), func() error {
-		return wfs.flushMetadataToFiler(context.Background(), fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid)
-	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
+// isFilerUnreachable reports a filer call that failed without the filer
+// answering it: the dial, the connection or the call deadline gave out. It
+// reads only the gRPC status, because a refusal the filer sends in its
+// response has none, and its message carries the file path.
+func isFilerUnreachable(err error) bool {
+	st, ok := util.ServerStatus(err)
+	return ok && st.Code() == codes.Unavailable
+}
+
+// flushMetadataWithRetry persists the chunk references of a closed file. The
+// chunk data is already on the volume servers and close() has returned, so
+// nothing else holds these references: like the writeback chunk uploads, it
+// keeps retrying for as long as the filer is unreachable.
+func (wfs *WFS) flushMetadataWithRetry(fh *FileHandle, dir, name string, fileFullPath util.FullPath) error {
+	publication := &contentPublication{failure: fh.writebackContentError, writes: fh.pageWrites.Load()}
+	attempts := 0
+	err := retryMetadataFlushUntil(context.Background(), func() error {
+		attempts++
+		return wfs.flushMetadataToFiler(context.Background(), fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid, nil, publication)
+	}, isFilerUnreachable, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
+		if totalAttempts == 0 {
+			glog.Warningf("completeAsyncFlush %s: filer unreachable, retrying metadata flush (attempt %d) after %v: %v",
+				fileFullPath, nextAttempt, backoff, err)
+			return
+		}
 		glog.Warningf("completeAsyncFlush %s: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, nextAttempt, totalAttempts, backoff, err)
 	})
 	if err != nil {
+		if fh.dirtyContent {
+			publication.abandon()
+		}
 		glog.Errorf("completeAsyncFlush %s: metadata flush failed after %d attempts: %v - "+
 			"chunks are uploaded but NOT referenced in filer metadata; "+
 			"they will appear as orphans in volume.fsck",
-			fileFullPath, metadataFlushRetries+1, err)
+			fileFullPath, attempts, err)
 	}
+	return err
 }
 
 // WaitForAsyncFlush waits for all pending background flush work items to complete.

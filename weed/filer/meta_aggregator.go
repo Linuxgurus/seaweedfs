@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"google.golang.org/grpc"
@@ -49,7 +50,12 @@ type MetaAggregator struct {
 	// whose unflushed events still exist, and de-accounting it at once would
 	// let subscribers advance past them. A re-add clears the mark; a peer
 	// gone past the grace is dropped so it cannot pin the low-watermarks.
+	// The mark itself stays until the peer's resume point is forgotten.
 	peerRemovedAtNs map[pb.ServerAddress]int64
+	// peerUnreachableSinceNs is when each followed peer's subscription last
+	// started failing to connect; see notePeerUnreachable. Guarded by
+	// peerChansLock, so a removed peer's exiting loop cannot recreate it.
+	peerUnreachableSinceNs map[pb.ServerAddress]int64
 	// lowWatermarkTsNs and lowFlushWatermarkTsNs are the last minima signalled
 	// on deliveryAdvanced and flushAdvanced, each closed and replaced when its
 	// own minimum rises. Held readers park on the one that bounds them:
@@ -62,8 +68,20 @@ type MetaAggregator struct {
 	deliveryAdvanced      chan struct{}
 	flushAdvanced         chan struct{}
 	remotePeerArrived     chan struct{}
-	peerWatermarksLock    sync.Mutex
-	peerWg                sync.WaitGroup
+	// peerResumeTsNs keeps each peer's delivered-through position across
+	// subscription restarts; the watermark maps forget a removed peer past
+	// the grace, but a rejoining peer still needs it to resume. Forgotten
+	// peerResumeRetention after the removal so addresses that never return,
+	// such as restarted pods' IPs, do not accumulate.
+	peerResumeTsNs map[pb.ServerAddress]int64
+	// newPeerStartTsNs is the newest start of a peer subscription that had no
+	// resume point: the ring holds nothing that peer logged at or before it.
+	newPeerStartTsNs   int64
+	peerWatermarksLock sync.Mutex
+	peerWg             sync.WaitGroup
+	// peerSubscribeLoop is replaceable so a test can observe the subscribe
+	// start without a live peer.
+	peerSubscribeLoop func(f *Filer, self, peer pb.ServerAddress, startFrom time.Time, stopChan chan struct{})
 	// stopped is set under peerChansLock by Shutdown; OnPeerUpdate then
 	// rejects adds so no subscription can outlive the shutdown wait and run
 	// against a store Filer.Shutdown has already closed.
@@ -81,7 +99,11 @@ func NewMetaAggregator(filer *Filer, self pb.ServerAddress, grpcDialOption grpc.
 		peerWatermarks:      make(map[pb.ServerAddress]int64),
 		peerFlushWatermarks: make(map[pb.ServerAddress]int64),
 		peerRemovedAtNs:     make(map[pb.ServerAddress]int64),
+		peerResumeTsNs:      make(map[pb.ServerAddress]int64),
+
+		peerUnreachableSinceNs: make(map[pb.ServerAddress]int64),
 	}
+	t.peerSubscribeLoop = t.loopSubscribeToOneFiler
 	// nil notifyFn: aggregated subscribers wake through the buffer's
 	// subscriber channels, not a cond.
 	t.MetaLogBuffer = log_buffer.NewLogBuffer("aggr", LogFlushInterval, nil, nil, nil)
@@ -114,16 +136,18 @@ func (ma *MetaAggregator) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, star
 		// Account for the peer before its stream signals; keep prior values
 		// on reconnect.
 		ma.initPeerWatermark(address)
+		startFrom = ma.peerResumeStartFrom(address, startFrom)
 		ma.peerWg.Add(1)
 		go func() {
 			defer ma.peerWg.Done()
-			ma.loopSubscribeToOneFiler(ma.filer, ma.self, address, startFrom, stopChan)
+			ma.peerSubscribeLoop(ma.filer, ma.self, address, startFrom, stopChan)
 		}()
 	} else {
 		if prevChan, found := ma.peerChans[address]; found {
 			close(prevChan)
 			delete(ma.peerChans, address)
 		}
+		delete(ma.peerUnreachableSinceNs, address)
 		// Only mark: dropping the watermarks at once would let subscribers
 		// advance past a flapping peer's unflushed events (see peerRemovedAtNs).
 		ma.markPeerWatermarkRemoved(address)
@@ -134,6 +158,51 @@ func (ma *MetaAggregator) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, star
 // in the low-watermarks. Matches the subscribe loops' settled horizon, which
 // already bounds a stale watermark's influence within it.
 const peerWatermarkRemovalGrace = 2 * LogFlushInterval
+
+// peerResumeRetention is how long a removed peer's resume point outlives the
+// watermark grace, so a slow restart or a partition still rejoins at its old
+// position.
+const peerResumeRetention = time.Hour
+
+// peerUnreachableRemovalAfter is how long a peer may refuse connections
+// before it is treated as removed.
+const peerUnreachableRemovalAfter = 2 * LogFlushInterval
+
+// errPeerUnreachable marks a subscription attempt that never reached the peer.
+var errPeerUnreachable = errors.New("connecting to peer filer")
+
+// notePeerUnreachable records a failed connection to peer at nowNs and marks
+// the peer removed once the failures have lasted peerUnreachableRemovalAfter.
+// The master's removal notice reaches only the clients attached to the master
+// that saw the peer go, so a peer that died across a leader change is
+// otherwise followed forever and its zero watermark holds every aggregated
+// subscriber at the settled horizon. Reports true the one time it marks.
+func (ma *MetaAggregator) notePeerUnreachable(peer pb.ServerAddress, stopChan <-chan struct{}, nowNs int64) bool {
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+	if ma.peerChans[peer] != stopChan {
+		return false
+	}
+	since, found := ma.peerUnreachableSinceNs[peer]
+	if !found {
+		ma.peerUnreachableSinceNs[peer] = nowNs
+		since = nowNs
+	}
+	return nowNs-since >= int64(peerUnreachableRemovalAfter) && ma.markPeerWatermarkRemoved(peer)
+}
+
+// notePeerReachable tracks peer again after a successful connection, from a
+// zero watermark if the removal grace already dropped it. A subscription the
+// master has removed meanwhile must not undo that removal.
+func (ma *MetaAggregator) notePeerReachable(peer pb.ServerAddress, stopChan <-chan struct{}) {
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+	if ma.peerChans[peer] != stopChan {
+		return
+	}
+	delete(ma.peerUnreachableSinceNs, peer)
+	ma.initPeerWatermark(peer)
+}
 
 // initPeerWatermark adds the peer with a zero (unknown) watermark; a re-added
 // peer keeps its prior values and stops being considered removed.
@@ -150,30 +219,39 @@ func (ma *MetaAggregator) initPeerWatermark(peer pb.ServerAddress) {
 	ma.noteLowWatermarksLocked()
 }
 
-func (ma *MetaAggregator) markPeerWatermarkRemoved(peer pb.ServerAddress) {
+// markPeerWatermarkRemoved reports whether it set a new mark.
+func (ma *MetaAggregator) markPeerWatermarkRemoved(peer pb.ServerAddress) bool {
 	ma.peerWatermarksLock.Lock()
 	defer ma.peerWatermarksLock.Unlock()
 	if _, found := ma.peerWatermarks[peer]; !found {
-		return
+		return false
 	}
 	// First removal time wins: duplicate removals must not refresh the grace.
-	if _, marked := ma.peerRemovedAtNs[peer]; !marked {
-		ma.peerRemovedAtNs[peer] = time.Now().UnixNano()
+	if _, marked := ma.peerRemovedAtNs[peer]; marked {
+		return false
 	}
+	ma.peerRemovedAtNs[peer] = time.Now().UnixNano()
+	return true
 }
 
-// dropExpiredRemovedPeersLocked drops peers whose removal outlived the grace.
-// Caller must hold peerWatermarksLock.
+// dropExpiredRemovedPeersLocked drops the watermarks of peers whose removal
+// outlived the grace, and the mark with the resume point once it outlived
+// peerResumeRetention. Caller must hold peerWatermarksLock.
 func (ma *MetaAggregator) dropExpiredRemovedPeersLocked() {
 	if len(ma.peerRemovedAtNs) == 0 {
 		return
 	}
-	cutoff := time.Now().UnixNano() - int64(peerWatermarkRemovalGrace)
+	now := time.Now().UnixNano()
+	graceCutoff := now - int64(peerWatermarkRemovalGrace)
+	resumeCutoff := now - int64(peerResumeRetention)
 	for peer, removedAt := range ma.peerRemovedAtNs {
-		if removedAt < cutoff {
-			delete(ma.peerRemovedAtNs, peer)
+		if removedAt < graceCutoff {
 			delete(ma.peerWatermarks, peer)
 			delete(ma.peerFlushWatermarks, peer)
+		}
+		if removedAt < resumeCutoff {
+			delete(ma.peerRemovedAtNs, peer)
+			delete(ma.peerResumeTsNs, peer)
 		}
 	}
 	// Dropping the peer that pinned a minimum raises it, same as it reporting.
@@ -182,14 +260,58 @@ func (ma *MetaAggregator) dropExpiredRemovedPeersLocked() {
 
 // advancePeerWatermark records the peer as received-through tsNs. Monotonic,
 // and only for tracked peers: a dropped peer's straggler must not recreate
-// its entry and pin the low-watermark.
+// its entry and pin the low-watermark, nor revive a forgotten resume point.
 func (ma *MetaAggregator) advancePeerWatermark(peer pb.ServerAddress, tsNs int64) {
 	ma.peerWatermarksLock.Lock()
 	defer ma.peerWatermarksLock.Unlock()
-	if cur, found := ma.peerWatermarks[peer]; found && tsNs > cur {
+	cur, found := ma.peerWatermarks[peer]
+	if !found {
+		return
+	}
+	if tsNs > cur {
 		ma.peerWatermarks[peer] = tsNs
 		ma.noteLowWatermarksLocked()
 	}
+	if tsNs > ma.peerResumeTsNs[peer] {
+		ma.peerResumeTsNs[peer] = tsNs
+	}
+}
+
+// peerResumeStartFrom rewinds a (re)joining peer's subscribe start to the
+// position the previous subscription was delivered through. The peer's own
+// stream carries delivery claims (idle heartbeats and events alike) in this
+// timestamp domain, so anything at or below it was already received; starting
+// from the caller's "now" instead would drop what the peer logged while its
+// stream was down. A peer seen for the first time keeps the given start.
+//
+// An in-session reconnect resumes from the last real event, but this may
+// trust an idle heartbeat too: on the peer's local stream it is a
+// delivered-through claim capped by the in-flight floor and fenced against
+// later stamps, so no event can land at or below it afterwards. The claim
+// came from the peer's previous process, so it holds as long as the
+// restarted peer's clock does not run backwards.
+//
+// A replay floor never has to cap this: only a peer with its own store can
+// floor an event, and such a peer starts from its persisted offset instead.
+func (ma *MetaAggregator) peerResumeStartFrom(peer pb.ServerAddress, startFrom time.Time) time.Time {
+	ma.peerWatermarksLock.Lock()
+	defer ma.peerWatermarksLock.Unlock()
+	if prev := ma.peerResumeTsNs[peer]; prev > 0 && prev < startFrom.UnixNano() {
+		return time.Unix(0, prev)
+	}
+	if startTsNs := startFrom.UnixNano(); startTsNs > ma.newPeerStartTsNs {
+		ma.newPeerStartTsNs = startTsNs
+	}
+	return startFrom
+}
+
+// NewPeerStartTsNs returns the newest start of a peer subscription that had
+// no resume point. What that peer logged at or before it is only on disk, so
+// a cursor below it cannot be served from the ring alone.
+func (ma *MetaAggregator) NewPeerStartTsNs() int64 {
+	ma.peerWatermarksLock.Lock()
+	defer ma.peerWatermarksLock.Unlock()
+	return ma.newPeerStartTsNs
 }
 
 // advancePeerFlushWatermark records the peer's reported flush watermark.
@@ -210,7 +332,7 @@ func (ma *MetaAggregator) PeerLowFlushWatermarkTsNs() int64 {
 	ma.peerWatermarksLock.Lock()
 	defer ma.peerWatermarksLock.Unlock()
 	ma.dropExpiredRemovedPeersLocked()
-	return lowWatermarkOf(ma.peerFlushWatermarks)
+	return observeLowWatermark("flush", lowWatermarkOf(ma.peerFlushWatermarks))
 }
 
 // PeerLowWatermarkTsNs returns the minimum received-through timestamp across
@@ -221,7 +343,18 @@ func (ma *MetaAggregator) PeerLowWatermarkTsNs() int64 {
 	ma.peerWatermarksLock.Lock()
 	defer ma.peerWatermarksLock.Unlock()
 	ma.dropExpiredRemovedPeersLocked()
-	return lowWatermarkOf(ma.peerWatermarks)
+	return observeLowWatermark("delivery", lowWatermarkOf(ma.peerWatermarks))
+}
+
+// observeLowWatermark exports how far a low-watermark trails the clock (-1
+// while a tracked peer has not signalled) and hands the value back.
+func observeLowWatermark(kind string, lowTsNs int64) int64 {
+	age := -1.0
+	if lowTsNs > 0 {
+		age = float64(time.Now().UnixNano()-lowTsNs) / 1e9
+	}
+	stats.FilerMetaPeerLowWatermarkAgeSeconds.WithLabelValues(kind).Set(age)
+	return lowTsNs
 }
 
 // DeliveryWatermarkAdvancedChan returns a channel closed the next time the
@@ -389,6 +522,13 @@ func (ma *MetaAggregator) Shutdown() {
 	for {
 		select {
 		case <-done:
+			// The peers have stopped writing; retire the aggregated buffer so
+			// its flush loops and sealed windows are released with the
+			// aggregator instead of outliving it.
+			if ma.MetaLogBuffer != nil {
+				ma.MetaLogBuffer.ShutdownLogBuffer()
+				ma.MetaLogBuffer.WaitForShutdown()
+			}
 			return
 		case <-ticker.C:
 			glog.Warningf("meta aggregator shutdown: peer subscriptions still stopping")
@@ -416,6 +556,9 @@ func (ma *MetaAggregator) loopSubscribeToOneFiler(f *Filer, self pb.ServerAddres
 				errLvl = glog.Level(4)
 			}
 			glog.V(errLvl).Infof("subscribing remote %s meta change: %v", peer, err)
+			if errors.Is(err, errPeerUnreachable) && ma.notePeerUnreachable(peer, stopChan, time.Now().UnixNano()) {
+				glog.V(0).Infof("peer %s unreachable for %v, treating it as removed until it answers", peer, peerUnreachableRemovalAfter)
+			}
 		}
 		if lastTsNs < nextLastTsNs {
 			lastTsNs = nextLastTsNs
@@ -441,7 +584,7 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 
 	*/
 
-	var maybeReplicateMetadataChange func(*filer_pb.SubscribeMetadataResponse) error
+	var maybeReplicateMetadataChange func(*filer_pb.SubscribeMetadataResponse, int64) error
 	lastPersistTime := time.Now()
 	lastTsNs := startFrom
 	// replayFloorTsNs is the earliest event this session gave up replaying.
@@ -470,8 +613,9 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 
 	peerSignature, err := ma.readFilerStoreSignature(ctx, peer)
 	if err != nil {
-		return lastTsNs, fmt.Errorf("connecting to peer filer %s: %v", peer, err)
+		return lastTsNs, fmt.Errorf("%w %s: %v", errPeerUnreachable, peer, err)
 	}
+	ma.notePeerReachable(peer, stopChan)
 
 	// when filer store is not shared by multiple filers
 	if peerSignature != f.Signature {
@@ -513,7 +657,7 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 		glog.V(0).Infof("follow peer: %v, last %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
 		var counter int64
 		var synced bool
-		maybeReplicateMetadataChange = func(event *filer_pb.SubscribeMetadataResponse) error {
+		maybeReplicateMetadataChange = func(event *filer_pb.SubscribeMetadataResponse, peerTsNs int64) error {
 			if err := replicateMetadataChange(f, peer, event, stopChan); err != nil {
 				if errors.Is(err, errPeerSubscriptionStopped) {
 					return err
@@ -522,16 +666,16 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 				// the reconnect resume point cannot pass, while the stream
 				// keeps flowing: blocking on an event that can never replay
 				// would stall every later event from this peer.
-				if replayFloorTsNs == 0 || event.TsNs < replayFloorTsNs {
-					replayFloorTsNs = event.TsNs
+				if replayFloorTsNs == 0 || peerTsNs < replayFloorTsNs {
+					replayFloorTsNs = peerTsNs
 				}
 				return nil
 			}
 			counter++
 			if lastPersistTime.Add(time.Minute).Before(time.Now()) {
-				if err := ma.updateOffset(f, peer, peerSignature, persistableTsNs(event.TsNs)); err == nil {
-					if event.TsNs < time.Now().Add(-2*time.Minute).UnixNano() {
-						glog.V(0).Infof("sync with %s progressed to: %v %0.2f/sec", peer, time.Unix(0, event.TsNs), float64(counter)/60.0)
+				if err := ma.updateOffset(f, peer, peerSignature, persistableTsNs(peerTsNs)); err == nil {
+					if peerTsNs < time.Now().Add(-2*time.Minute).UnixNano() {
+						glog.V(0).Infof("sync with %s progressed to: %v %0.2f/sec", peer, time.Unix(0, peerTsNs), float64(counter)/60.0)
 					} else if !synced {
 						synced = true
 						glog.V(0).Infof("synced with %s", peer)
@@ -549,17 +693,28 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 	processEventFn := func(event *filer_pb.SubscribeMetadataResponse) error {
 		data, err := proto.Marshal(event)
 		if err != nil {
-			glog.Errorf("failed to marshal subscribed filer_pb.SubscribeMetadataResponse %+v: %v", event, err)
+			glog.Errorf("failed to marshal subscribed filer_pb.SubscribeMetadataResponse %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
 			return err
 		}
 		dir := event.Directory
 		// println("received meta change", dir, "size", len(data))
-		if err := ma.MetaLogBuffer.AddDataToBuffer([]byte(dir), data, event.TsNs); err != nil {
+		peerTsNs := event.TsNs
+		if event.MutationTsNs == 0 {
+			// Older peers predate the field; their TsNs was the commit stamp,
+			// so Replay must keep ordering by it after TsNs is restamped.
+			event.MutationTsNs = peerTsNs
+		}
+		tsNs, err := ma.MetaLogBuffer.AddDataToBufferAndGetTs([]byte(dir), data, event.TsNs)
+		if err != nil {
 			glog.Errorf("failed to add data to log buffer for %s: %v", dir, err)
 			return err
 		}
+		notifyRenameTarget(ma.MetaLogBuffer, event)
+		// The event now sits at tsNs in the local stream; offset tracking
+		// still needs the peer's own position, so it is passed separately.
+		event.TsNs = tsNs
 		if maybeReplicateMetadataChange != nil {
-			if err := maybeReplicateMetadataChange(event); err != nil {
+			if err := maybeReplicateMetadataChange(event, peerTsNs); err != nil {
 				return err
 			}
 		}
@@ -581,7 +736,7 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 			return NewChunkStreamReaderFromLookup(ctx, lookupFn, chunks), nil
 		}
 
-		stream, err := client.SubscribeLocalMetadata(ctx, &filer_pb.SubscribeMetadataRequest{
+		stream, err := client.SubscribeLocalMetadata(security.WithMetadataSubscriptionCredentials(ctx, nil), &filer_pb.SubscribeMetadataRequest{
 			ClientName:                   "filer:" + string(self),
 			PathPrefix:                   "/",
 			SinceNs:                      lastTsNs,
@@ -606,13 +761,14 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 				return errPeerSubscriptionStopped
 			default:
 			}
+			peerTsNs := event.TsNs
 			if err := processEventFn(event); err != nil {
-				glog.V(0).Infof("SubscribeLocalMetadata process %v: %v", event, err)
-				return fmt.Errorf("process %v: %w", event, err)
+				glog.V(0).Infof("SubscribeLocalMetadata process %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
+				return fmt.Errorf("process %s -> %s ts_ns=%d: %w", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
 			}
 			f.onMetadataChangeEvent(event)
-			lastTsNs = event.TsNs
-			ma.advancePeerWatermark(peer, event.TsNs)
+			lastTsNs = peerTsNs
+			ma.advancePeerWatermark(peer, peerTsNs)
 			return nil
 		}
 
@@ -640,11 +796,15 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 					lastTsNs, 0, pb.PathFilter{PathPrefix: "/"},
 					func(event *filer_pb.SubscribeMetadataResponse) error {
 						return processOne(event)
+					}, func(tsNs int64) {
+						if tsNs > lastTsNs {
+							lastTsNs = tsNs
+						}
 					})
 				if readErr != nil {
 					return fmt.Errorf("%w from %s: %w", pb.ErrLogFileRead, peer, readErr)
 				}
-				if lastTs > 0 {
+				if lastTs > lastTsNs {
 					lastTsNs = lastTs
 				}
 				pendingRefs = nil
@@ -672,8 +832,10 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 					return err
 				}
 			}
-			// Idle heartbeat: advance only the watermark, not lastTsNs, so a
-			// reconnect still resumes from the last real event.
+			// Idle heartbeat: a delivery claim. It advances the watermark and
+			// the re-add resume point (see peerResumeStartFrom) but not
+			// lastTsNs, so this loop's own reconnect still resumes from the
+			// last real event.
 			if resp.EventNotification == nil && len(resp.Events) == 0 && resp.TsNs > 0 {
 				ma.advancePeerWatermark(peer, resp.TsNs)
 			}
@@ -754,10 +916,8 @@ func (ma *MetaAggregator) traversePeerMetadata(ctx context.Context, f *Filer, pe
 				continue
 			}
 			entry := FromPbEntry(resp.Directory, resp.Entry)
-			// Order on the sender's per-path commit timestamp, not the
-			// entry's mtime — mtime is client-settable and does not track
-			// when the peer committed the change. Peers that predate the
-			// field send 0 and fall back to mtime.
+			// Order on the sender's commit timestamp, not client-settable
+			// mtime. Peers predating the field send 0: fall back to mtime.
 			peerTsNs := resp.EntryTsNs
 			if peerTsNs == 0 {
 				peerTsNs = entry.Attr.Mtime.UnixNano()
@@ -776,10 +936,9 @@ func (ma *MetaAggregator) traversePeerMetadata(ctx context.Context, f *Filer, pe
 }
 
 // applyTraversedEntry merges one bootstrap entry under the path's replay
-// locks, keeping local state when its commit is newer than the sender's —
-// most importantly a delete, whose tombstone must not let the bootstrap
-// resurrect the path. An applied entry records the sender's commit time so a
-// later peer replay orders against it rather than the entry's mtime.
+// locks, keeping local state when its commit is newer than the sender's.
+// An applied entry keeps the sender's commit time on its stamp so a later
+// peer replay orders against it rather than the entry's mtime.
 func (f *Filer) applyTraversedEntry(ctx context.Context, entry *Entry, peerTsNs int64) error {
 	unlock := f.lockReplayPaths(entry.FullPath, "")
 	defer unlock()
@@ -788,8 +947,24 @@ func (f *Filer) applyTraversedEntry(ctx context.Context, entry *Entry, peerTsNs 
 		return fmt.Errorf("check local state for %s: %w", entry.FullPath, err)
 	}
 	if localTsNs >= peerTsNs {
-		return nil
+		if localTsNs != 0 {
+			return nil
+		}
+		// Zero timestamps carry no order: keep the path only when an entry
+		// exists locally — a missing one takes the peer's copy, or an
+		// epoch-dated entry from a peer reporting no commit time is dropped.
+		if f.Store == nil {
+			return nil
+		}
+		local, findErr := f.Store.FindEntry(ctx, entry.FullPath)
+		if findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
+			return fmt.Errorf("check local state for %s: %w", entry.FullPath, findErr)
+		}
+		if local != nil {
+			return nil
+		}
 	}
+	entry.CommitTsNs = peerTsNs
 	if insertErr := f.Store.InsertEntry(ctx, entry); insertErr != nil {
 		// Entry already exists (root dir, or partial previous bootstrap);
 		// the lock kept the check above current, so the peer commit is newer.
@@ -800,7 +975,6 @@ func (f *Filer) applyTraversedEntry(ctx context.Context, entry *Entry, peerTsNs 
 			return fmt.Errorf("update entry %s: %w", entry.FullPath, updateErr)
 		}
 	}
-	f.notePathChange(entry.FullPath, peerTsNs, false)
 	return nil
 }
 

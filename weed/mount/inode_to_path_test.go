@@ -208,3 +208,65 @@ func TestMovePathWithNoSourceLeavesTheTarget(t *testing.T) {
 		t.Errorf("/a/g.txt resolves to %d (found %v), want %d", got, found, inode)
 	}
 }
+
+// A second hard link name found by a lookup belongs to the inode, so it is
+// reported with the others and released by the final forget.
+func TestLookupRecordsHardLinkNames(t *testing.T) {
+	table := NewInodeToPath(util.FullPath("/"), 0)
+	inode := table.Lookup("/a", 1, false, true, 42, true)
+	if got := table.Lookup("/b", 1, false, true, 42, true); got != inode {
+		t.Fatalf("second name got inode %d, want %d", got, inode)
+	}
+	table.Lookup("/b", 1, false, true, 42, true)
+	if got := table.GetAllPaths(inode); len(got) != 2 || got[0] != "/a" || got[1] != "/b" {
+		t.Fatalf("paths %v, want [/a /b]", got)
+	}
+	table.RemovePath("/a", nil)
+	if got, status := table.GetPath(inode); status != fuse.OK || got != "/b" {
+		t.Fatalf("after removing /a the inode answers to %q (%v), want /b", got, status)
+	}
+	table.Forget(inode, 3, nil, nil)
+	if _, found := table.GetInode("/b"); found {
+		t.Fatal("the final forget left /b mapped to a released inode")
+	}
+}
+
+func TestRemoveAliasKeepsSoleName(t *testing.T) {
+	table := NewInodeToPath(util.FullPath("/"), 0)
+	inode := table.Lookup("/a", 1, false, true, 42, true)
+	if _, ok := table.RemoveAlias("/a"); ok || !table.HasPath("/a") {
+		t.Fatal("removed the only name")
+	}
+	table.AddPath(inode, "/b")
+	if survivor, ok := table.RemoveAlias("/a"); !ok || survivor != "/b" || table.HasPath("/a") {
+		t.Fatalf("RemoveAlias(/a) = %q, %v, want /b", survivor, ok)
+	}
+	if _, ok := table.RemoveAlias("/b"); ok || !table.HasPath("/b") {
+		t.Fatal("removed the surviving name")
+	}
+}
+
+// AllocateInode must return the first number no inode holds. It used to
+// re-check the number it had just stepped off and return the next one
+// unchecked, so a file created in the same second as a renamed one could store
+// that file's inode number and stat as the same file (GNU mv refused with
+// "are the same file").
+func TestAllocateInodeReturnsFirstFreeNumber(t *testing.T) {
+	itp := NewInodeToPath(util.FullPath("/"), 60)
+	tmp := util.FullPath("/run/active.json.tmp")
+	now := time.Now().Unix()
+	a := tmp.AsInode(now)
+
+	// a and a+2 are held, a+1 is free
+	itp.Lookup("/run/x", now, false, false, a, true)
+	itp.Lookup("/run/y", now, false, false, a+2, true)
+	if got := itp.AllocateInode(tmp, now); got != a+1 {
+		t.Fatalf("AllocateInode = a%+d, want a+1", int64(got-a))
+	}
+
+	// a, a+1 and a+2 are held
+	itp.Lookup("/run/z", now, false, false, a+1, true)
+	if got := itp.AllocateInode(tmp, now); got != a+3 {
+		t.Fatalf("AllocateInode = a%+d, want a+3", int64(got-a))
+	}
+}

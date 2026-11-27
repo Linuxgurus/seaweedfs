@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -66,12 +69,19 @@ type listBucketResultV1 struct {
 }
 
 func toListBucketResultV1(in ListBucketResult) listBucketResultV1 {
+	if in.EncodingType == s3.EncodingTypeUrl {
+		// botocore does not decode the V1 Prefix, so it stays raw unless XML cannot carry it.
+		if !isXMLText(in.Prefix) {
+			in.Prefix = urlPathEscape(in.Prefix)
+		}
+		in.Delimiter = urlPathEscape(in.Delimiter)
+	}
 	return listBucketResultV1{
 		Metadata:       in.Metadata,
 		Name:           in.Name,
 		Prefix:         in.Prefix,
-		Marker:         in.Marker,
-		NextMarker:     in.NextMarker,
+		Marker:         encodeMarkerEcho(in.Marker, in.EncodingType == s3.EncodingTypeUrl),
+		NextMarker:     encodeMarkerEcho(in.NextMarker, in.EncodingType == s3.EncodingTypeUrl),
 		MaxKeys:        in.MaxKeys,
 		Delimiter:      in.Delimiter,
 		IsTruncated:    in.IsTruncated,
@@ -104,7 +114,7 @@ func (s3a *S3ApiServer) ListObjectsV2Handler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	marker := continuationToken.string
+	marker := decodeListContinuationToken(continuationToken.string)
 	if !continuationToken.set {
 		marker = startAfter
 	}
@@ -145,16 +155,111 @@ func (s3a *S3ApiServer) ListObjectsV2Handler(w http.ResponseWriter, r *http.Requ
 		IsTruncated:           response.IsTruncated,
 		KeyCount:              len(response.Contents) + len(response.CommonPrefixes),
 		MaxKeys:               uint16(response.MaxKeys),
-		NextContinuationToken: response.NextMarker,
+		NextContinuationToken: encodeListContinuationToken(response.NextMarker),
 		Prefix:                response.Prefix,
 		StartAfter:            startAfter,
 	}
 	if encodingTypeUrl {
 		responseV2.EncodingType = s3.EncodingTypeUrl
+		responseV2.StartAfter = urlPathEscape(startAfter)
+		responseV2.Prefix = urlPathEscape(response.Prefix)
+		responseV2.Delimiter = urlPathEscape(response.Delimiter)
 	}
 
 	glog.V(3).Infof("ListObjectsV2Handler response: %+v", responseV2)
 	writeSuccessResponseXML(w, r, responseV2)
+}
+
+// continuationTokenEncodingPrefix tags a NextContinuationToken whose payload is the
+// base64url encoding of the raw key. XML 1.0 cannot carry control characters, and the
+// XML encoder replaces them with U+FFFD, so a token holding such a key would resume
+// past a mangled name and skip every key sorting between the two. Keys that are valid
+// XML text still travel as the bare key, so the token is unchanged for them.
+const continuationTokenEncodingPrefix = "base64:"
+
+func encodeListContinuationToken(key string) string {
+	if key == "" {
+		return ""
+	}
+	if isXMLText(key) && !strings.HasPrefix(key, continuationTokenEncodingPrefix) {
+		return key
+	}
+	return continuationTokenEncodingPrefix + base64.RawURLEncoding.EncodeToString([]byte(key))
+}
+
+func encodeListContinuationTokenField(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	return aws.String(encodeListContinuationToken(*value))
+}
+
+// encodeMarkerEcho renders a decoded request marker for the response echo:
+// the token encoding keeps an XML-unsafe key legible, and urlPathEscape applies
+// the encoding-type=url form the keys in the same response already carry.
+func encodeMarkerEcho(marker string, encodingTypeUrl bool) string {
+	marker = encodeListContinuationToken(marker)
+	if encodingTypeUrl {
+		marker = urlPathEscape(marker)
+	}
+	return marker
+}
+
+func decodeListContinuationToken(token string) string {
+	key, ok := strings.CutPrefix(token, continuationTokenEncodingPrefix)
+	if !ok {
+		return token
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(key)
+	if err != nil {
+		// Not a token this server wrote; resume at the token as the raw key.
+		return token
+	}
+	decodedKey := string(decoded)
+	// encodeListContinuationToken only writes a token for a key that cannot
+	// travel bare, so a decoded key that could have stayed bare — valid XML
+	// text without the prefix — means the input was a legacy raw-key token,
+	// not something to decode.
+	if isXMLText(decodedKey) && !strings.HasPrefix(decodedKey, continuationTokenEncodingPrefix) {
+		return token
+	}
+	// A decoded key that could not travel bare makes the token ambiguous
+	// ("base64:AQ" reads as both the encoded form of "\x01" and a literal
+	// legacy key). The encoded reading wins: preferring the raw one would
+	// resume past real entries for every token this server writes, while a
+	// legacy token aliasing the encoded form only re-lists keys.
+	return decodedKey
+}
+
+// isXMLText reports whether s survives an XML 1.0 round trip unchanged, i.e. the
+// encoder does not replace any of its characters with U+FFFD.
+func isXMLText(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return false
+		}
+		if !isXMLChar(r) {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
+// isXMLChar follows the XML 1.0 Char production the encoding/xml encoder enforces.
+func isXMLChar(r rune) bool {
+	switch {
+	case r == 0x9 || r == 0xA || r == 0xD:
+		return true
+	case r >= 0x20 && r <= 0xD7FF:
+		return true
+	case r >= 0xE000 && r <= 0xFFFD:
+		return true
+	case r >= 0x10000 && r <= 0x10FFFF:
+		return true
+	}
+	return false
 }
 
 func (s3a *S3ApiServer) ListObjectsV1Handler(w http.ResponseWriter, r *http.Request) {
@@ -163,9 +268,9 @@ func (s3a *S3ApiServer) ListObjectsV1Handler(w http.ResponseWriter, r *http.Requ
 
 	// collect parameters
 	bucket, _ := s3_constants.GetBucketAndObject(r)
-	originalPrefix, marker, delimiter, encodingTypeUrl, maxKeys, allowUnordered, errCode := getListObjectsV1Args(r.URL.Query())
+	originalPrefix, listMarker, delimiter, encodingTypeUrl, maxKeys, allowUnordered, errCode := getListObjectsV1Args(r.URL.Query())
 
-	glog.V(2).Infof("ListObjectsV1Handler bucket=%s prefix=%s marker=%s delimiter=%s maxKeys=%d", bucket, originalPrefix, marker, delimiter, maxKeys)
+	glog.V(2).Infof("ListObjectsV1Handler bucket=%s prefix=%s marker=%s delimiter=%s maxKeys=%d", bucket, originalPrefix, listMarker, delimiter, maxKeys)
 
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
@@ -181,8 +286,8 @@ func (s3a *S3ApiServer) ListObjectsV1Handler(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Adjust marker if it ends with delimiter to skip all entries with that prefix
-	requestMarker := marker
-	marker = adjustMarkerForDelimiter(marker, originalPrefix, delimiter)
+	requestMarker := decodeListContinuationToken(listMarker)
+	marker := adjustMarkerForDelimiter(requestMarker, originalPrefix, delimiter)
 
 	response, err := s3a.listFilerEntries(r.Context(), listObjectsRequest{
 		bucket:          bucket,
@@ -217,26 +322,31 @@ func sanitizeV1MarkerEcho(response *ListBucketResult, marker string, encodingTyp
 		return
 	}
 
-	markerCandidates := map[string]struct{}{
+	// Content keys travel in the response wire encoding while NextMarker stays
+	// the raw key, so each compares against the marker in its own form.
+	rawCandidates := map[string]struct{}{
 		marker:                          {},
 		strings.TrimPrefix(marker, "/"): {},
 	}
+	keyCandidates := rawCandidates
 	if encodingTypeUrl {
-		escapedMarker := urlPathEscape(strings.TrimPrefix(marker, "/"))
-		markerCandidates[escapedMarker] = struct{}{}
+		keyCandidates = make(map[string]struct{}, len(rawCandidates))
+		for m := range rawCandidates {
+			keyCandidates[urlPathEscape(m)] = struct{}{}
+		}
 	}
-	matchesMarker := func(v string) bool {
-		if _, ok := markerCandidates[v]; ok {
+	matchesMarker := func(candidates map[string]struct{}, v string) bool {
+		if _, ok := candidates[v]; ok {
 			return true
 		}
-		_, ok := markerCandidates[strings.TrimPrefix(v, "/")]
+		_, ok := candidates[strings.TrimPrefix(v, "/")]
 		return ok
 	}
 
 	if len(response.Contents) > 0 {
 		filtered := response.Contents[:0]
 		for _, content := range response.Contents {
-			if matchesMarker(content.Key) {
+			if matchesMarker(keyCandidates, content.Key) {
 				continue
 			}
 			filtered = append(filtered, content)
@@ -246,7 +356,7 @@ func sanitizeV1MarkerEcho(response *ListBucketResult, marker string, encodingTyp
 
 	// doListFilerEntries advances nextMarker to the last emitted entry and skips
 	// the marker in exclusive mode. So NextMarker==marker indicates no progress.
-	if matchesMarker(response.NextMarker) && len(response.Contents) == 0 && len(response.CommonPrefixes) == 0 {
+	if matchesMarker(rawCandidates, response.NextMarker) && len(response.Contents) == 0 && len(response.CommonPrefixes) == 0 {
 		response.NextMarker = ""
 		response.IsTruncated = false
 	}
@@ -326,6 +436,10 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 		*cursor = ListingCursor{
 			maxKeys:               maxKeys,
 			prefixEndsOnDelimiter: prefixEndsOnDelimiter,
+		}
+		if delimiter != "/" {
+			cursor.prefetch = newListPrefetcher(ctx, client, maxKeys)
+			defer cursor.prefetch.close()
 		}
 
 		var lastEntryWasCommonPrefix bool
@@ -810,6 +924,9 @@ type ListingCursor struct {
 	// callback to its plain key; its "<name>/" CommonPrefix is deferred to the
 	// directory's own block position.
 	prefixObjectKeyOnly bool
+	// prefetch reads directories ahead of a recursive walk; nil lists each directory
+	// when the walk enters it.
+	prefetch *listPrefetcher
 }
 
 // excludedMarkerKey returns the key an exclusive marker names that the walk's cutoff no
@@ -958,18 +1075,11 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 
 	// A directory's keys sort at "<name>/" among this level's children, not at
 	// the name itself: siblings like "a-c" and "a.txt" sort before "a/b" while
-	// "a0" sorts after. Start the window at the first child whose block can
-	// still hold keys past the marker — the shortest prefix of the marker
-	// followed by a byte no greater than "/" — and ask for it inclusively, so
-	// a marker-named directory's subtree is reached at all.
+	// "a0" sorts after. Any candidate directory whose prefix sorts before the marker
+	// but whose "<name>/" block extends past the marker is looked up and queued into
+	// pendingDirs below. The main window starts strictly after the marker.
 	startName := marker
-	for i := 0; i < len(marker); i++ {
-		if marker[i] <= '/' {
-			startName = marker[:i]
-			break
-		}
-	}
-	inclusiveStartFrom = startName != ""
+	inclusiveStartFrom = false
 
 	// now marker is also a direct child of dir
 	ctx, cancel := context.WithCancel(ctx)
@@ -1096,9 +1206,40 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 		for i < len(pendingDirs) && pendingDirs[i].e.Name+"/" < blockKey {
 			i++
 		}
+		// A backend may echo a marker directory already queued by its lookup.
+		if i < len(pendingDirs) && pendingDirs[i].e.Name == pd.e.Name {
+			return
+		}
 		pendingDirs = append(pendingDirs, pendingDir{})
 		copy(pendingDirs[i+1:], pendingDirs[i:])
 		pendingDirs[i] = pd
+	}
+
+	// Look up candidate directory prefixes that could have their "<name>/" block
+	// sort past the marker or contain the marker, and queue them into pendingDirs.
+	// Only direct children belong here; recursion handles the rest of the marker.
+	if marker != "" {
+		markerName, _, _ := strings.Cut(marker, "/")
+		for i := 1; i <= len(markerName); i++ {
+			if i == len(markerName) || markerName[i] <= '/' {
+				candidate := markerName[:i]
+				blockKey := candidate + "/"
+				if strings.HasPrefix(candidate, prefix) && (blockKey > marker || strings.HasPrefix(marker, blockKey)) {
+					resp, lookupErr := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{Directory: dir, Name: candidate})
+					if errors.Is(lookupErr, filer_pb.ErrNotFound) {
+						continue
+					}
+					if lookupErr != nil {
+						return "", fmt.Errorf("lookup marker candidate %s/%s: %w", dir, candidate, lookupErr)
+					}
+					entry := resp.Entry
+					if listWalkDescends(entry) {
+						matchedPrefixDir := cursor.prefixEndsOnDelimiter && entry.Name == prefix
+						queueDir(pendingDir{e: entry, matchedPrefixDir: matchedPrefixDir})
+					}
+				}
+			}
+		}
 	}
 
 	// Entries that emit nothing (empty directories, the .uploads folder, the marker
@@ -1114,13 +1255,35 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 			InclusiveStartFrom: inclusiveStartFrom,
 		}
 
-		stream, listErr := client.ListEntries(ctx, request)
-		if listErr != nil {
-			if errors.Is(listErr, filer_pb.ErrNotFound) {
+		var stream listEntriesStream
+		windowLimit := request.Limit
+		// A trailing-slash prefix names one directory, the only entry this level
+		// lists; a file of that name lists nothing. Looking the name up spares
+		// listing every sibling it prefixes, which a SQL store answers by scanning
+		// the rest of the directory.
+		if cursor.prefixEndsOnDelimiter && prefix != "" && startName == "" {
+			if resp, lookupErr := client.LookupDirectoryEntry(ctx, &filer_pb.LookupDirectoryEntryRequest{Directory: dir, Name: prefix}); lookupErr == nil && resp.GetEntry() != nil {
+				stream = &listWindow{entries: []*filer_pb.Entry{resp.Entry}}
+			}
+		}
+		if stream == nil {
+			if entries, limit, ok := cursor.prefetch.take(request); ok {
+				stream, windowLimit = &listWindow{entries: entries}, limit
+			}
+		}
+		if stream == nil {
+			onlyPrefix := cursor.prefixEndsOnDelimiter
+			var listErr error
+			stream, listErr = cursor.prefetch.list(ctx, client, request, func(entry *filer_pb.Entry) bool {
+				return listWalkDescends(entry) && entry.Name+"/" > marker && (!onlyPrefix || entry.Name == prefix)
+			})
+			if listErr != nil {
+				if errors.Is(listErr, filer_pb.ErrNotFound) {
+					return
+				}
+				err = fmt.Errorf("list entries %+v: %w", request, listErr)
 				return
 			}
-			err = fmt.Errorf("list entries %+v: %w", request, listErr)
-			return
 		}
 
 		var entriesReceived uint32
@@ -1285,13 +1448,31 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 		if cursor.isTruncated || stopped {
 			return
 		}
-		if entriesReceived < request.Limit {
+		if entriesReceived < windowLimit {
 			err = flushDirs("")
 			return
 		}
 		startName = lastEntryName
 		inclusiveStartFrom = false
 	}
+}
+
+type listEntriesStream interface {
+	Recv() (*filer_pb.ListEntriesResponse, error)
+}
+
+// listWindow serves entries already in hand the way a ListEntries stream does.
+type listWindow struct {
+	entries []*filer_pb.Entry
+}
+
+func (w *listWindow) Recv() (*filer_pb.ListEntriesResponse, error) {
+	if len(w.entries) == 0 {
+		return nil, io.EOF
+	}
+	entry := w.entries[0]
+	w.entries = w.entries[1:]
+	return &filer_pb.ListEntriesResponse{Entry: entry}, nil
 }
 
 // hiddenProbePageSize is the window one probe request asks the filer for.
@@ -1439,7 +1620,9 @@ func getListObjectsV2Args(values url.Values) (prefix, startAfter, delimiter stri
 	token = OptionalString{set: values.Has("continuation-token"), string: values.Get("continuation-token")}
 	startAfter = values.Get("start-after")
 	delimiter = values.Get("delimiter")
-	encodingTypeUrl = values.Get("encoding-type") == s3.EncodingTypeUrl
+	if encodingTypeUrl, errCode = parseEncodingType(values); errCode != s3err.ErrNone {
+		return
+	}
 	maxkeys, errCode = parseMaxKeys(values.Get("max-keys"))
 	if errCode != s3err.ErrNone {
 		return
@@ -1454,7 +1637,9 @@ func getListObjectsV1Args(values url.Values) (prefix, marker, delimiter string, 
 	prefix = values.Get("prefix")
 	marker = values.Get("marker")
 	delimiter = values.Get("delimiter")
-	encodingTypeUrl = values.Get("encoding-type") == "url"
+	if encodingTypeUrl, errCode = parseEncodingType(values); errCode != s3err.ErrNone {
+		return
+	}
 	maxkeys, errCode = parseMaxKeys(values.Get("max-keys"))
 	if errCode != s3err.ErrNone {
 		return
@@ -1462,6 +1647,18 @@ func getListObjectsV1Args(values url.Values) (prefix, marker, delimiter string, 
 	allowUnordered = values.Get("allow-unordered") == "true"
 	errCode = s3err.ErrNone
 	return
+}
+
+// parseEncodingType reports whether encoding-type=url was requested. AWS
+// accepts no other encoding and answers anything else with InvalidArgument.
+func parseEncodingType(values url.Values) (bool, s3err.ErrorCode) {
+	switch values.Get("encoding-type") {
+	case "":
+		return false, s3err.ErrNone
+	case s3.EncodingTypeUrl:
+		return true, s3err.ErrNone
+	}
+	return false, s3err.ErrInvalidEncodingMethod
 }
 
 // parseMaxKeys parses the max-keys query parameter. Like AWS S3, any integer in

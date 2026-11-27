@@ -66,7 +66,36 @@
 # replica_placement = ""
 # fail planning when the placement constraints cannot be met instead of relaxing them
 # strict_placement = false
+# volume-slot deadband for shard placement: nodes whose free volume slots differ by at
+# most this much tie and fewer live shards wins; applied times data shards (0 = strict)
+# free_slots_deadband = 0
+# shard copy concurrency. Leave unset for one in-flight copy per destination disk.
+# 0 sends shards sequentially. A positive N is a global cap, still one per disk.
+# max_shard_transfers = 4
 # max retry attempts for a failed erasure coding job
 # retry_limit = 1
 # seconds to wait between retry attempts
 # retry_backoff_seconds = 30
+
+[maintenance.s3_lifecycle]
+# enabled = true
+# How far back the filer meta-log subscription can reliably reach, in days.
+# Rules whose TTL exceeds this window cannot be serviced by replay alone and
+# are partitioned into the walk set, which steady-state walks scan in full,
+# subject to walker_interval_minutes.
+# 0 means "no retention info supplied": the run then falls back to the longest
+# rule TTL, which keeps every replay rule in replay and promotes nothing.
+# Set this to the window the filer meta-log actually retains.
+# meta_log_retention_days = 0
+# Minimum minutes between steady-state bucket walks per shard. Cold-start and
+# recovery walks ignore it. 0 walks on every run.
+# walker_interval_minutes = 0
+# Cluster-wide delete budget in delete RPCs per second, divided across
+# execute-capable workers at dispatch time. 0 means unlimited.
+# cluster_deletes_per_second = 0
+# Token-bucket burst for the delete budget. 0 means 2 x per-second.
+# cluster_deletes_burst = 0
+# max retry attempts for a failed lifecycle run
+# retry_limit = 0
+# seconds to wait between retry attempts
+# retry_backoff_seconds = 5

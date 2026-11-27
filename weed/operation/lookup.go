@@ -51,35 +51,49 @@ var (
 // authorization the master stamped on the volume; pass it through to the
 // volume server on the read request.
 func LookupFileId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, fileId string) (fullUrl string, jwt string, err error) {
+	fullUrls, jwt, err := lookupFileIdUrls(masterFn, grpcDialOption, fileId)
+	if err != nil {
+		return "", jwt, err
+	}
+	return fullUrls[0], jwt, nil
+}
+
+// lookupFileIdUrls returns the read URLs of every replica of fileId, local
+// replicas first, each group in random order.
+func lookupFileIdUrls(masterFn GetMasterFn, grpcDialOption grpc.DialOption, fileId string) (fullUrls []string, jwt string, err error) {
 	parts := strings.Split(fileId, ",")
 	if len(parts) != 2 {
-		return "", jwt, errors.New("Invalid fileId " + fileId)
+		return nil, jwt, errors.New("Invalid fileId " + fileId)
 	}
 	lookup, lookupError := LookupVolumeId(masterFn, grpcDialOption, parts[0])
 	if lookupError != nil {
-		return "", jwt, lookupError
+		return nil, jwt, lookupError
 	}
 	if len(lookup.Locations) == 0 {
-		return "", jwt, errors.New("File Not Found")
+		return nil, jwt, errors.New("File Not Found")
 	}
 
-	localUrls := make([]string, 0, len(lookup.Locations))
+	var localUrls, remoteUrls []string
 	for _, loc := range lookup.Locations {
-		if !loc.DataInRemote {
-			localUrls = append(localUrls, loc.Url)
+		fullUrl := "http://" + loc.Url + "/" + fileId
+		if loc.DataInRemote {
+			remoteUrls = append(remoteUrls, fullUrl)
+		} else {
+			localUrls = append(localUrls, fullUrl)
 		}
 	}
-	if len(localUrls) == 0 {
-		for _, loc := range lookup.Locations {
-			localUrls = append(localUrls, loc.Url)
-		}
-	}
+	rand.Shuffle(len(localUrls), func(i, j int) { localUrls[i], localUrls[j] = localUrls[j], localUrls[i] })
+	rand.Shuffle(len(remoteUrls), func(i, j int) { remoteUrls[i], remoteUrls[j] = remoteUrls[j], remoteUrls[i] })
 
-	return "http://" + localUrls[rand.IntN(len(localUrls))] + "/" + fileId, lookup.Jwt, nil
+	return append(localUrls, remoteUrls...), lookup.Jwt, nil
 }
 
 func LookupVolumeId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid string) (*LookupResult, error) {
-	results, err := LookupVolumeIds(masterFn, grpcDialOption, []string{vid})
+	return LookupVolumeIdWithContext(context.Background(), masterFn, grpcDialOption, vid)
+}
+
+func LookupVolumeIdWithContext(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid string) (*LookupResult, error) {
+	results, err := LookupVolumeIdsWithContext(ctx, masterFn, grpcDialOption, []string{vid})
 	return results[vid], err
 }
 
@@ -90,6 +104,12 @@ func InvalidateVolumeIdLocationCache(vid string) {
 
 // LookupVolumeIds find volume locations by cache and actual lookup
 func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids []string, useCache ...bool) (map[string]*LookupResult, error) {
+	return LookupVolumeIdsWithContext(context.Background(), masterFn, grpcDialOption, vids, useCache...)
+}
+
+// LookupVolumeIdsWithContext is LookupVolumeIds bound to ctx, so a caller's
+// cancellation (e.g. a dropped inbound request) also stops the master query.
+func LookupVolumeIdsWithContext(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids []string, useCache ...bool) (map[string]*LookupResult, error) {
 	ret := make(map[string]*LookupResult)
 	var unknown_vids []string
 	cacheLocations := len(useCache) == 0 || useCache[0]
@@ -112,12 +132,12 @@ func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids 
 
 	//only query unknown_vids
 
-	err := WithMasterServerClient(context.Background(), false, masterFn(context.Background()), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	err := WithMasterServerClient(ctx, false, masterFn(ctx), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 
 		req := &master_pb.LookupVolumeRequest{
 			VolumeOrFileIds: unknown_vids,
 		}
-		resp, grpcErr := masterClient.LookupVolume(context.Background(), req)
+		resp, grpcErr := masterClient.LookupVolume(ctx, req)
 		if grpcErr != nil {
 			return grpcErr
 		}

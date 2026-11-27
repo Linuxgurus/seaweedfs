@@ -23,7 +23,7 @@ func newTestIamGrpcServer(t *testing.T) *IamGrpcServer {
 	if err != nil {
 		t.Fatalf("NewCredentialManager: %v", err)
 	}
-	return NewIamGrpcServer(cm, security.SigningKey(testIamSigningKey))
+	return NewIamGrpcServer(cm, security.NewGuard(nil, testIamSigningKey, 0, "", 0, "", ""))
 }
 
 func ctxWithBearer(token string) context.Context {
@@ -117,6 +117,31 @@ func TestIamGrpc_ValidToken_ReachesHandler(t *testing.T) {
 	}
 }
 
+func TestIamGrpc_ValidTokenAfterStaleToken_ReachesHandler(t *testing.T) {
+	s := newTestIamGrpcServer(t)
+	stale := security.GenJwtForFilerAdmin(security.SigningKey("a-different-key"), 60)
+	good := security.GenJwtForFilerAdmin(security.SigningKey(testIamSigningKey), 60)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.MD{
+		"authorization": []string{"Bearer " + string(stale), "Bearer " + string(good)},
+	})
+	if _, err := s.ListUsers(ctx, &iam_pb.ListUsersRequest{}); err != nil {
+		t.Fatalf("ListUsers with a valid token after a stale one: unexpected error %v", err)
+	}
+}
+
+func TestIamGrpc_AllInvalidTokens_Unauthenticated(t *testing.T) {
+	s := newTestIamGrpcServer(t)
+	stale := security.GenJwtForFilerAdmin(security.SigningKey("a-different-key"), 60)
+	other := security.GenJwtForFilerAdmin(security.SigningKey("another-different-key"), 60)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.MD{
+		"authorization": []string{"Bearer " + string(stale), "Bearer " + string(other)},
+	})
+	_, err := s.ListUsers(ctx, &iam_pb.ListUsersRequest{})
+	if got, want := status.Code(err), codes.Unauthenticated; got != want {
+		t.Fatalf("ListUsers with two invalid tokens: got code %v, want %v (err=%v)", got, want, err)
+	}
+}
+
 func TestIamGrpc_NoSigningKey_Unauthenticated_Allowed(t *testing.T) {
 	// Auth is opt-in: when the server is built without a signing key, every
 	// RPC is accepted regardless of (or in the absence of) metadata so the
@@ -125,7 +150,7 @@ func TestIamGrpc_NoSigningKey_Unauthenticated_Allowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCredentialManager: %v", err)
 	}
-	s := NewIamGrpcServer(cm, nil)
+	s := NewIamGrpcServer(cm, security.NewGuard(nil, "", 0, "", 0, "", ""))
 	resp, err := s.ListUsers(context.Background(), &iam_pb.ListUsersRequest{})
 	if err != nil {
 		t.Fatalf("ListUsers without key: unexpected error %v", err)

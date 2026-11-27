@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -25,6 +26,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
@@ -166,6 +168,24 @@ func S3CompatibleEndpoint(conf *remote_pb.RemoteConf) (string, bool) {
 		return "", false
 	}
 	return opt.endpoint, true
+}
+
+// UsesDefaultCredentialChain reports whether a client of conf, of any
+// S3-compatible type, may take its credentials from the SDK's default chain
+// (an access key or a secret missing, after the type's own environment
+// fallbacks): the only case where they live outside the configuration.
+func UsesDefaultCredentialChain(conf *remote_pb.RemoteConf) bool {
+	opt, ok := s3CompatibleClientOptions(conf)
+	return ok && !(opt.accessKey != "" && opt.secretKey != "")
+}
+
+// ResolvedCredentials returns the static credentials a client of conf carries
+// — the configuration's own keys, or the type's environment fallback for an
+// unset field — and whether conf is S3-compatible at all. An environment
+// fallback's change shows up here where the configuration's hash would not.
+func ResolvedCredentials(conf *remote_pb.RemoteConf) (accessKey, secretKey string, ok bool) {
+	opt, ok := s3CompatibleClientOptions(conf)
+	return opt.accessKey, opt.secretKey, ok
 }
 
 // awsCredentialSourceConfigured reports whether the environment names a source
@@ -524,13 +544,18 @@ func (s *s3RemoteStorageClient) RemoveDirectory(loc *remote_pb.RemoteStorageLoca
 			return true
 		}
 		// a listing page holds at most 1000 keys, the DeleteObjects limit
-		resp, batchErr := s.conn.DeleteObjects(&s3.DeleteObjectsInput{
+		req, resp := s.conn.DeleteObjectsRequest(&s3.DeleteObjectsInput{
 			Bucket: aws.String(loc.Bucket),
 			Delete: &s3.Delete{
 				Objects: objects,
 				Quiet:   aws.Bool(true),
 			},
 		})
+		// the client-level S3DisableContentMD5Validation also drops the
+		// Content-MD5 header this operation requires; the request config is a
+		// copy, so re-enabling it here leaves other operations untouched
+		req.Config.S3DisableContentMD5Validation = aws.Bool(false)
+		batchErr := req.Send()
 		if batchErr != nil {
 			deleteErr = batchErr
 			return false
@@ -567,18 +592,12 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 		u.Concurrency = s.uploadConcurrency()
 	})
 
-	// process tagging
-	tags := ""
 	var awsTags *string
 	// openstack swift doesn't support s3 object tagging
 	if s.conf.S3SupportTagging {
-		for k, v := range entry.Extended {
-			if len(tags) > 0 {
-				tags = tags + "&"
-			}
-			tags = tags + k + "=" + string(v)
+		if tagging := toTagging(entry.Extended); len(tagging.TagSet) > 0 {
+			awsTags = aws.String(s3TaggingHeader(tagging.TagSet))
 		}
-		awsTags = aws.String(tags)
 	}
 
 	// Upload the file to S3.
@@ -609,14 +628,23 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 
 }
 
+// toTagging maps the entry's extended attributes to the remote object's tag
+// set. Only X-Amz-Tagging-* attributes are S3 tags; the rest of Extended is
+// Seaweed-internal metadata whose values are not legal tag values.
 func toTagging(attributes map[string][]byte) *s3.Tagging {
 	tagging := &s3.Tagging{}
 	for k, v := range attributes {
+		if !strings.HasPrefix(k, s3_constants.AmzObjectTaggingPrefix) {
+			continue
+		}
 		tagging.TagSet = append(tagging.TagSet, &s3.Tag{
-			Key:   aws.String(k),
+			Key:   aws.String(k[len(s3_constants.AmzObjectTaggingPrefix):]),
 			Value: aws.String(string(v)),
 		})
 	}
+	sort.Slice(tagging.TagSet, func(i, j int) bool {
+		return aws.StringValue(tagging.TagSet[i].Key) < aws.StringValue(tagging.TagSet[j].Key)
+	})
 	return tagging
 }
 
@@ -707,6 +735,9 @@ func (s *s3RemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageL
 	}
 
 	tagging := toTagging(newEntry.Extended)
+	if reflect.DeepEqual(tagging.TagSet, toTagging(oldEntry.Extended).TagSet) {
+		return
+	}
 	if len(tagging.TagSet) > 0 {
 		_, err = s.conn.PutObjectTagging(&s3.PutObjectTaggingInput{
 			Bucket:  aws.String(loc.Bucket),
@@ -970,6 +1001,10 @@ func (s *s3RemoteStorageClient) DeleteBucket(name string) (err error) {
 		Bucket: aws.String(name),
 	})
 	if err != nil {
+		var aerr awserr.Error
+		if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchBucket {
+			return nil
+		}
 		return fmt.Errorf("delete bucket %s: %v", name, err)
 	}
 	return

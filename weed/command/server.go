@@ -3,15 +3,19 @@ package command
 import (
 	"crypto/tls"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
@@ -70,6 +74,7 @@ var (
 	volumeMinFreeSpace        = cmdServer.Flag.String("volume.minFreeSpace", "", "min free disk space (value<=100 as percentage like 1, other as human readable bytes, like 10GiB). Low disk space will mark all volumes as ReadOnly.")
 	serverMetricsHttpPort     = cmdServer.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	serverMetricsHttpIp       = cmdServer.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
+	serverGrpcLocalSocketDir  = cmdServer.Flag.String("grpc.localSocketDir", "/tmp", "directory for the local gRPC Unix sockets; default to /tmp. Point it at a directory a temp cleaner does not sweep, such as /run/seaweedfs")
 
 	// pulseSeconds              = cmdServer.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats")
 	isStartingMasterServer = cmdServer.Flag.Bool("master", true, "whether to start master server")
@@ -97,7 +102,7 @@ func init() {
 	masterOptions.peers = cmdServer.Flag.String("master.peers", "", "all master nodes in comma separated ip:masterPort list")
 	masterOptions.volumeSizeLimitMB = cmdServer.Flag.Uint("master.volumeSizeLimitMB", util.DefaultVolumeSizeLimitMB, "Master stops directing writes to oversized volumes.")
 	masterOptions.volumePreallocate = cmdServer.Flag.Bool("master.volumePreallocate", false, "Preallocate disk space for volumes.")
-	masterOptions.maxParallelVacuumPerServer = cmdServer.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server")
+	masterOptions.maxParallelVacuumPerServer = cmdServer.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server; 0 for no limit (deprecated, use master.vacuum.max_parallel_per_server in master.toml)")
 	masterOptions.vacuumIntervalSeconds = cmdServer.Flag.Int("master.vacuumIntervalSeconds", 840, "seconds between automatic vacuum sweeps")
 	masterOptions.vacuumDeleteEmptyAfterSeconds = cmdServer.Flag.Int("master.vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	masterOptions.defaultReplication = cmdServer.Flag.String("master.defaultReplication", "", "Default replication type if not specified.")
@@ -127,6 +132,7 @@ func init() {
 	filerOptions.saveToFilerLimit = cmdServer.Flag.Int("filer.saveToFilerLimit", 0, "Small files smaller than this limit can be cached in filer store.")
 	filerOptions.concurrentUploadLimitMB = cmdServer.Flag.Int("filer.concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
 	filerOptions.concurrentFileUploadLimit = cmdServer.Flag.Int("filer.concurrentFileUploadLimit", 0, "limit number of concurrent file uploads, 0 means unlimited")
+	filerOptions.inflightUploadDataTimeout = cmdServer.Flag.Duration("filer.inflightUploadDataTimeout", 60*time.Second, "how long an upload waits for a slot under the concurrent upload limits before it is rejected with 429, 0 means no limit")
 	filerOptions.localSocket = cmdServer.Flag.String("filer.localSocket", "", "default to /tmp/seaweedfs-filer-<port>.sock")
 	filerOptions.showUIDirectoryDelete = cmdServer.Flag.Bool("filer.ui.deleteDir", true, "enable filer UI show delete directory button")
 	filerOptions.downloadMaxMBps = cmdServer.Flag.Int("filer.downloadMaxMBps", 0, "download max speed for each download request, in MB per second")
@@ -137,6 +143,7 @@ func init() {
 	filerOptions.tusSessionExpiry = cmdServer.Flag.Duration("filer.tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration, e.g. \"48h\", \"7h30m\"")
 	filerOptions.allowUntrustedRemoteEndpoints = cmdServer.Flag.Bool("filer.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	filerOptions.remoteCacheEvictThreshold = cmdServer.Flag.Float64("filer.remoteCacheEvictThreshold", 0.9, "evict remote-cached objects (oldest first) when any volume disk exceeds this usage fraction; 0 disables")
+	filerOptions.idleTimeout = cmdServer.Flag.Int("filer.idleTimeout", 10, "connection idle seconds")
 
 	serverOptions.v.port = cmdServer.Flag.Int("volume.port", 8080, "volume server http listen port")
 	serverOptions.v.portGrpc = cmdServer.Flag.Int("volume.port.grpc", 0, "volume server grpc listen port")
@@ -153,7 +160,7 @@ func init() {
 	serverOptions.v.fileSizeLimitMB = cmdServer.Flag.Int("volume.fileSizeLimitMB", 256, "limit file size to avoid out of memory")
 	serverOptions.v.ldbTimeout = cmdServer.Flag.Int64("volume.index.leveldbTimeout", 0, "alive time for leveldb (default to 0). If leveldb of volume is not accessed in ldbTimeout hours, it will be off loaded to reduce opened files and memory consumption.")
 	serverOptions.v.concurrentUploadLimitMB = cmdServer.Flag.Int("volume.concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
-	serverOptions.v.concurrentDownloadLimitMB = cmdServer.Flag.Int("volume.concurrentDownloadLimitMB", 0, "limit total concurrent download size, 0 means unlimited")
+	serverOptions.v.concurrentDownloadLimitMB = cmdServer.Flag.Int("volume.concurrentDownloadLimitMB", 0, "limit total concurrent download size, 0 means unlimited; reads over the limit are sent to a replica unless volume.readMode is local")
 	serverOptions.v.publicUrl = cmdServer.Flag.String("volume.publicUrl", "", "publicly accessible address")
 	serverOptions.v.preStopSeconds = cmdServer.Flag.Int("volume.preStopSeconds", 10, "number of seconds between stop send heartbeats and stop volume server")
 	serverOptions.v.pprof = cmdServer.Flag.Bool("volume.pprof", false, "enable pprof http handlers. precludes -memprofile and -cpuprofile")
@@ -164,6 +171,9 @@ func init() {
 	serverOptions.v.hasSlowRead = cmdServer.Flag.Bool("volume.hasSlowRead", true, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
 	serverOptions.v.readBufferSizeMB = cmdServer.Flag.Int("volume.readBufferSizeMB", 4, "<experimental> larger values can optimize query performance but will increase some memory usage,Use with hasSlowRead normally")
 	serverOptions.v.allowUntrustedRemoteEndpoints = cmdServer.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
+	serverOptions.v.fsyncMinBatchBytes = cmdServer.Flag.Int64("volume.fsyncMinBatchBytes", 1*1024*1024, "minimum bytes an fsync batch gathers before a drained queue flushes without waiting")
+	serverOptions.v.fsyncMinBatchRequests = cmdServer.Flag.Int("volume.fsyncMinBatchRequests", 128, "minimum requests an fsync batch gathers before a drained queue flushes without waiting")
+	serverOptions.v.fsyncBatchWait = cmdServer.Flag.Duration("volume.fsyncBatchWait", 500*time.Microsecond, "how long a below-minimum fsync batch waits for more requests once the queue drains; 0 flushes immediately")
 	serverOptions.v.setDiskIOProbeDefaults()
 
 	s3Options.port = cmdServer.Flag.Int("s3.port", 8333, "s3 server http listen port")
@@ -191,9 +201,10 @@ func init() {
 	s3Options.idleTimeout = cmdServer.Flag.Int("s3.idleTimeout", 120, "connection idle seconds")
 	s3Options.concurrentUploadLimitMB = cmdServer.Flag.Int("s3.concurrentUploadLimitMB", 0, "limit total concurrent upload size for S3, 0 means unlimited")
 	s3Options.concurrentFileUploadLimit = cmdServer.Flag.Int("s3.concurrentFileUploadLimit", 0, "limit number of concurrent file uploads for S3, 0 means unlimited")
+	s3Options.inflightUploadDataTimeout = cmdServer.Flag.Duration("s3.inflightUploadDataTimeout", 60*time.Second, "how long an upload waits for a slot under the concurrent upload limits before it is rejected with SlowDown, 0 means no limit")
 	s3Options.enableIam = cmdServer.Flag.Bool("s3.iam", true, "enable embedded IAM API on the same S3 port")
 	s3Options.iamReadOnly = cmdServer.Flag.Bool("s3.iam.readOnly", true, "disable IAM write operations on this server")
-	s3Options.cipher = cmdServer.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads")
+	s3Options.cipher = cmdServer.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads; on whenever -filer.encryptVolumeData is")
 	s3Options.externalUrl = cmdServer.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	s3Options.allowBackslashInKey = cmdServer.Flag.Bool("s3.allowBackslashInKey", false, allowBackslashInKeyUsage)
 	s3Options.defaultFileMode = cmdServer.Flag.String("s3.defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
@@ -201,8 +212,13 @@ func init() {
 	s3Options.readerCacheSizeMB = cmdServer.Flag.Int64("s3.readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
 	s3Options.allowUntrustedRemoteEndpoints = cmdServer.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	s3Options.iamSelfServiceRequiresGrant = cmdServer.Flag.Bool("s3.iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
+	s3Options.routedLookupTimeout = cmdServer.Flag.Duration("s3.routedLookupTimeout", defaultS3RoutedLookupTimeout, s3RoutedLookupTimeoutUsage)
+	s3Options.unreachableOwnerTTL = cmdServer.Flag.Duration("s3.unreachableOwnerTTL", defaultS3UnreachableOwnerTTL, s3UnreachableOwnerTTLUsage)
+	s3Options.volumeLookupTimeout = cmdServer.Flag.Duration("s3.volumeLookupTimeout", defaultS3VolumeLookupTimeout, s3VolumeLookupTimeoutUsage)
+	s3Options.preStopSeconds = cmdServer.Flag.Int("s3.preStopSeconds", 0, s3PreStopSecondsUsage)
 
 	sftpOptions.port = cmdServer.Flag.Int("sftp.port", 2022, "SFTP server listen port")
+	sftpOptions.idleTimeout = cmdServer.Flag.Int("sftp.idleTimeout", 10, "connection idle seconds")
 	sftpOptions.sshPrivateKey = cmdServer.Flag.String("sftp.sshPrivateKey", "", "path to the SSH private key file for host authentication")
 	sftpOptions.hostKeysFolder = cmdServer.Flag.String("sftp.hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
 	sftpOptions.authMethods = cmdServer.Flag.String("sftp.authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, certificate")
@@ -216,6 +232,7 @@ func init() {
 	sftpOptions.dataCenter = cmdServer.Flag.String("sftp.dataCenter", "", "prefer to read and write to volumes in this data center")
 	sftpOptions.localSocket = cmdServer.Flag.String("sftp.localSocket", "", "default to /tmp/seaweedfs-sftp-<port>.sock")
 	iamOptions.port = cmdServer.Flag.Int("iam.port", 8111, "iam server http listen port")
+	iamOptions.idleTimeout = cmdServer.Flag.Int("iam.idleTimeout", 10, "connection idle seconds")
 	iamOptions.selfServiceRequiresGrant = s3Options.iamSelfServiceRequiresGrant
 
 	webdavOptions.port = cmdServer.Flag.Int("webdav.port", 7333, "webdav server http listen port")
@@ -228,6 +245,7 @@ func init() {
 	webdavOptions.cacheSizeMB = cmdServer.Flag.Int64("webdav.cacheCapacityMB", 0, "local cache capacity in MB")
 	webdavOptions.maxMB = cmdServer.Flag.Int("webdav.maxMB", 4, "split files larger than the limit")
 	webdavOptions.filerRootPath = cmdServer.Flag.String("webdav.filer.path", "/", "use this remote path from filer server")
+	webdavOptions.idleTimeout = cmdServer.Flag.Int("webdav.idleTimeout", 10, "connection idle seconds")
 
 	mqBrokerOptions.port = cmdServer.Flag.Int("mq.broker.port", 17777, "message queue broker gRPC listen port")
 	mqBrokerOptions.logFlushInterval = cmdServer.Flag.Int("mq.broker.logFlushInterval", 5, "log buffer flush interval in seconds")
@@ -235,6 +253,17 @@ func init() {
 	mqAgentServerOptions.brokersString = cmdServer.Flag.String("mq.agent.brokers", "localhost:17777", "comma-separated message queue brokers")
 	mqAgentServerOptions.port = cmdServer.Flag.Int("mq.agent.port", 16777, "message queue agent gRPC listen port")
 
+}
+
+// isServerFlagPassed checks if a specific flag was passed on the command line
+func isServerFlagPassed(name string) bool {
+	found := false
+	cmdServer.Flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func runServer(cmd *Command, args []string) bool {
@@ -278,10 +307,22 @@ func runServer(cmd *Command, args []string) bool {
 	}
 
 	var actualPeersForComponents string
+	var embeddedMaster atomic.Pointer[weed_server.MasterServer]
+	var peerList []pb.ServerAddress
 	if *isStartingMasterServer {
 		// If we are starting a master, validate and complete the peer list
-		_, peerList := checkPeers(*serverIp, *masterOptions.port, *masterOptions.portGrpc, *masterOptions.peers)
+		_, peerList = checkPeers(*serverIp, *masterOptions.port, *masterOptions.portGrpc, *masterOptions.peers)
 		actualPeersForComponents = strings.Join(pb.ToAddressStrings(peerList), ",")
+		if len(peerList) == 1 && *isStartingVolumeServer {
+			// A single-master weed server has one guaranteed reporter: its
+			// embedded volume server, whose first heartbeat already carries the
+			// full inventory. Its clean report collapses the post-mint
+			// allocation hold to a confirm pulse instead of running the whole
+			// warmup window on every fresh start. Other volume servers stay
+			// admitted, so a late veteran still lands its prior-state evidence
+			// inside that pulse.
+			masterOptions.expectedReporterAddr = util.JoinHostPort(*serverIp, *serverOptions.v.port)
+		}
 	} else if *masterOptions.peers != "" {
 		if isSingleMasterMode(*masterOptions.peers) {
 			glog.Fatalf("'-master.peers=none' is only valid when starting a master server, but master is not starting.")
@@ -290,6 +331,11 @@ func runServer(cmd *Command, args []string) bool {
 		actualPeersForComponents = *masterOptions.peers
 	}
 
+	// The loopback companion listener is only kept while -ip.bind is unset and
+	// the bind address falls back to -ip. Capture that here: serverBindIp is
+	// repointed at serverIp below, after which the flag state is no longer
+	// distinguishable.
+	ipBindUnspecified := *serverBindIp == ""
 	if *serverBindIp == "" {
 		serverBindIp = serverIp
 	}
@@ -304,31 +350,51 @@ func runServer(cmd *Command, args []string) bool {
 	// ip address
 	masterOptions.ip = serverIp
 	masterOptions.ipBind = serverBindIp
+	masterOptions.listenOnLocalhost = &ipBindUnspecified
 	// Use actualPeersForComponents for volume/filer, not masterOptions.peers which might be "none"
 	filerOptions.masters = pb.ServerAddresses(actualPeersForComponents).ToServiceDiscovery()
 	filerOptions.ip = serverIp
 	filerOptions.bindIp = serverBindIp
+	filerOptions.listenOnLocalhost = &ipBindUnspecified
 	s3Options.ip = serverIp
 	if *s3Options.bindIp == "" {
+		s3Options.listenOnLocalhost = &ipBindUnspecified
 		s3Options.bindIp = serverBindIp
 	}
 	if sftpOptions.bindIp == nil || *sftpOptions.bindIp == "" {
+		sftpOptions.listenOnLocalhost = &ipBindUnspecified
 		sftpOptions.bindIp = serverBindIp
 	}
 	iamOptions.ip = serverBindIp
+	iamOptions.listenOnLocalhost = &ipBindUnspecified
 	iamOptions.masters = &actualPeersForComponents
 	webdavOptions.ipBind = serverBindIp
 	serverOptions.v.ip = serverIp
 	serverOptions.v.bindIp = serverBindIp
+	serverOptions.v.listenOnLocalhost = &ipBindUnspecified
 	serverOptions.v.masters = pb.ServerAddresses(actualPeersForComponents).ToAddresses()
 	serverOptions.v.idleConnectionTimeout = serverTimeout
 	serverOptions.v.dataCenter = serverDataCenter
 	serverOptions.v.rack = serverRack
 	mqBrokerOptions.ip = serverIp
+	mqBrokerOptions.ipBind = serverBindIp
+	mqBrokerOptions.listenOnLocalhost = &ipBindUnspecified
 	mqBrokerOptions.masters = filerOptions.masters.GetInstancesAsMap()
 	mqBrokerOptions.filerGroup = filerOptions.filerGroup
 	mqAgentServerOptions.ip = serverIp
-	mqAgentServerOptions.brokers = pb.ServerAddresses(*mqAgentServerOptions.brokersString).ToAddresses()
+	mqAgentServerOptions.ipBind = serverBindIp
+	mqAgentServerOptions.listenOnLocalhost = &ipBindUnspecified
+	if isServerFlagPassed("mq.agent.brokers") {
+		mqAgentServerOptions.brokers = pb.ServerAddresses(*mqAgentServerOptions.brokersString).ToAddresses()
+	} else {
+		// Default to the embedded broker's bind address: with an explicit
+		// -ip.bind the broker does not listen on localhost.
+		brokerHost := *serverBindIp
+		if brokerHost == "0.0.0.0" || brokerHost == "::" || brokerHost == "[::]" {
+			brokerHost = "localhost"
+		}
+		mqAgentServerOptions.brokers = []pb.ServerAddress{pb.NewServerAddress(brokerHost, *mqBrokerOptions.port, 0)}
+	}
 
 	// serverOptions.v.pulseSeconds = pulseSeconds
 	// masterOptions.pulseSeconds = pulseSeconds
@@ -345,8 +411,9 @@ func runServer(cmd *Command, args []string) bool {
 	*filerOptions.disableHttp = *filerOptions.disableHttp || *serverDisableHttp
 	masterOptions.disableHttp = serverDisableHttp
 
-	filerAddress := string(pb.NewServerAddress(*serverIp, *filerOptions.port, *filerOptions.portGrpc))
+	filerAddress := embeddedFilerAddress(*serverIp, *filerOptions.port, filerOptions.portGrpc)
 	s3Options.filer = &filerAddress
+	s3Options.homeFiler = filerAddress
 	sftpOptions.filer = &filerAddress
 	iamOptions.filer = &filerAddress
 	webdavOptions.filer = &filerAddress
@@ -372,6 +439,7 @@ func runServer(cmd *Command, args []string) bool {
 	// Register Unix socket paths for gRPC services running in this process
 	// so local inter-service communication uses Unix sockets instead of TCP.
 	// Resolve gRPC ports early (same calculation each service does internally).
+	var localSockets []grpcLocalSocket
 	for _, svc := range []struct {
 		starting *bool
 		portGrpc *int
@@ -387,8 +455,14 @@ func runServer(cmd *Command, args []string) bool {
 			if *svc.portGrpc == 0 {
 				*svc.portGrpc = 10000 + *svc.port
 			}
-			pb.RegisterLocalGrpcSocket(*serverIp, *svc.portGrpc, fmt.Sprintf("/tmp/seaweedfs-%s-grpc-%d.sock", svc.name, *svc.portGrpc))
+			localSockets = append(localSockets, grpcLocalSocket{svc.name, *svc.portGrpc})
 		}
+	}
+	if err := checkGrpcLocalSocketDir(*serverGrpcLocalSocketDir, localSockets); err != nil {
+		glog.Fatalf("Check gRPC local socket folder (-grpc.localSocketDir=%q): %v", *serverGrpcLocalSocketDir, err)
+	}
+	for _, socket := range localSockets {
+		pb.RegisterLocalGrpcSocket(*serverIp, socket.port, grpcLocalSocketPath(*serverGrpcLocalSocketDir, socket.name, socket.port))
 	}
 
 	serverWhiteList := util.StringSplit(*serverWhiteListOption, ",")
@@ -396,6 +470,17 @@ func runServer(cmd *Command, args []string) bool {
 	if *isStartingFiler {
 		if *filerOptions.diskType == "" && *serverOptions.v.diskType != "" {
 			filerOptions.diskType = serverOptions.v.diskType
+		}
+		if len(peerList) == 1 && *isStartingMasterServer {
+			// The embedded filer shares the master's process: when the master
+			// mints a fresh TopologyId its persisted state was empty, so the
+			// empty peer scan only has to survive a reconnecting peer's
+			// keepalive retries, not the full membership confirm. Prior state
+			// keeps the full window.
+			filerOptions.clusterFreshHint = func() bool {
+				ms := embeddedMaster.Load()
+				return ms != nil && ms.Topo.FreshMinted()
+			}
 		}
 		go func() {
 			time.Sleep(1 * time.Second)
@@ -422,7 +507,6 @@ func runServer(cmd *Command, args []string) bool {
 	if *isStartingSftp {
 		go func() {
 			time.Sleep(2 * time.Second)
-			sftpOptions.localSocket = filerOptions.localSocket
 			sftpOptions.startSftpServer()
 		}()
 	}
@@ -463,15 +547,30 @@ func runServer(cmd *Command, args []string) bool {
 	}
 
 	if *isStartingMasterServer {
-		go startMaster(masterOptions, serverWhiteList)
+		go startMaster(masterOptions, serverWhiteList, &embeddedMaster)
 	}
 
 	select {}
 }
 
+// idleTimeoutSeconds converts a seconds flag to the listener activity timeout,
+// keeping the 10s default when the option was never set. The clamp keeps the
+// multiplication from overflowing time.Duration; non-positive values disable
+// the timeout, as before.
+func idleTimeoutSeconds(seconds *int) time.Duration {
+	if seconds == nil {
+		return 10 * time.Second
+	}
+	if *seconds <= 0 {
+		return 0
+	}
+	return time.Duration(min(int64(*seconds), math.MaxInt64/int64(time.Second))) * time.Second
+}
+
 func newHttpServer(h http.Handler, tlsConfig *tls.Config) *http.Server {
 	s := &http.Server{
-		Handler: h,
+		Handler:     h,
+		ConnContext: util.ConnContext,
 	}
 	if tlsConfig != nil {
 		s.TLSConfig = tlsConfig.Clone()

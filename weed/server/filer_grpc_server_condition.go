@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,8 @@ func clauseSatisfied(c *filer_pb.WriteCondition_Clause, current *filer.Entry) bo
 		return !exists
 	case filer_pb.WriteCondition_IF_EXISTS:
 		return exists
+	case filer_pb.WriteCondition_IF_OBJECT_EXISTS:
+		return exists && (!current.IsDirectory() || current.ToProtoEntry().IsDirectoryKeyObject())
 	case filer_pb.WriteCondition_IF_ETAG_MATCH:
 		return exists && etagInSet(storedEntryETag(current), c.Etags, c.AllowWeak)
 	case filer_pb.WriteCondition_IF_ETAG_NOT_MATCH:
@@ -87,14 +90,16 @@ func clauseSatisfied(c *filer_pb.WriteCondition_Clause, current *filer.Entry) bo
 		if !exists || c.ExpectedEntry == nil {
 			return !exists && c.ExpectedEntry == nil
 		}
-		// Compare both sides in serialized form on clones: chunks are matched
-		// by their fid only — the stored entry may carry the restored file_id
-		// while an expected one built from a metadata event does not.
+		// Compare both sides in serialized, normalized form on clones: chunks
+		// are matched by their fid only — the stored entry may carry the
+		// restored file_id while an expected one built from a metadata event
+		// does not — and a store that does not decode through FromPbEntry
+		// keeps the FileSize it was given.
 		expected := proto.Clone(c.ExpectedEntry).(*filer_pb.Entry)
 		filer_pb.BeforeEntrySerialization(expected.Chunks)
 		actual := proto.Clone(current.ToProtoEntry()).(*filer_pb.Entry)
 		filer_pb.BeforeEntrySerialization(actual.Chunks)
-		return proto.Equal(actual, filer.FromPbEntry("", expected).ToProtoEntry())
+		return proto.Equal(filer.FromPbEntry("", actual).ToProtoEntry(), filer.FromPbEntry("", expected).ToProtoEntry())
 	default:
 		// An unrecognized clause kind (e.g. from a newer client) must not be
 		// treated as satisfied, which would silently bypass the guard. Fail
@@ -159,15 +164,27 @@ func canonicalETag(etag string) (value string, weak bool) {
 	return strings.Trim(etag, `"`), false
 }
 
-// storedEntryETag mirrors the S3 gateway's ETag precedence (the stored
-// Seaweed ETag extended attribute, then the chunk/Md5 fallback) so conditional
-// comparisons match what the gateway computes, without coupling the filer to
-// S3 request handling.
+// storedEntryETag mirrors the S3 gateway's ETag precedence — the stored
+// Seaweed ETag extended attribute, then the remote ETag while the entry still
+// holds the remote bytes, then Md5, then the chunk hash (an empty object has
+// no ETag) — so conditional comparisons match what the gateway computes,
+// without coupling the filer to S3 request handling.
 func storedEntryETag(entry *filer.Entry) string {
 	if v, ok := entry.Extended[s3_constants.ExtETagKey]; ok && len(v) > 0 {
 		return normalizeETag(string(v))
 	}
-	return normalizeETag(filer.ETagEntry(entry))
+	if remote := entry.Remote; remote != nil && remote.RemoteETag != "" &&
+		entry.FileSize == uint64(remote.RemoteSize) &&
+		(remote.LastLocalSyncTsNs > 0 || (len(entry.GetChunks()) == 0 && len(entry.Content) == 0)) {
+		return normalizeETag(remote.RemoteETag)
+	}
+	if len(entry.Md5) > 0 {
+		return fmt.Sprintf("%x", entry.Md5)
+	}
+	if len(entry.GetChunks()) == 0 {
+		return ""
+	}
+	return normalizeETag(filer.ETagChunks(entry.GetChunks()))
 }
 
 func normalizeETag(etag string) string {

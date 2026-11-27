@@ -81,6 +81,7 @@ type FilerOption struct {
 	SaveToFilerLimit          int64
 	ConcurrentUploadLimit     int64
 	ConcurrentFileUploadLimit int64
+	InflightUploadDataTimeout time.Duration
 	ShowUIDirectoryDelete     bool
 	DownloadMaxBytesPs        int64
 	DiskType                  string
@@ -95,6 +96,19 @@ type FilerOption struct {
 	// master; it joins the filer list only once the gRPC port is serving and
 	// the metadata replay has caught up with the peers found at startup.
 	AnnounceCh chan struct{}
+	// SkipEmptyMembershipConfirm announces after the startup peer scan
+	// without re-polling to disprove an empty result: the embedded filer of
+	// a single-master weed mini is the only member its dev cluster can have
+	// yet, so the confirm window is dead time while routed traffic waits on
+	// the filer's master listing. A late external filer still joins and
+	// replays through the normal path.
+	SkipEmptyMembershipConfirm bool
+	// ClusterFreshHint, when non-nil, reports that the co-located master
+	// minted its TopologyId this boot — its persisted state was empty, so the
+	// empty-scan confirm only needs to cover a reconnecting peer's keepalive
+	// retries rather than the full settling window. Restarted masters
+	// recovering a prior id keep the full window.
+	ClusterFreshHint func() bool
 	// AllowUntrustedRemoteEndpoints lets a read of a remote-only entry dial a
 	// mounted endpoint that resolves to a loopback / private / metadata host.
 	AllowUntrustedRemoteEndpoints bool
@@ -106,15 +120,24 @@ type FilerOption struct {
 type FilerServer struct {
 	inFlightDataSize int64
 	inFlightUploads  int64
+	// unix nanos when this filer was first seen missing from its own lock ring;
+	// <= 0 while it is in the ring, with a new value on every reset
+	lockRingUnhealthySince atomic.Int64
+	lockRingResets         atomic.Int64
 
 	inFlightDataLimitCond *sync.Cond
 
 	filer_pb.UnimplementedSeaweedFilerServer
-	option         *FilerOption
-	filer          *filer.Filer
-	filerGuard     *security.Guard
-	volumeGuard    *security.Guard
-	grpcDialOption grpc.DialOption
+	option               *FilerOption
+	filer                *filer.Filer
+	filerGuard           *security.Guard
+	basicAuth            atomic.Pointer[security.BasicAuth]
+	basicAuthFile        string
+	volumeGuard          *security.Guard
+	grpcDialOption       grpc.DialOption
+	grpcDialOptionMaster grpc.DialOption
+	grpcDialOptionVolume grpc.DialOption
+	grpcDialOptionS3     grpc.DialOption
 
 	// metrics read from the master
 	metricsAddress     string
@@ -175,6 +198,12 @@ type FilerServer struct {
 	// this filer announced itself; AnnounceOnceCaughtUp waits for their
 	// replayed backlogs before the filer joins the master's list.
 	startupPeers []pb.ServerAddress
+
+	// peerBootstrapPending marks a fresh store whose startup peer scan came
+	// back empty: an empty answer during a master restart can just mean the
+	// existing filers have not reconnected yet, so AnnounceOnceCaughtUp
+	// re-checks membership before registering.
+	peerBootstrapPending bool
 
 	// entryLockTable serializes mutations to the same entry path on this filer.
 	// CreateEntry takes it today; UpdateEntry and DeleteEntry are intended to take
@@ -239,6 +268,9 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs = &FilerServer{
 		option:                option,
 		grpcDialOption:        security.LoadClientTLS(util.GetViper(), "grpc.filer"),
+		grpcDialOptionMaster:  security.LoadClientTLSForTarget(util.GetViper(), "grpc.filer", "grpc.master"),
+		grpcDialOptionVolume:  security.LoadClientTLSForTarget(util.GetViper(), "grpc.filer", "grpc.volume"),
+		grpcDialOptionS3:      security.LoadClientTLSForTarget(util.GetViper(), "grpc.filer", "grpc.s3"),
 		knownListeners:        make(map[int32]int32),
 		subscribers:           make(map[int32]*metadataSubscriber),
 		inFlightDataLimitCond: sync.NewCond(new(sync.Mutex)),
@@ -275,7 +307,11 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	v.SetDefault("filer.options.max_file_name_length", 255)
 	maxFilenameLength := v.GetUint32("filer.options.max_file_name_length")
 	glog.V(0).Infof("max_file_name_length %d", maxFilenameLength)
-	fs.filer = filer.NewFiler(*option.Masters, fs.grpcDialOption, option.Host, option.FilerGroup, option.Collection, option.DefaultReplication, option.DataCenter, maxFilenameLength, nil)
+	fs.filer = filer.NewFiler(*option.Masters, &filer.DialOptions{
+		Filer:  fs.grpcDialOption,
+		Master: fs.masterGrpcDialOption(),
+		Volume: fs.volumeGrpcDialOption(),
+	}, option.Host, option.FilerGroup, option.Collection, option.DefaultReplication, option.DataCenter, maxFilenameLength, nil)
 	// Peer metadata replay takes the same per-path locks, so a replayed change
 	// cannot split a local mutation's read-modify-write.
 	fs.entryLockTable = fs.filer.EntryLockTable
@@ -291,8 +327,11 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	if v.GetString("guard.white_list") != "" {
 		glog.Warningf("filer: guard.white_list is configured but the IP whitelist feature is currently disabled. See https://github.com/seaweedfs/seaweedfs/issues/7094")
 	}
-	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
-	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
+	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec, v.GetString("jwt.filer_signing.previous_key"), v.GetString("jwt.filer_signing.read.previous_key"))
+	basicAuth, basicAuthFile := loadBasicAuth(nil, "")
+	fs.basicAuth.Store(basicAuth)
+	fs.basicAuthFile = basicAuthFile
+	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec, "", "")
 
 	fs.checkWithMaster()
 
@@ -367,9 +406,12 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	startFromTime := time.Now().Add(-filer.LogFlushInterval)
 	if isFresh {
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
-		if err := fs.filer.MaybeBootstrapFromOnePeer(option.Host, existingNodes, startFromTime); err != nil {
+		if err := fs.filer.MaybeBootstrapFromOnePeer(context.Background(), option.Host, existingNodes, startFromTime); err != nil {
 			glog.Fatalf("%s bootstrap from %+v: %v", option.Host, existingNodes, err)
 		}
+		// An empty scan can be a settling master rather than an empty cluster;
+		// the announce gate then re-checks membership before registering.
+		fs.peerBootstrapPending = len(existingNodes) == 0
 	}
 	v.SetDefault("filer.options.s3.empty_folder_cleanup_delay", "2m")
 	if d, err := time.ParseDuration(v.GetString("filer.options.s3.empty_folder_cleanup_delay")); err == nil {
@@ -387,6 +429,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	}
 
 	fs.filer.LoadFilerConf()
+	fs.filer.LoadNotificationWebhooks()
 
 	fs.filer.LoadRemoteStorageConfAndMapping()
 
@@ -401,10 +444,33 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		fs.CredentialManager.SetFilerAddressFunc(func() pb.ServerAddress {
 			return fs.option.Host
 		}, fs.grpcDialOption)
-		fs.CredentialManager.SetMasterClient(fs.filer.MasterClient, fs.grpcDialOption)
+		fs.CredentialManager.SetMasterClient(fs.filer.MasterClient, fs.s3GrpcDialOption())
 	}
 
 	return fs, nil
+}
+
+// Target-specific dial options fall back to the shared filer option, which is
+// what FilerServer literals in tests set up.
+func (fs *FilerServer) masterGrpcDialOption() grpc.DialOption {
+	if fs.grpcDialOptionMaster != nil {
+		return fs.grpcDialOptionMaster
+	}
+	return fs.grpcDialOption
+}
+
+func (fs *FilerServer) volumeGrpcDialOption() grpc.DialOption {
+	if fs.grpcDialOptionVolume != nil {
+		return fs.grpcDialOptionVolume
+	}
+	return fs.grpcDialOption
+}
+
+func (fs *FilerServer) s3GrpcDialOption() grpc.DialOption {
+	if fs.grpcDialOptionS3 != nil {
+		return fs.grpcDialOptionS3
+	}
+	return fs.grpcDialOption
 }
 
 func (fs *FilerServer) checkWithMaster() {
@@ -413,7 +479,7 @@ func (fs *FilerServer) checkWithMaster() {
 	for !isConnected {
 		fs.option.Masters.RefreshBySrvIfAvailable()
 		for _, master := range fs.option.Masters.GetInstances() {
-			readErr := operation.WithMasterServerClient(context.Background(), false, master, fs.grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+			readErr := operation.WithMasterServerClient(context.Background(), false, master, fs.masterGrpcDialOption(), func(masterClient master_pb.SeaweedClient) error {
 				resp, err := masterClient.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
 				if err != nil {
 					return fmt.Errorf("get master %s configuration: %v", master, err)
@@ -494,16 +560,26 @@ const announceCatchUpCap = time.Minute
 // routed traffic is answerable the moment the filer is listed.
 func (fs *FilerServer) AnnounceOnceCaughtUp(announce chan struct{}, waitStart time.Time) {
 	defer close(announce)
-	if len(fs.startupPeers) == 0 || fs.filer.MetaAggregator == nil {
+	ma := fs.filer.MetaAggregator
+	if ma == nil {
 		return
 	}
+	// The bootstrap re-check and the catch-up wait share one deadline so a
+	// late peer cannot stretch the registration hold past the cap.
 	deadline := time.Now().Add(announceCatchUpCap)
+	peers := fs.startupPeers
+	if fs.peerBootstrapPending && !fs.option.SkipEmptyMembershipConfirm {
+		peers = append(peers, fs.awaitPeerBootstrap(deadline)...)
+	}
+	if len(peers) == 0 {
+		return
+	}
 	for {
 		// Take the channel before reading the watermarks so a rise in
 		// between still wakes this wait (see DeliveryWatermarkAdvancedChan).
-		advanced := fs.filer.MetaAggregator.DeliveryWatermarkAdvancedChan()
-		if fs.filer.MetaAggregator.PeersCaughtUpTo(fs.startupPeers, waitStart.UnixNano()) {
-			glog.V(0).Infof("%s caught up with %d startup peers, announcing to masters", fs.option.Host, len(fs.startupPeers))
+		advanced := ma.DeliveryWatermarkAdvancedChan()
+		if ma.PeersCaughtUpTo(peers, waitStart.UnixNano()) {
+			glog.V(0).Infof("%s caught up with %d startup peers, announcing to masters", fs.option.Host, len(peers))
 			return
 		}
 		remaining := time.Until(deadline)
@@ -516,6 +592,85 @@ func (fs *FilerServer) AnnounceOnceCaughtUp(announce chan struct{}, waitStart ti
 		case <-time.After(min(remaining, time.Second)):
 		}
 	}
+}
+
+// emptyMembershipConfirmTimeout bounds the announce hold for a peer to
+// disprove an empty startup scan on a fresh store. This runs after the ports
+// already serve, so a genuinely empty cluster pays a delayed master listing,
+// not a stalled startup.
+const emptyMembershipConfirmTimeout = 10 * time.Second
+
+// freshMembershipConfirmTimeout bounds the same hold when the co-located
+// master minted its TopologyId this boot: a fresh mint proves the master kept
+// no cluster state, but not that no external filer survived its loss — one
+// may still be mid-reconnect. A few keepalive cycles of empty scans cover the
+// reconnect while keeping a genuinely fresh cluster's announce prompt.
+const freshMembershipConfirmTimeout = 3 * time.Second
+
+// awaitPeerBootstrap re-polls membership while a fresh store's empty startup
+// scan can still be disproved: masters restarted or re-elected report no
+// filers until the existing ones reconnect. Peers found late are backfilled
+// from before their streams start, then reported so the caller waits for
+// their catch-up like startup peers. The whole wait — including each peer
+// metadata copy — is bounded by the shared announce deadline.
+func (fs *FilerServer) awaitPeerBootstrap(deadline time.Time) (peers []pb.ServerAddress) {
+	confirmBy := time.Now().Add(emptyMembershipConfirmTimeout)
+	var freshSince time.Time
+	peerSeen := false
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		nodes, listErr := fs.filer.ListExistingPeerUpdates(ctx)
+		cancel()
+		if listErr != nil {
+			glog.Warningf("%s cannot re-check existing peers: %v; announcing anyway", fs.option.Host, listErr)
+			return nil
+		}
+		var remotes []*master_pb.ClusterNodeUpdate
+		for _, node := range nodes {
+			if !pb.ServerAddress(node.Address).Equals(fs.option.Host) {
+				remotes = append(remotes, node)
+			}
+		}
+		if len(remotes) == 0 {
+			exitBy := confirmBy
+			// The mint lands after raft election, which can postdate this
+			// wait's start, so the hint is re-evaluated each pass rather than
+			// once up front. An observed peer — even one that later
+			// disconnects — disables the shortened deadline: an empty scan
+			// afterward no longer proves a fresh cluster.
+			if !peerSeen && fs.option.ClusterFreshHint != nil && fs.option.ClusterFreshHint() {
+				if freshSince.IsZero() {
+					freshSince = time.Now()
+					glog.V(0).Infof("%s embedded master minted a fresh topology id; shortening the empty-scan confirm", fs.option.Host)
+				}
+				if freshBy := freshSince.Add(freshMembershipConfirmTimeout); freshBy.Before(exitBy) {
+					exitBy = freshBy
+				}
+			}
+			if !time.Now().Before(exitBy) {
+				return nil
+			}
+			time.Sleep(time.Second)
+			continue
+		}
+		peerSeen = true
+		bootstrapFrom := time.Now().Add(-filer.LogFlushInterval)
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+		err := fs.filer.MaybeBootstrapFromOnePeer(ctx, fs.option.Host, remotes, bootstrapFrom)
+		cancel()
+		if err != nil {
+			glog.Warningf("%s bootstrap from late peers %+v: %v; retrying", fs.option.Host, remotes, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		glog.V(0).Infof("%s bootstrap from late-arriving peers %+v", fs.option.Host, remotes)
+		for _, node := range remotes {
+			peers = append(peers, pb.ServerAddress(node.Address))
+			fs.filer.MetaAggregator.OnPeerUpdate(node, bootstrapFrom)
+		}
+		return peers
+	}
+	return nil
 }
 
 // masterRemovalWaitBudget bounds how long shutdown waits for masters to
@@ -544,7 +699,7 @@ func (fs *FilerServer) waitForClusterRemoval() {
 			// The per-query timeout shares the overall deadline, so a stalled
 			// master cannot stretch the wait past the budget.
 			queryCtx, queryCancel := context.WithTimeout(ctx, 2*time.Second)
-			nodes, err := cluster.ListExistingPeerUpdates(queryCtx, master, fs.grpcDialOption, fs.filer.MasterClient.FilerGroup, cluster.FilerType)
+			nodes, err := cluster.ListExistingPeerUpdates(queryCtx, master, fs.masterGrpcDialOption(), fs.filer.MasterClient.FilerGroup, cluster.FilerType)
 			queryCancel()
 			if err != nil {
 				// A failed query is not confirmed removal; retry until the
@@ -606,22 +761,49 @@ func (fs *FilerServer) leaveLockRing(removalTimeout time.Duration) {
 	time.Sleep(time.Until(until))
 }
 
+// loadBasicAuth reads [filer.basic_auth] from security.toml and the WEED_
+// environment alone: the shared viper merges every reload into what it held,
+// so it would keep a password the file no longer sets. Once a file is read,
+// later reads stay on it rather than search again, so a directory that turns
+// unsearchable cannot hand over a lower-priority security.toml. A non-nil
+// current is kept when the file cannot be read.
+func loadBasicAuth(current *security.BasicAuth, file string) (*security.BasicAuth, string) {
+	v, used := util.ReadConfiguration("security", file)
+	if used == "" {
+		if current != nil {
+			return current, file
+		}
+		used = file
+	}
+	return security.NewBasicAuth(v.GetString("filer.basic_auth.user"), v.GetString("filer.basic_auth.password")), used
+}
+
+// FilerGuard holds the filer's reloadable jwt.filer_signing keys.
+func (fs *FilerServer) FilerGuard() *security.Guard {
+	return fs.filerGuard
+}
+
 func (fs *FilerServer) Reload() {
 	glog.V(0).Infoln("Reload filer server...")
 
 	util.LoadConfiguration("security", false)
 	v := util.GetViper()
-	fs.filerGuard.UpdateSigningKeys(
-		v.GetString("jwt.filer_signing.key"),
-		v.GetInt("jwt.filer_signing.expires_after_seconds"),
-		v.GetString("jwt.filer_signing.read.key"),
-		v.GetInt("jwt.filer_signing.read.expires_after_seconds"),
-	)
+	// Turn the new credential on before the old one goes off, so a switch
+	// between Basic Auth and JWT never leaves a window with neither.
+	basicAuth, basicAuthFile := loadBasicAuth(fs.basicAuth.Load(), fs.basicAuthFile)
+	fs.basicAuthFile = basicAuthFile
+	if basicAuth != nil {
+		fs.basicAuth.Store(basicAuth)
+	}
+	fs.filerGuard.ReloadSigningKeys("jwt.filer_signing")
+	fs.basicAuth.Store(basicAuth)
 	fs.volumeGuard.UpdateSigningKeys(
 		v.GetString("jwt.signing.key"),
 		v.GetInt("jwt.signing.expires_after_seconds"),
 		v.GetString("jwt.signing.read.key"),
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
+		"",
+		"",
 	)
 	util_http.ReloadJwtSigningReadConfig()
 }

@@ -217,8 +217,10 @@ func (l *DiskLocation) loadEcShardWithIdxDir(collection string, vid needle.Volum
 	ecVolume, found := l.ecVolumes[vid]
 	if !found {
 		var err error
-		ecVolume, err = erasure_coding.NewEcVolume(l.DiskType, l.Directory, idxDir, collection, vid)
+		ecVolume, err = erasure_coding.NewEcVolume(l.DiskType, l.Directory, idxDir, collection, vid, l.storeDirs...)
 		if err != nil {
+			ecVolumeShard.Unmount()
+			ecVolumeShard.Close()
 			// Wrap with %w so MountEcShards / startup reconcile can use
 			// errors.Is(err, os.ErrNotExist) to decide whether to try the
 			// next local disk vs. surface the failure.
@@ -253,6 +255,59 @@ func (l *DiskLocation) loadEcShardWithIdxDir(collection string, vid needle.Volum
 	}
 
 	return ecVolume, nil
+}
+
+// ReopenEcShard swaps the mounted shard's descriptor for a fresh open of its
+// on-disk file while leaving the volume's registration — and therefore the
+// master's view — untouched. It exists for the in-place rebuild path:
+// RebuildEcFiles renames a regenerated shard over the file a mounted handle is
+// still serving, and reopening repoints reads at the repaired file without
+// the delete/add heartbeat flip-flop an unmount+remount would send.
+func (l *DiskLocation) ReopenEcShard(vid needle.VolumeId, shardId erasure_coding.ShardId) (bool, error) {
+	l.ecVolumesLock.Lock()
+	defer l.ecVolumesLock.Unlock()
+
+	ecVolume, found := l.ecVolumes[vid]
+	if !found {
+		return false, nil
+	}
+	var oldShard *erasure_coding.EcVolumeShard
+	position := -1
+	for i, s := range ecVolume.Shards {
+		if s.ShardId == shardId {
+			position = i
+			oldShard = s
+			break
+		}
+	}
+	if oldShard == nil {
+		return false, nil
+	}
+
+	newShard, err := erasure_coding.NewEcVolumeShard(oldShard.DiskType, l.Directory, oldShard.Collection, vid, shardId)
+	if err != nil {
+		return true, fmt.Errorf("reopen ec shard %d.%d: %w", vid, shardId, err)
+	}
+	ecVolume.Shards[position] = newShard
+
+	// Readers that already resolved the old shard keep their object; its Close
+	// turns their next ReadAt into a clean error recovered via parity, the same
+	// contract eviction relies on. Mount/Unmount balance out, so the shard
+	// gauge does not move.
+	oldShard.Unmount()
+	oldShard.Close()
+	return true, nil
+}
+
+// MountedEcShardIds returns the ids of shards this disk currently serves for
+// the volume, or nil when the volume is not mounted here.
+func (l *DiskLocation) MountedEcShardIds(vid needle.VolumeId) []erasure_coding.ShardId {
+	l.ecVolumesLock.RLock()
+	defer l.ecVolumesLock.RUnlock()
+	if ecVolume, found := l.ecVolumes[vid]; found {
+		return ecVolume.ShardIdList()
+	}
+	return nil
 }
 
 func (l *DiskLocation) UnloadEcShard(vid needle.VolumeId, shardId erasure_coding.ShardId) bool {
@@ -605,6 +660,10 @@ func (l *DiskLocation) validateEcVolume(collection string, vid needle.VolumeId) 
 	// Custom ratio comes from the volume's own .vif; the server holds no
 	// cluster EC config in memory.
 	dataShards := l.ecDataShardsFromVif(collection, vid)
+	if dataShards == 0 {
+		glog.Warningf("EC volume %d: sibling .vif files disagree on the encode; keeping EC shards", vid)
+		return true
+	}
 
 	// On-disk .dat size, or -1 when absent (an empty <= superblock .dat is a
 	// stub). A transient stat error keeps the shards rather than deleting.
@@ -662,7 +721,8 @@ func (l *DiskLocation) validateEcVolume(collection string, vid needle.VolumeId) 
 }
 
 // ecDataShardsFromVif resolves the data-shard count for an EC volume from
-// its own .vif (EcShardConfig), checking the data dir then the idx dir. The
+// its own .vif (EcShardConfig), checking the data dir, the idx dir, then the
+// sibling data dir the mount takes the .vif from under a shared idx dir. The
 // .vif is the source of truth for custom ratios on the volume server, which
 // never holds the cluster EC config in memory. Falls back to the default
 // ratio when the .vif carries no EC shard config.
@@ -678,6 +738,15 @@ func (l *DiskLocation) ecDataShardsFromVif(collection string, vid needle.VolumeI
 		if ds := ecDataShardsFromVifDir(collection, l.IdxDirectory, vid); ds > 0 {
 			return ds
 		}
+		vif, ambiguous := erasure_coding.SiblingEcConfigVif(collection, vid, l.Directory, l.IdxDirectory, l.storeDirs)
+		if ambiguous {
+			return 0
+		}
+		if vif != "" {
+			if ds := ecDataShardsFromVifPath(vif); ds > 0 {
+				return ds
+			}
+		}
 	}
 	return erasure_coding.DataShardsCount
 }
@@ -685,7 +754,12 @@ func (l *DiskLocation) ecDataShardsFromVif(collection string, vid needle.VolumeI
 // ecDataShardsFromVifDir returns the .vif EcShardConfig data-shard count for
 // (collection, vid) under dir, or 0 when absent / not custom.
 func ecDataShardsFromVifDir(collection, dir string, vid needle.VolumeId) int {
-	vifName := erasure_coding.EcShardFileName(collection, dir, int(vid)) + ".vif"
+	return ecDataShardsFromVifPath(erasure_coding.EcShardFileName(collection, dir, int(vid)) + ".vif")
+}
+
+// ecDataShardsFromVifPath returns the EcShardConfig data-shard count recorded
+// in one .vif, or 0 when absent / not custom.
+func ecDataShardsFromVifPath(vifName string) int {
 	if vi, _, found, _ := volume_info.MaybeLoadVolumeInfo(vifName); found && vi.EcShardConfig != nil {
 		if ds := int(vi.EcShardConfig.DataShards); ds > 0 {
 			return ds

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/url"
 	"slices"
 	"testing"
 
@@ -143,6 +144,71 @@ func TestSelectMultipartUploadsHoldsOnlyThePage(t *testing.T) {
 	}
 }
 
+// With encoding-type=url the markers and upload keys take the wire form the
+// object listings already use: a client that echoes the escaped marker back
+// still resumes at the decoded key.
+func TestSelectMultipartUploadsUrlEncodesMarkersAndKeys(t *testing.T) {
+	entries := []*filer_pb.Entry{
+		uploadEntry("1", "a\x01b", 10),
+		uploadEntry("2", "a b", 20),
+		uploadEntry("3", "b", 30),
+	}
+	input := listUploadsInput("", "", "", 1)
+	input.EncodingType = aws.String(s3.EncodingTypeUrl)
+
+	out := selectMultipartUploads(input, entries)
+	if *out.Upload[0].Key != "a%01b" || *out.NextUploadIdMarker != "1" {
+		t.Fatalf("page got key %q upload-id-marker %q", *out.Upload[0].Key, *out.NextUploadIdMarker)
+	}
+	marker, err := url.QueryUnescape(*out.NextKeyMarker)
+	if err != nil || decodeListContinuationToken(marker) != "a\x01b" {
+		t.Fatalf("next key marker %q does not resume at %q", *out.NextKeyMarker, "a\x01b")
+	}
+
+	input.KeyMarker = aws.String(decodeListContinuationToken(marker))
+	input.UploadIdMarker = out.NextUploadIdMarker
+	out = selectMultipartUploads(input, entries)
+	if *out.KeyMarker != "a%01b" || *out.Upload[0].Key != "a+b" || *out.NextKeyMarker != "a+b" {
+		t.Fatalf("page got marker %q key %q next %q", *out.KeyMarker, *out.Upload[0].Key, *out.NextKeyMarker)
+	}
+
+	input.KeyMarker = aws.String("a b")
+	input.UploadIdMarker = out.NextUploadIdMarker
+	out = selectMultipartUploads(input, entries)
+	if *out.IsTruncated || *out.Upload[0].Key != "b" {
+		t.Fatalf("last page got truncated=%v key %q", *out.IsTruncated, *out.Upload[0].Key)
+	}
+}
+
+// A raw key that already carries the token prefix must survive an
+// encoding-type=url round trip: under url mode the wire form is the url escape
+// alone, so the client unescapes and hands the raw key back — running the
+// token decode on "base64:..." would misread the raw key as an encoded token.
+func TestSelectMultipartUploadsUrlTokenPrefixedKeyRoundTrip(t *testing.T) {
+	entries := []*filer_pb.Entry{
+		uploadEntry("1", "base64:AQ", 10),
+		uploadEntry("2", "base64:z", 20),
+	}
+	input := listUploadsInput("", "", "", 1)
+	input.EncodingType = aws.String(s3.EncodingTypeUrl)
+
+	out := selectMultipartUploads(input, entries)
+	resume, err := url.QueryUnescape(*out.NextKeyMarker)
+	if err != nil {
+		t.Fatalf("next key marker %q does not unescape: %v", *out.NextKeyMarker, err)
+	}
+	if resume != "base64:AQ" {
+		t.Fatalf("next key marker %q resumes at %q, want %q", *out.NextKeyMarker, resume, "base64:AQ")
+	}
+
+	input.KeyMarker = aws.String(resume)
+	input.UploadIdMarker = out.NextUploadIdMarker
+	out = selectMultipartUploads(input, entries)
+	if *out.IsTruncated || len(out.Upload) != 1 || *out.Upload[0].Key != "base64%3Az" {
+		t.Fatalf("second page got truncated=%v uploads %v", *out.IsTruncated, out.Upload)
+	}
+}
+
 func TestSelectMultipartUploadsCapsRequestedPageSize(t *testing.T) {
 	// max-uploads is caller-controlled; the page stays bounded at the server cap
 	page := newMultipartUploadPage(listUploadsInput("", "", "", 10*maxUploadsList))
@@ -196,5 +262,73 @@ func TestListMultipartUploadsRetryCollectsEachUploadOnce(t *testing.T) {
 	}
 	if !*out.IsTruncated || *out.NextKeyMarker != "b" || *out.NextUploadIdMarker != "3" {
 		t.Fatalf("truncation markers got (%v, %v, %v)", *out.IsTruncated, *out.NextKeyMarker, *out.NextUploadIdMarker)
+	}
+}
+
+// With a delimiter, uploads whose keys go on past it after the prefix are
+// listed once under CommonPrefixes, which count toward max-uploads.
+func TestSelectMultipartUploadsDelimiter(t *testing.T) {
+	entries := []*filer_pb.Entry{
+		uploadEntry("1", "a/1", 10),
+		uploadEntry("2", "a/2", 10),
+		uploadEntry("3", "b/x/1", 10),
+		uploadEntry("4", "c", 10),
+		uploadEntry("5", "a/sub/3", 10),
+	}
+	list := func(prefix, keyMarker string, maxUploads int64) ([]string, []string, bool, string) {
+		input := listUploadsInput(prefix, keyMarker, "", maxUploads)
+		input.Delimiter = aws.String("/")
+		out := selectMultipartUploads(input, entries)
+		var uploads, prefixes []string
+		for _, u := range out.Upload {
+			uploads = append(uploads, *u.Key)
+		}
+		for _, p := range out.CommonPrefixes {
+			prefixes = append(prefixes, p.Prefix)
+		}
+		return uploads, prefixes, *out.IsTruncated, aws.StringValue(out.NextKeyMarker)
+	}
+
+	uploads, prefixes, truncated, _ := list("", "", 1000)
+	if !slices.Equal(uploads, []string{"c"}) || !slices.Equal(prefixes, []string{"a/", "b/"}) || truncated {
+		t.Errorf("no prefix: uploads %v prefixes %v truncated %v", uploads, prefixes, truncated)
+	}
+
+	uploads, prefixes, _, _ = list("a/", "", 1000)
+	if !slices.Equal(uploads, []string{"a/1", "a/2"}) || !slices.Equal(prefixes, []string{"a/sub/"}) {
+		t.Errorf("prefix a/: uploads %v prefixes %v", uploads, prefixes)
+	}
+
+	// a page that ends on a common prefix resumes after it
+	uploads, prefixes, truncated, next := list("", "", 1)
+	if len(uploads) != 0 || !slices.Equal(prefixes, []string{"a/"}) || !truncated || next != "a/" {
+		t.Fatalf("page 1: uploads %v prefixes %v truncated %v next %q", uploads, prefixes, truncated, next)
+	}
+	uploads, prefixes, truncated, _ = list("", next, 1000)
+	if !slices.Equal(uploads, []string{"c"}) || !slices.Equal(prefixes, []string{"b/"}) || truncated {
+		t.Errorf("page 2: uploads %v prefixes %v truncated %v", uploads, prefixes, truncated)
+	}
+}
+
+// A common prefix that does not fit the page is not retained: prefixes tracks
+// only groups still in the page, so a small page stays bounded by max-uploads
+// rather than by every prefix in the bucket.
+func TestSelectMultipartUploadsDelimiterDropsLosingPrefixes(t *testing.T) {
+	input := listUploadsInput("", "", "", 1)
+	input.Delimiter = aws.String("/")
+	page := newMultipartUploadPage(input)
+	page.add(uploadEntry("1", "z/1", 10)) // holds the single slot, then evicted
+	page.add(uploadEntry("2", "a/1", 10))
+	page.add(uploadEntry("3", "z/2", 10)) // "z/" was evicted: loses again
+	page.add(uploadEntry("4", "z/3", 10))
+	if len(page.prefixes) > page.limit {
+		t.Fatalf("retained %d prefixes with limit %d", len(page.prefixes), page.limit)
+	}
+	out := page.result()
+	if len(out.CommonPrefixes) != 1 || out.CommonPrefixes[0].Prefix != "a/" || !*out.IsTruncated {
+		t.Fatalf("prefixes %v truncated %v", out.CommonPrefixes, *out.IsTruncated)
+	}
+	if out.NextUploadIdMarker != nil {
+		t.Fatalf("page ending on a common prefix has upload id marker %v", *out.NextUploadIdMarker)
 	}
 }

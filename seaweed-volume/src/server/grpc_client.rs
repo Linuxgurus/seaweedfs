@@ -60,20 +60,28 @@ pub fn load_outgoing_grpc_tls(
     config: &VolumeServerConfig,
 ) -> Result<Option<OutgoingGrpcTlsConfig>, GrpcClientError> {
     // prefer a dedicated client certificate: CAs may issue certs with only one of the serverAuth/clientAuth EKUs
-    let (cert_file, key_file) = if !config.grpc_client_cert_file.is_empty()
-        && !config.grpc_client_key_file.is_empty()
-    {
+    if config.grpc_client_cert_file.is_empty() != config.grpc_client_key_file.is_empty() {
+        return Err(GrpcClientError(
+            "grpc.volume.client_cert and grpc.volume.client_key must both be set".to_string(),
+        ));
+    }
+    let (cert_file, key_file) = if !config.grpc_client_cert_file.is_empty() {
         (&config.grpc_client_cert_file, &config.grpc_client_key_file)
     } else {
-        if !config.grpc_client_cert_file.is_empty() || !config.grpc_client_key_file.is_empty() {
-            tracing::warn!(
-                "grpc.volume.client_cert and grpc.volume.client_key must both be set, falling back to grpc.volume.cert and grpc.volume.key"
-            );
-        }
         (&config.grpc_cert_file, &config.grpc_key_file)
     };
-    if cert_file.is_empty() || key_file.is_empty() || config.grpc_ca_file.is_empty() {
+    if cert_file.is_empty() && key_file.is_empty() {
         return Ok(None);
+    }
+    if cert_file.is_empty() || key_file.is_empty() {
+        return Err(GrpcClientError(
+            "grpc.volume.cert and grpc.volume.key must both be set".to_string(),
+        ));
+    }
+    if config.grpc_ca_file.is_empty() {
+        return Err(GrpcClientError(
+            "grpc.volume cert and key are set but grpc.ca is not".to_string(),
+        ));
     }
 
     let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
@@ -100,6 +108,17 @@ pub fn load_outgoing_grpc_tls(
         key_pem,
         ca_pem,
     }))
+}
+
+#[cfg(test)]
+impl OutgoingGrpcTlsConfig {
+    pub(crate) fn self_signed_for_test() -> Self {
+        Self {
+            cert_pem: tests::TEST_CERT_PEM.to_string(),
+            key_pem: tests::TEST_KEY_PEM.to_string(),
+            ca_pem: tests::TEST_CERT_PEM.to_string(),
+        }
+    }
 }
 
 pub fn grpc_endpoint_uri(grpc_host_port: &str, tls: Option<&OutgoingGrpcTlsConfig>) -> String {
@@ -352,8 +371,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBPDCB76ADAgECAhRuRPQgeAu43BT/M7EfAWSdapVdYDAFBgMrZXAwFDESMBAG\nA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwNTE2MTUyOVoXDTM2MDcwMjE2MTUyOVow\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCowBQYDK2VwAyEAr/3bNIFI+8V32oCiY6y+\nXRFmZpdNQ2g//VtRkT+nQg+jUzBRMB0GA1UdDgQWBBTsy9tLf1zPiXCQfgci6zNi\ndEzRSjAfBgNVHSMEGDAWgBTsy9tLf1zPiXCQfgci6zNidEzRSjAPBgNVHRMBAf8E\nBTADAQH/MAUGAytlcANBAIvsdw0IbvOBBkb9cd7BfMJfIP9pQQrAL03pCRWJFnFh\nSysaLVgFXI4T078IiaM874oO+iB+5vNbWEpc7CkGow4=\n-----END CERTIFICATE-----\n";
-    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIHbyn71Kk+Y7KT3sBctit7uZpErpoH6qDbFj6P8qGaZH\n-----END PRIVATE KEY-----\n";
+    pub(super) const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBPDCB76ADAgECAhRuRPQgeAu43BT/M7EfAWSdapVdYDAFBgMrZXAwFDESMBAG\nA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwNTE2MTUyOVoXDTM2MDcwMjE2MTUyOVow\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCowBQYDK2VwAyEAr/3bNIFI+8V32oCiY6y+\nXRFmZpdNQ2g//VtRkT+nQg+jUzBRMB0GA1UdDgQWBBTsy9tLf1zPiXCQfgci6zNi\ndEzRSjAfBgNVHSMEGDAWgBTsy9tLf1zPiXCQfgci6zNidEzRSjAPBgNVHRMBAf8E\nBTADAQH/MAUGAytlcANBAIvsdw0IbvOBBkb9cd7BfMJfIP9pQQrAL03pCRWJFnFh\nSysaLVgFXI4T078IiaM874oO+iB+5vNbWEpc7CkGow4=\n-----END CERTIFICATE-----\n";
+    pub(super) const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIHbyn71Kk+Y7KT3sBctit7uZpErpoH6qDbFj6P8qGaZH\n-----END PRIVATE KEY-----\n";
 
     #[test]
     fn test_build_grpc_endpoint_with_tls_resolves_crypto_provider() {
@@ -393,6 +412,9 @@ mod tests {
             fix_jpg_orientation: false,
             read_mode: ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
+            fsync_min_batch_bytes: 1024 * 1024,
+            fsync_min_batch_requests: 128,
+            fsync_batch_wait: std::time::Duration::from_micros(500),
             cpu_profile: String::new(),
             mem_profile: String::new(),
             compaction_byte_per_second: 0,
@@ -414,6 +436,8 @@ mod tests {
             ui_enabled: false,
             jwt_signing_key: vec![],
             jwt_signing_expires_seconds: 0,
+            jwt_previous_signing_key: vec![],
+            jwt_previous_read_signing_key: vec![],
             jwt_read_signing_key: vec![],
             jwt_read_signing_expires_seconds: 0,
             https_cert_file: String::new(),
@@ -449,10 +473,21 @@ mod tests {
     }
 
     #[test]
-    fn test_load_outgoing_grpc_tls_requires_cert_key_and_ca() {
+    fn test_load_outgoing_grpc_tls_unconfigured_is_plaintext() {
+        let config = sample_config();
+        assert!(load_outgoing_grpc_tls(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_outgoing_grpc_tls_rejects_partial_config() {
         let mut config = sample_config();
         config.grpc_cert_file = "/tmp/client.pem".to_string();
-        assert!(load_outgoing_grpc_tls(&config).unwrap().is_none());
+        assert!(load_outgoing_grpc_tls(&config).is_err());
+
+        let mut config = sample_config();
+        config.grpc_cert_file = "/tmp/client.pem".to_string();
+        config.grpc_key_file = "/tmp/client.key".to_string();
+        assert!(load_outgoing_grpc_tls(&config).is_err());
     }
 
     fn write_pem_files(dir: &tempfile::TempDir, config: &mut VolumeServerConfig) {
@@ -464,6 +499,20 @@ mod tests {
         config.grpc_cert_file = write("server.pem", "server-cert");
         config.grpc_key_file = write("server.key", "server-key");
         config.grpc_ca_file = write("ca.pem", "ca");
+    }
+
+    #[test]
+    fn test_load_outgoing_grpc_tls_rejects_partial_client_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = sample_config();
+        write_pem_files(&dir, &mut config);
+        config.grpc_client_cert_file = "/tmp/client.pem".to_string();
+
+        let err = load_outgoing_grpc_tls(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "grpc.volume.client_cert and grpc.volume.client_key must both be set"
+        );
     }
 
     #[test]

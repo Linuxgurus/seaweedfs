@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"google.golang.org/grpc"
 
@@ -13,7 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
 
-func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, garbageThreshold float64, concurrentVacuumLimitPerVolumeServer int, growThreshold float64, preallocate int64, vacuumInterval time.Duration, deleteEmptyAfter time.Duration) {
+func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, garbageThreshold float64, concurrentVacuumLimitPerVolumeServer int, concurrentVacuumLimitPerRack int, growThreshold float64, preallocate int64, vacuumInterval time.Duration, deleteEmptyAfter time.Duration) {
 	if vacuumInterval <= 0 {
 		vacuumInterval = 14 * time.Minute
 	}
@@ -23,6 +22,7 @@ func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, g
 				freshThreshHold := time.Now().Unix() - 3*t.pulse //3 times of sleep interval
 				t.CollectDeadNodeAndFullVolumes(freshThreshHold, t.volumeSizeLimit, growThreshold)
 				t.DecayQuietVolumeSizes()
+				t.retryPendingQuarantineReleases()
 			}
 			time.Sleep(time.Duration(float32(t.pulse*1e3)*(1+rand.Float32())) * time.Millisecond)
 		}
@@ -39,7 +39,7 @@ func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, g
 					t.EnableVacuumByPlugin()
 				}
 				if !t.IsVacuumDisabled() {
-					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, 0, "", preallocate, true, deleteEmptyAfter)
+					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, concurrentVacuumLimitPerRack, 0, "", preallocate, true, deleteEmptyAfter)
 				}
 			} else {
 				stats.MasterReplicaPlacementMismatch.Reset()
@@ -76,7 +76,7 @@ func (t *Topology) SetVolumeCapacityFull(volumeInfo storage.VolumeInfo) bool {
 	for _, dn := range vidLocations.list {
 		if !volumeInfo.ReadOnly {
 
-			disk := dn.getOrCreateDisk(volumeInfo.DiskType)
+			disk := dn.getOrCreateDiskWithLock(volumeInfo.DiskType)
 			disk.UpAdjustDiskUsageDelta(types.ToDiskType(volumeInfo.DiskType), &DiskUsageCounts{
 				activeVolumeCount: -1,
 			})
@@ -122,9 +122,15 @@ func (t *Topology) UnRegisterDataNode(dn *DataNode) {
 		defer t.releaseResolvedQuarantine(v.Id)
 	}
 
-	// unregister ec shards when volume server disconnected
+	// unregister ec shards when volume server disconnected. The node's own
+	// records clear first so the still-held check cannot skip the drop, and
+	// each unregister gets a copy — DeleteEcShard drains the shared
+	// ShardsInfo.
 	for _, s := range dn.GetEcShards() {
-		t.UnRegisterEcShards(s, dn)
+		held := *s
+		held.ShardsInfo = s.ShardsInfo.Copy()
+		dn.DeleteEcShard(s)
+		t.UnRegisterEcShards(&held, dn)
 	}
 
 	negativeUsages := dn.GetDiskUsages().negative()
@@ -132,7 +138,6 @@ func (t *Topology) UnRegisterDataNode(dn *DataNode) {
 		dn.UpAdjustDiskUsageDelta(dt, du)
 	}
 	dn.DeltaUpdateVolumes([]storage.VolumeInfo{}, dn.GetVolumes())
-	dn.DeltaUpdateEcShards([]*erasure_coding.EcVolumeInfo{}, dn.GetEcShards())
 	t.unregisterDataNodeAddress(dn.ServerAddress(), dn)
 	if dn.Parent() != nil {
 		dn.Parent().UnlinkChildNode(dn.Id())

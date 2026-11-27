@@ -102,6 +102,15 @@ func (dn *DataNode) getOrCreateDisk(diskType string) *Disk {
 	return disk
 }
 
+// getOrCreateDiskWithLock is getOrCreateDisk for callers that do not hold
+// dn.Lock: linking a new disk writes dn.children, which readers range under
+// dn.RLock.
+func (dn *DataNode) getOrCreateDiskWithLock(diskType string) *Disk {
+	dn.Lock()
+	defer dn.Unlock()
+	return dn.getOrCreateDisk(diskType)
+}
+
 func (dn *DataNode) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged, tierTransition bool) {
 	disk := dn.getOrCreateDisk(v.DiskType)
 	return disk.AddOrUpdateVolume(v)
@@ -187,7 +196,9 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 	for _, v := range deletedVolumes {
 		disk := dn.getOrCreateDisk(v.DiskType)
 
-		_, err := disk.GetVolumesById(v.Id)
+		// Undo what was counted for the stored record: the delete report does
+		// not carry the read-only state the master has since learned.
+		held, err := disk.GetVolumesById(v.Id)
 		if err != nil {
 			continue
 		}
@@ -195,10 +206,10 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 
 		deltaDiskUsage := &DiskUsageCounts{}
 		deltaDiskUsage.volumeCount = -1
-		if v.IsRemote() {
+		if held.IsRemote() {
 			deltaDiskUsage.remoteVolumeCount = -1
 		}
-		if !v.ReadOnly {
+		if !held.ReadOnly {
 			deltaDiskUsage.activeVolumeCount = -1
 		}
 		disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
@@ -221,7 +232,7 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 		if currentDiskUsageMaxVolumeCount == int64(maxVolumeCount) {
 			continue
 		}
-		disk := dn.getOrCreateDisk(dt.String())
+		disk := dn.getOrCreateDiskWithLock(dt.String())
 		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
 			maxVolumeCount: int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount,
 		})
@@ -247,7 +258,7 @@ func (dn *DataNode) AdjustDiskUsageBytes(diskTotalBytes, diskFreeBytes map[strin
 		if currentTotal == newTotal && currentFree == newFree {
 			continue
 		}
-		disk := dn.getOrCreateDisk(dt.String())
+		disk := dn.getOrCreateDiskWithLock(dt.String())
 		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
 			diskTotalBytes: newTotal - currentTotal,
 			diskFreeBytes:  newFree - currentFree,
@@ -358,10 +369,10 @@ func (dn *DataNode) matchesLocation(option *VolumeGrowOption) bool {
 
 func (dn *DataNode) GetTopology() *Topology {
 	p := dn.Parent()
-	for p.Parent() != nil {
+	for p != nil && p.Parent() != nil {
 		p = p.Parent()
 	}
-	t := p.(*Topology)
+	t, _ := p.(*Topology)
 	return t
 }
 

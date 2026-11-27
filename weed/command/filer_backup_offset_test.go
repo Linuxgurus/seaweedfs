@@ -3,11 +3,14 @@ package command
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -34,14 +37,35 @@ func (s *kvFilerServer) KvPut(_ context.Context, req *filer_pb.KvPutRequest) (*f
 	return &filer_pb.KvPutResponse{}, nil
 }
 
+type failingKvFilerServer struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	calls atomic.Int32
+}
+
+func (s *failingKvFilerServer) KvGet(context.Context, *filer_pb.KvGetRequest) (*filer_pb.KvGetResponse, error) {
+	if s.calls.Add(1) == 1 {
+		return &filer_pb.KvGetResponse{Error: "kv store unavailable"}, nil
+	}
+	return &filer_pb.KvGetResponse{}, nil
+}
+
+// a miss reads as ErrNotFound so the retried attempt skips the KEK retry loop
+func (s *failingKvFilerServer) LookupDirectoryEntry(context.Context, *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	return &filer_pb.LookupDirectoryEntryResponse{}, nil
+}
+
 func startKvFiler(t *testing.T) (pb.ServerAddress, grpc.DialOption) {
+	return startFiler(t, &kvFilerServer{kv: map[string][]byte{}})
+}
+
+func startFiler(t *testing.T, server filer_pb.SeaweedFilerServer) (pb.ServerAddress, grpc.DialOption) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	grpcServer := grpc.NewServer()
-	filer_pb.RegisterSeaweedFilerServer(grpcServer, &kvFilerServer{kv: map[string][]byte{}})
+	filer_pb.RegisterSeaweedFilerServer(grpcServer, server)
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(func() { grpcServer.Stop() })
 	grpcPort := listener.Addr().(*net.TCPAddr).Port
@@ -57,7 +81,7 @@ func TestBackupOffset_HistoricalFallbackThenIndependence(t *testing.T) {
 	filerAddr, dial := startKvFiler(t)
 
 	s := &stubSink{name: "s3", dir: "/", destination: "endpoint-a|bucket-a|/"}
-	sinkId, legacySinkId := backupCheckpointIds("/", s)
+	sinkId, legacySinkId := backupCheckpointIds("/", s, false)
 
 	// pre-upgrade state: only the shared historical checkpoint exists
 	if err := setOffset(dial, filerAddr, BackupKeyPrefix, legacySinkId, 111); err != nil {
@@ -93,8 +117,8 @@ func TestBackupOffset_HistoricalFallbackThenIndependence(t *testing.T) {
 func TestBackupOffset_DistinctDestinationsDoNotShare(t *testing.T) {
 	filerAddr, dial := startKvFiler(t)
 
-	idA, legacyA := backupCheckpointIds("/", &stubSink{name: "s3", dir: "/", destination: "s3.us-west-004.backblazeb2.com|seaweed-backup-a|/"})
-	idB, legacyB := backupCheckpointIds("/", &stubSink{name: "s3", dir: "/", destination: "s3.us-east-005.backblazeb2.com|seaweed-backup-b|/"})
+	idA, legacyA := backupCheckpointIds("/", &stubSink{name: "s3", dir: "/", destination: "s3.us-west-004.backblazeb2.com|seaweed-backup-a|/"}, false)
+	idB, legacyB := backupCheckpointIds("/", &stubSink{name: "s3", dir: "/", destination: "s3.us-east-005.backblazeb2.com|seaweed-backup-b|/"}, false)
 
 	if err := setOffset(dial, filerAddr, BackupKeyPrefix, idA, 1000); err != nil {
 		t.Fatalf("write A: %v", err)
@@ -108,5 +132,40 @@ func TestBackupOffset_DistinctDestinationsDoNotShare(t *testing.T) {
 	}
 	if got, err := getOffsetWithFallback(dial, filerAddr, BackupKeyPrefix, idB, BackupKeyPrefix, legacyB); err != nil || got != 2000 {
 		t.Fatalf("B reads (%d, %v), want (2000, nil)", got, err)
+	}
+}
+
+func TestFilerBackup_OffsetReadFailureFailsAttempt(t *testing.T) {
+	server := &failingKvFilerServer{}
+	filerAddr, dial := startFiler(t, server)
+
+	config := util.GetViper()
+	config.Set("sink.local.enabled", true)
+	config.Set("sink.local.directory", t.TempDir())
+	t.Cleanup(func() {
+		config.Set("sink.local.enabled", false)
+		config.Set("sink.local.directory", "")
+	})
+
+	options := filerBackupOptions
+	address := string(filerAddr)
+	options.filer = &address
+
+	resumeTsNs, err := doFilerBackup(dial, &options, nil, nil, nil, 1, 1, 0)
+	if err == nil || !strings.Contains(err.Error(), "kv store unavailable") {
+		t.Fatalf("doFilerBackup error = %v, want the offset read failure", err)
+	}
+	if resumeTsNs != 0 {
+		t.Fatalf("resume position = %d, want 0", resumeTsNs)
+	}
+
+	// the next attempt re-reads the checkpoint and gets past it once the KV
+	// recovers, so it must fail later, not on the offset read
+	_, err = doFilerBackup(dial, &options, nil, nil, nil, 1, 2, resumeTsNs)
+	if err == nil || strings.Contains(err.Error(), "kv store unavailable") {
+		t.Fatalf("retried doFilerBackup error = %v, want a later-stage failure", err)
+	}
+	if got := server.calls.Load(); got < 2 {
+		t.Fatalf("checkpoint reads across attempts = %d, want a re-read", got)
 	}
 }

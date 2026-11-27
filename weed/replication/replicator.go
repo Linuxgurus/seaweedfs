@@ -101,14 +101,14 @@ func (r *Replicator) Replicate(ctx context.Context, key string, message *filer_p
 
 	if oldEntry != nil && newEntry == nil {
 		glog.V(4).Infof("deleting %v", oldSinkKey)
-		return sink.DeleteEntry(r.sink, oldSinkKey, oldEntry.IsDirectory, message.DeleteChunks, filer.IsMetadataOnlyDelete(oldEntry), message.Signatures)
+		return sink.DeleteEntryVersion(r.sink, oldSinkKey, oldEntry, 0, message.DeleteChunks, filer.IsMetadataOnlyDelete(oldEntry), message.Signatures)
 	}
 	if oldEntry == nil && newEntry != nil {
 		glog.V(4).Infof("creating %v", oldSinkKey)
 		return r.sink.CreateEntry(oldSinkKey, newEntry, message.Signatures)
 	}
 	if oldEntry == nil && newEntry == nil {
-		glog.V(0).Infof("weird message %+v", message)
+		glog.V(0).Infof("weird message %v: no old or new entry", key)
 		return nil
 	}
 
@@ -116,7 +116,7 @@ func (r *Replicator) Replicate(ctx context.Context, key string, message *filer_p
 		// A real move: the path changed. UpdateEntry cannot move an entry.
 		if mover, ok := r.sink.(sink.EntryMover); ok {
 			glog.V(4).Infof("moving %v => %v", oldSinkKey, newSinkKey)
-			return mover.MoveEntry(oldSinkKey, newSinkKey, newEntry, message.Signatures)
+			return mover.MoveEntry(oldSinkKey, newSinkKey, oldEntry, newEntry, message.Signatures)
 		}
 		// Sinks without a native move: create at the new key first, then delete the
 		// old, so a crash between the two leaves the entry visible under both names
@@ -125,7 +125,7 @@ func (r *Replicator) Replicate(ctx context.Context, key string, message *filer_p
 		if err := r.sink.CreateEntry(newSinkKey, newEntry, message.Signatures); err != nil {
 			return fmt.Errorf("create renamed entry %v: %w", newSinkKey, err)
 		}
-		return r.sink.DeleteEntry(oldSinkKey, oldEntry.IsDirectory, false, message.Signatures)
+		return sink.DeleteEntryVersion(r.sink, oldSinkKey, oldEntry, 0, false, false, message.Signatures)
 	}
 
 	// oldSinkKey == newSinkKey: pure in-place update (same path, content/attrs changed).

@@ -44,6 +44,17 @@ func isCanceledErr(err error) bool {
 	return false
 }
 
+func isDeadlineExceededErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	statusErr, ok := status.FromError(err)
+	return ok && statusErr.Code() == codes.DeadlineExceeded
+}
+
 // LookupVolumeIds queries the master for volume locations (fallback when cache misses).
 // Returns partial results with aggregated errors for volumes that failed.
 // Retries on codes.Unavailable (e.g. master warming up after restart) with backoff.
@@ -61,6 +72,10 @@ func (p *masterVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []
 		func() error {
 			result = make(map[string][]Location)
 			lookupErrors = nil
+			epoch := p.masterClient.mapEpoch()
+			// Taken with the epoch: what the master answers is not cached over
+			// locations learned and set aside while it was asked.
+			asked := p.masterClient.vidMap.learnedSoFar()
 
 			// Per-attempt timeout bounds both master resolution and the RPC
 			// so a single attempt cannot consume the entire retry budget.
@@ -113,10 +128,9 @@ func (p *masterVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []
 							ReadOnly:          masterLoc.ReadOnly,
 							ReadOnlyCanDelete: masterLoc.ReadOnlyCanDelete,
 						}
-						// Update cache with the location
-						p.masterClient.addLocation(uint32(vid), loc)
 						locations = append(locations, loc)
 					}
+					p.masterClient.fillLocations(uint32(vid), locations, epoch, asked)
 
 					if len(locations) > 0 {
 						result[vidOnly] = locations
@@ -165,6 +179,14 @@ type MasterClient struct {
 	OnLockRingUpdateLock sync.RWMutex
 	OnMasterChange       func(previous, current pb.ServerAddress)
 	OnMasterChangeLock   sync.RWMutex
+	// OnVolumeLocationChange hears, per pushed message, the vids loc added and
+	// the vids loc no longer serves in any form.
+	OnVolumeLocationChange     func(loc Location, addedVids, deletedVids []uint32)
+	OnVolumeLocationChangeLock sync.RWMutex
+	// OnVidMapReset fires when a (re)connect makes the master re-tell its view;
+	// removals made while disconnected are never pushed.
+	OnVidMapReset     func()
+	OnVidMapResetLock sync.RWMutex
 
 	// streamLock publishes the stream only after its registration send, so a
 	// leave sent afterwards never races that send.
@@ -258,6 +280,29 @@ func (mc *MasterClient) SetOnMasterChangeFn(fn func(previous, current pb.ServerA
 	mc.OnMasterChangeLock.Lock()
 	mc.OnMasterChange = fn
 	mc.OnMasterChangeLock.Unlock()
+}
+
+func (mc *MasterClient) SetOnVolumeLocationChangeFn(fn func(loc Location, addedVids, deletedVids []uint32)) {
+	mc.OnVolumeLocationChangeLock.Lock()
+	mc.OnVolumeLocationChange = fn
+	mc.OnVolumeLocationChangeLock.Unlock()
+}
+
+func (mc *MasterClient) SetOnVidMapResetFn(fn func()) {
+	mc.OnVidMapResetLock.Lock()
+	mc.OnVidMapReset = fn
+	mc.OnVidMapResetLock.Unlock()
+}
+
+// resetVidMap starts a new vid map generation and tells OnVidMapReset.
+func (mc *MasterClient) resetVidMap() {
+	mc.vidMapClient.resetVidMap()
+	mc.OnVidMapResetLock.RLock()
+	fn := mc.OnVidMapReset
+	mc.OnVidMapResetLock.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (mc *MasterClient) tryAllMasters(ctx context.Context) {
@@ -578,12 +623,39 @@ func (mc *MasterClient) updateVidMap(resp *master_pb.KeepConnectedResponse) {
 		glog.V(2).Infof("%s.%s: %s masterClient removes ec volume %d", mc.FilerGroup, mc.clientType, loc.Url, deletedEcVid)
 		mc.deleteEcLocation(deletedEcVid, loc)
 	}
+	mc.notifyVolumeLocationChange(loc, resp.VolumeLocation)
 	glog.V(1).Infof("updateVidMap(%s) %s.%s: %s volume add local: %d, remote: %d, del: %d, add ec: %d del ec: %d",
 		resp.VolumeLocation.DataCenter, mc.FilerGroup, mc.clientType, loc.Url,
 		len(resp.VolumeLocation.NewVids)-len(resp.VolumeLocation.RemoteVids),
 		len(resp.VolumeLocation.RemoteVids),
 		len(resp.VolumeLocation.DeletedVids), len(resp.VolumeLocation.NewEcVids),
 		len(resp.VolumeLocation.DeletedEcVids))
+}
+
+// notifyVolumeLocationChange reports a removal only once loc serves the vid in
+// no form, since ec.encode and ec.decode add the new form before removing the
+// old one from the same server.
+func (mc *MasterClient) notifyVolumeLocationChange(loc Location, vl *master_pb.VolumeLocation) {
+	mc.OnVolumeLocationChangeLock.RLock()
+	fn := mc.OnVolumeLocationChange
+	mc.OnVolumeLocationChangeLock.RUnlock()
+	if fn == nil {
+		return
+	}
+	var added, deleted []uint32
+	for _, vids := range [][]uint32{vl.NewVids, vl.RemoteVids, vl.NewEcVids} {
+		added = append(added, vids...)
+	}
+	for _, vids := range [][]uint32{vl.DeletedVids, vl.DeletedEcVids} {
+		for _, vid := range vids {
+			if !mc.vidMap.hasLocation(vid, loc.Url) {
+				deleted = append(deleted, vid)
+			}
+		}
+	}
+	if len(added) > 0 || len(deleted) > 0 {
+		fn(loc, added, deleted)
+	}
 }
 
 func (mc *MasterClient) WithClient(ctx context.Context, streamingMode bool, fn func(client master_pb.SeaweedClient) error) error {

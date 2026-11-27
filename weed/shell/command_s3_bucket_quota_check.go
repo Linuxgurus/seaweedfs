@@ -40,7 +40,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	applyQuotaLimit := bucketCommand.Bool("apply", false, "actually change the buckets readonly attribute")
 	if err = bucketCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 	infoAboutSimulationMode(writer, *applyQuotaLimit, "-apply")
 
@@ -60,7 +60,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 	}
 
 	// read existing filer configuration
-	fc, err := filer.ReadFilerConf(commandEnv.option.FilerAddress, commandEnv.option.GrpcDialOption, commandEnv.MasterClient)
+	fc, err := filer.ReadFilerConf(commandEnv.FilerAddress(), commandEnv.option.GrpcDialOption, commandEnv.MasterClient)
 	if err != nil {
 		return err
 	}

@@ -18,8 +18,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 func (ms *MasterServer) StreamAssign(server master_pb.Seaweed_StreamAssignServer) error {
@@ -51,7 +53,7 @@ func (ms *MasterServer) StreamAssign(server master_pb.Seaweed_StreamAssignServer
 func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest) (*master_pb.AssignResponse, error) {
 
 	if !ms.Topo.IsLeader() {
-		return nil, raft.NotLeaderError
+		return nil, notLeaderError()
 	}
 
 	if req.Count == 0 {
@@ -71,7 +73,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	}
 
 	if ms.Topo.IsWarmingUp() {
-		return nil, status.Errorf(codes.Unavailable, "master is warming up, topology is still loading")
+		return nil, warmingUpError(ms.Topo.RemainingWarmupDuration())
 	}
 	diskType := types.ToDiskType(req.DiskType)
 
@@ -118,6 +120,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		startTime            = time.Now()
 		initiatedGrow        bool
 		repickedAfterGrow    bool
+		recheckedBlocker     bool
 		unservedLayoutLogged bool
 	)
 
@@ -139,8 +142,33 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 			stats.MasterPickForWriteErrorCounter.Inc()
 			lastErr = err
 			if (req.DataCenter != "" || req.Rack != "") && strings.Contains(err.Error(), topology.NoWritableVolumes) {
-				glog.V(0).Infof("assign %v %v: %v", req, option.String(), err)
-				return nil, err
+				// Fail fast only when no growth can produce a writable volume in
+				// the requested location; a location with a pending or just-
+				// concluded grow gets the same wait/shed path as an
+				// unconstrained assign, so its client retry can re-trigger
+				// growth.
+				growBlocker := err
+				growthInFlight := !ms.option.VolumeGrowthDisabled && (initiatedGrow || vl.HasGrowRequest())
+				if growthInFlight {
+					growBlocker = ms.Topo.GrowthBlocker(option)
+				}
+				if growBlocker != nil {
+					// The blocker's slot counts can predate an in-flight grow's
+					// delivery by a heartbeat: a volume minted on the last slot
+					// still registers writable a moment later. Give a pending
+					// grow one repick before surfacing the placement error.
+					if growthInFlight && !recheckedBlocker {
+						recheckedBlocker = true
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(200 * time.Millisecond):
+						}
+						continue
+					}
+					glog.V(0).Infof("assign %v %v: %v", req, option.String(), err)
+					return nil, growBlocker
+				}
 			}
 			if shouldGrow {
 				if ms.Topo.AvailableSpaceFor(option) <= 0 {
@@ -199,27 +227,15 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		if dn == nil {
 			continue
 		}
-		var replicas []*master_pb.Location
-		for _, r := range dnList.Rest() {
-			replicas = append(replicas, &master_pb.Location{
-				Url:        r.Url(),
-				PublicUrl:  r.PublicUrl,
-				GrpcPort:   uint32(r.GrpcPort),
-				DataCenter: r.GetDataCenterId(),
-			})
+		return assignResponse(fid, count, dnList, ms.guard), nil
+	}
+	// The last in-loop pick can predate the growth it triggered concluding:
+	// growth registers its volumes before clearing the pending flag, so pick
+	// once more before shedding.
+	if fid, count, dnList, _, err := ms.Topo.PickForWrite(req.Count, option, vl, req.ExpectedDataSize); err == nil {
+		if dnList.Head() != nil {
+			return assignResponse(fid, count, dnList, ms.guard), nil
 		}
-		return &master_pb.AssignResponse{
-			Fid: fid,
-			Location: &master_pb.Location{
-				Url:        dn.Url(),
-				PublicUrl:  dn.PublicUrl,
-				GrpcPort:   uint32(dn.GrpcPort),
-				DataCenter: dn.GetDataCenterId(),
-			},
-			Count:    count,
-			Auth:     string(security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), fid)),
-			Replicas: replicas,
-		}, nil
 	}
 	// The initiator timed out with its growth still pending: shed retryably
 	// rather than failing the write that growth is about to satisfy.
@@ -233,6 +249,31 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		glog.V(0).Infof("assign %v %v: %v", req, option.String(), lastErr)
 	}
 	return nil, lastErr
+}
+
+func assignResponse(fid string, count uint64, dnList *topology.VolumeLocationList, guard *security.Guard) *master_pb.AssignResponse {
+	var replicas []*master_pb.Location
+	for _, r := range dnList.Rest() {
+		replicas = append(replicas, &master_pb.Location{
+			Url:        r.Url(),
+			PublicUrl:  r.PublicUrl,
+			GrpcPort:   uint32(r.GrpcPort),
+			DataCenter: r.GetDataCenterId(),
+		})
+	}
+	dn := dnList.Head()
+	return &master_pb.AssignResponse{
+		Fid: fid,
+		Location: &master_pb.Location{
+			Url:        dn.Url(),
+			PublicUrl:  dn.PublicUrl,
+			GrpcPort:   uint32(dn.GrpcPort),
+			DataCenter: dn.GetDataCenterId(),
+		},
+		Count:    count,
+		Auth:     string(security.GenJwtForVolumeServer(guard.SigningKey(), guard.ExpiresAfterSec(), fid)),
+		Replicas: replicas,
+	}
 }
 
 // describeDiskLayout names the disk layout an assign targets. The empty disk
@@ -290,4 +331,27 @@ func (w *unservedLayoutWarning) Do(optionKey string, lastErr error) {
 	}
 	w.last[optionKey] = now
 	glog.Warningf("assign requests for %s will keep failing until a volume server registers that disk layout or clients change their assignment disk type: %v", optionKey, lastErr)
+}
+
+func notLeaderError() error {
+	st := status.New(codes.Unavailable, raft.NotLeaderError.Error())
+	withReason, err := st.WithDetails(&errdetails.ErrorInfo{Reason: "NOT_LEADER", Domain: "seaweedfs"})
+	if err != nil {
+		return st.Err()
+	}
+	return withReason.Err()
+}
+
+// warmingUpError carries the remaining warm-up as a RetryInfo detail, the gRPC
+// counterpart of the HTTP handlers' Retry-After.
+func warmingUpError(remaining time.Duration) error {
+	st := status.New(codes.Unavailable, "master is warming up, topology is still loading")
+	if remaining <= 0 {
+		return st.Err()
+	}
+	withHint, err := st.WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(remaining)})
+	if err != nil {
+		return st.Err()
+	}
+	return withHint.Err()
 }

@@ -48,7 +48,7 @@ func TestReconcileRollForwardMarkerOnly(t *testing.T) {
 	}
 	// Delete two so the compacted generation is strictly smaller than the source.
 	for _, id := range []uint64{2, 5} {
-		if _, err := v.deleteNeedle2(newEmptyNeedle(id)); err != nil {
+		if _, err := v.deleteNeedle2(newEmptyNeedle(id), false); err != nil {
 			t.Fatalf("delete %d: %v", id, err)
 		}
 	}
@@ -122,7 +122,7 @@ func TestReconcileRollForwardPartialRename(t *testing.T) {
 		}
 	}
 	for _, id := range []uint64{2, 5} {
-		if _, err := v.deleteNeedle2(newEmptyNeedle(id)); err != nil {
+		if _, err := v.deleteNeedle2(newEmptyNeedle(id), false); err != nil {
 			t.Fatalf("delete %d: %v", id, err)
 		}
 	}
@@ -339,4 +339,41 @@ func TestDestroyRemovesCommitMarker(t *testing.T) {
 	defer location.Close()
 	location.reconcileCompactStates()
 	mustNotExist(t, cpc)
+}
+
+// A VolumeCopy mid-flight writes the same basenames an interrupted commit
+// would swap: reconcileCompactStates must skip the vid while the load guard
+// reports a copy, and roll the leftover forward once it clears.
+func TestReconcileSkipsVidWithCopyInFlight(t *testing.T) {
+	dir := t.TempDir()
+
+	location := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, "", nil, stats.DefaultDiskIOProbeConfig())
+	defer location.Close()
+
+	base := filepath.Join(dir, "7")
+	for _, ext := range []string{".cpc", ".cpd", ".cpx"} {
+		if err := os.WriteFile(base+ext, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(base+".dat", []byte("copy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	vid := needle.VolumeId(7)
+	inFlight := true
+	location.loadGuard = func(v needle.VolumeId) (func(), bool) {
+		return func() {}, v == vid && inFlight
+	}
+
+	location.reconcileCompactStates()
+	mustExist(t, base+".cpd")
+	if got, err := os.ReadFile(base + ".dat"); err != nil || string(got) != "copy" {
+		t.Fatalf("reconcile rolled a swap over a copy's .dat: %q %v", got, err)
+	}
+
+	inFlight = false
+	location.reconcileCompactStates()
+	mustNotExist(t, base+".cpd")
+	mustExist(t, base+".dat")
 }

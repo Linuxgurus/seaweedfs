@@ -10,6 +10,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
@@ -59,6 +60,10 @@ type volumeShards struct {
 	collection    string
 	shardBits     erasure_coding.ShardBits            // union across disks
 	diskShardBits map[uint32]erasure_coding.ShardBits // disk_id -> shards of this volume on that disk
+	diskEncodeTs  map[uint32]int64                    // disk_id -> encode-run identity from the disk's .vif
+	// frozen marks a volume whose duplicate shards come from conflicting
+	// encode runs; no phase moves its shards.
+	frozen bool
 }
 
 type rack struct {
@@ -223,6 +228,19 @@ func (n *Node) AddShards(vid uint32, collection string, diskID uint32, bits eras
 	vs.diskShardBits[diskID] |= bits
 }
 
+// SetEncodeTs records the encode-run identity (the heartbeat's encode_ts_ns)
+// of the volume's shards on diskID. Call it after AddShards for that disk.
+func (n *Node) SetEncodeTs(vid uint32, collection string, diskID uint32, encodeTsNs int64) {
+	vs, ok := n.shards[volKey{collection: collection, vid: vid}]
+	if !ok {
+		return
+	}
+	if vs.diskEncodeTs == nil {
+		vs.diskEncodeTs = make(map[uint32]int64)
+	}
+	vs.diskEncodeTs[diskID] = encodeTsNs
+}
+
 // Plan runs the full multi-phase EC balance policy and returns the proposed
 // moves: per collection it deduplicates, then spreads data and parity shards
 // across racks and within racks (two-pass, with anti-affinity), and finally
@@ -288,16 +306,25 @@ func Plan(topo *Topology, opts Options) []Move {
 	var all []*move
 	for _, collection := range collections {
 		for _, vk := range byCollection[collection] {
-			m := detectDuplicateShards(vk, nodes)
+			if isFrozen(vk, nodes) {
+				continue
+			}
+			m := detectDuplicateShards(vk, nodes, dataShardsByVolume[vk]+parityShardsByVolume[vk])
 			applyMovesToTopology(m, racks)
 			all = append(all, m...)
 		}
 		for _, vk := range byCollection[collection] {
+			if isFrozen(vk, nodes) {
+				continue
+			}
 			m := detectCrossRackImbalance(vk, nodes, racks, opts.DiskType, opts.ImbalanceThreshold, dataShardsByVolume[vk], parityShardsByVolume[vk], opts.ReplicaPlacement, opts.RackTotalCapRaised)
 			applyMovesToTopology(m, racks)
 			all = append(all, m...)
 		}
 		for _, vk := range byCollection[collection] {
+			if isFrozen(vk, nodes) {
+				continue
+			}
 			m := detectWithinRackImbalance(vk, nodes, racks, opts.DiskType, opts.ImbalanceThreshold, dataShardsByVolume[vk], parityShardsByVolume[vk], opts.ReplicaPlacement)
 			applyMovesToTopology(m, racks)
 			all = append(all, m...)
@@ -340,9 +367,14 @@ func buildRacks(nodes map[string]*Node) map[string]*rack {
 }
 
 // detectDuplicateShards finds shards present on more than one node and proposes
-// deleting all copies but the one on the node with the most free slots.
-func detectDuplicateShards(vk volKey, nodes map[string]*Node) []*move {
+// deleting all copies but one. When the copies come from different encode runs,
+// only a copy from the one run that has a complete shard set is kept: filters can
+// hide shards but not add them, so that run is complete whatever the snapshot
+// leaves out. Without such a run the copies are left alone and the volume is
+// frozen, so later phases cannot move one copy onto another.
+func detectDuplicateShards(vk volKey, nodes map[string]*Node, totalShards int) []*move {
 	shardLocations := make(map[int][]*Node)
+	runShards := make(map[int64]erasure_coding.ShardBits)
 	for _, node := range nodes {
 		info, ok := node.shards[vk]
 		if !ok {
@@ -351,25 +383,58 @@ func detectDuplicateShards(vk volKey, nodes map[string]*Node) []*move {
 		for sid := range info.shardBits.All() {
 			shardLocations[int(sid)] = append(shardLocations[int(sid)], node)
 		}
+		for diskID, bits := range info.diskShardBits {
+			ts := info.diskEncodeTs[diskID]
+			runShards[ts] |= bits
+		}
 	}
+	completeRun, hasCompleteRun := onlyCompleteRun(runShards, totalShards)
 
 	var moves []*move
-	for shardID, locs := range shardLocations {
+	for _, shardID := range sortedShardIDs(shardLocations) {
+		locs := shardLocations[shardID]
+		if len(locs) == 1 {
+			if _, ok := shardEncodeRun(locs[0], vk, shardID); !ok {
+				glog.Warningf("ec balance: volume %d shard %d has copies from different encode runs on node %s; leaving the volume as is", vk.vid, shardID, locs[0].id)
+				freezeVolume(vk, nodes)
+				return nil
+			}
+		}
 		if len(locs) <= 1 {
 			continue
+		}
+		keepable := locs
+		if !sameEncodeRun(locs, vk, shardID) {
+			keepable = nil
+			if hasCompleteRun {
+				for _, node := range locs {
+					if ts, ok := shardEncodeRun(node, vk, shardID); ok && ts == completeRun {
+						keepable = append(keepable, node)
+					}
+				}
+			}
+			if len(keepable) == 0 {
+				glog.Warningf("ec balance: volume %d shard %d has copies from different encode runs and no complete run to keep; leaving the volume as is", vk.vid, shardID)
+				freezeVolume(vk, nodes)
+				return nil
+			}
 		}
 		// Keep the copy on the node with the most free slots and delete the
 		// duplicates from the more-constrained nodes, relieving capacity pressure
 		// where it is tightest. Sort ascending by free slots (tie-break on node id
 		// for determinism) and keep the last entry.
-		sort.Slice(locs, func(i, j int) bool {
-			if locs[i].freeSlots != locs[j].freeSlots {
-				return locs[i].freeSlots < locs[j].freeSlots
+		sort.Slice(keepable, func(i, j int) bool {
+			if keepable[i].freeSlots != keepable[j].freeSlots {
+				return keepable[i].freeSlots < keepable[j].freeSlots
 			}
-			return locs[i].id < locs[j].id
+			return keepable[i].id < keepable[j].id
 		})
-		keep := locs[len(locs)-1]
-		for _, node := range locs[:len(locs)-1] {
+		keep := keepable[len(keepable)-1]
+		sort.Slice(locs, func(i, j int) bool { return locs[i].id < locs[j].id })
+		for _, node := range locs {
+			if node == keep {
+				continue
+			}
 			moves = append(moves, &move{
 				volumeID:   vk.vid,
 				shardID:    shardID,
@@ -384,6 +449,92 @@ func detectDuplicateShards(vk volKey, nodes map[string]*Node) []*move {
 		}
 	}
 	return moves
+}
+
+// shardEncodeRun is the encode run of the node's copy of the shard (0 when
+// unreported), and false when the node holds it on disks of different runs.
+func shardEncodeRun(node *Node, vk volKey, shardID int) (int64, bool) {
+	info, ok := node.shards[vk]
+	if !ok {
+		return 0, false
+	}
+	sid := erasure_coding.ShardId(shardID)
+	run, found := int64(0), false
+	for diskID, bits := range info.diskShardBits {
+		if !bits.Has(sid) {
+			continue
+		}
+		ts := info.diskEncodeTs[diskID]
+		if found && ts != run {
+			return 0, false
+		}
+		run, found = ts, true
+	}
+	return run, found
+}
+
+func sameEncodeRun(locs []*Node, vk volKey, shardID int) bool {
+	first, ok := shardEncodeRun(locs[0], vk, shardID)
+	if !ok {
+		return false
+	}
+	for _, node := range locs[1:] {
+		if ts, ok := shardEncodeRun(node, vk, shardID); !ok || ts != first {
+			return false
+		}
+	}
+	return true
+}
+
+// onlyCompleteRun returns the encode run holding every shard id, and false when
+// no run or more than one does, or when the only complete one is unreported.
+func onlyCompleteRun(runShards map[int64]erasure_coding.ShardBits, totalShards int) (int64, bool) {
+	var complete int64
+	found := false
+	for ts, bits := range runShards {
+		if totalShards <= 0 || bits.Count() < totalShards {
+			continue
+		}
+		if found {
+			return 0, false
+		}
+		complete, found = ts, true
+	}
+	return complete, found && complete != 0
+}
+
+// Freeze keeps the volume's shards on this node out of every phase while still
+// counting them toward the node's load. Call it after AddShards.
+func (n *Node) Freeze(vid uint32, collection string) {
+	if info, ok := n.shards[volKey{collection: collection, vid: vid}]; ok {
+		info.frozen = true
+	}
+}
+
+func freezeVolume(vk volKey, nodes map[string]*Node) {
+	for _, node := range nodes {
+		if info, ok := node.shards[vk]; ok {
+			info.frozen = true
+		}
+	}
+}
+
+func isFrozen(vk volKey, nodes map[string]*Node) bool {
+	for _, node := range nodes {
+		if info, ok := node.shards[vk]; ok && info.frozen {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedShardIDs(m map[int][]*Node) []int {
+	ids := make([]int, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
 }
 
 // detectCrossRackImbalance spreads a volume's shards across racks in two passes
@@ -937,113 +1088,191 @@ func detectGlobalImbalance(nodes map[string]*Node, racks map[string]*rack, diskT
 		if iterations <= 0 {
 			iterations = totalShards
 		}
+		spread := newRackSpread(r)
+		blocked := make(blockedPairs)
 		for i := 0; i < iterations; i++ {
-			var minNode, maxNode *Node
-			minUtil := math.Inf(1)
-			maxUtil := -1.0
-			var minCount, maxCount int
-			for _, nodeID := range sortedNodeKeys(r.nodes) {
-				count := nodeShardCounts[nodeID]
-				node := r.nodes[nodeID]
-				capacity := nodeCapacity[nodeID]
-				if capacity <= 0 {
-					continue
-				}
-				util := float64(count) / float64(capacity)
-				if util < minUtil && node.receiveSlots() > 0 {
-					minUtil, minCount, minNode = util, count, node
-				}
-				if util > maxUtil {
-					maxUtil, maxCount, maxNode = util, count, node
-				}
-			}
-			if maxNode == nil || minNode == nil || maxNode.id == minNode.id {
+			m := planGlobalMove(r, spread, blocked, rackMachineCount, nodeShardCounts, nodeCapacity, diskType, dataShardsByVolume, parityShardsByVolume)
+			if m == nil {
 				break
 			}
-
-			maxCap := nodeCapacity[maxNode.id]
-			minCap := nodeCapacity[minNode.id]
-			if maxCap <= 0 || minCap <= 0 {
-				break
-			}
-			if float64(minCount+1)/float64(minCap) > float64(maxCount-1)/float64(maxCap) {
-				break
-			}
-
-			// Prefer a volume absent from the destination's machine (pass 0) before
-			// adding to one already there (pass 1), to keep volumes spread.
-			moved := false
-			for pass := 0; pass < 2 && !moved; pass++ {
-				for _, vk := range sortedVolumeKeys(maxNode.shards) {
-					if moved {
-						break
-					}
-					info := maxNode.shards[vk]
-					minInfo := minNode.shards[vk]
-					volumeOnMinMachine := machineHoldsVolume(r, minNode.host, vk)
-					if pass == 0 && volumeOnMinMachine {
-						continue // pass 0: only volumes absent from the destination machine
-					}
-					if pass == 1 {
-						if !volumeOnMinMachine {
-							continue
-						}
-						// Protect the volume's machine spread only where it's achievable
-						// (enough machines for this rack's shards to each stay within
-						// parity); there a cross-machine load move is allowed only if it
-						// doesn't raise the destination machine's count past the source's.
-						// Where it isn't achievable, capacity rules and any leveling move
-						// is fine. Feasibility uses the rack's shards, not the whole volume.
-						parity := parityShardsByVolume[vk]
-						spreadFeasible := parity > 0 && rackMachineCount >= ceilDivide(rackVolumeShardCount(r, vk), parity)
-						if spreadFeasible && minNode.host != maxNode.host &&
-							machineVolumeCount(r, minNode.host, vk) >= machineVolumeCount(r, maxNode.host, vk) {
-							continue
-						}
-					}
-					// Walk the volume's actual shard bitmap so custom ratios with more
-					// than the standard total (ids 14..MaxShardCount-1) are candidates too.
-					for sid := range info.shardBits.All() {
-						shardID := int(sid)
-						if minInfo != nil && minInfo.shardBits.Has(sid) {
-							continue
-						}
-						dataShards := dataShardsByVolume[vk]
-						if dataShards <= 0 {
-							dataShards = erasure_coding.DataShardsCount
-						}
-						destDisk := pickBestDiskOnNode(minNode, vk, diskType, shardID, dataShards)
-						moves = append(moves, &move{
-							volumeID:   vk.vid,
-							shardID:    shardID,
-							collection: vk.collection,
-							source:     maxNode,
-							sourceDisk: shardDiskID(maxNode, vk, shardID),
-							target:     minNode,
-							targetDisk: destDisk,
-							phase:      "global",
-						})
-						info.shardBits = info.shardBits.Clear(sid)
-						for diskID := range info.diskShardBits {
-							info.diskShardBits[diskID] = info.diskShardBits[diskID].Clear(sid)
-						}
-						reserveShard(minNode, vk, shardID, destDisk)
-						nodeShardCounts[maxNode.id]--
-						nodeShardCounts[minNode.id]++
-						maxNode.freeSlots++
-						minNode.freeSlots--
-						moved = true
-						break
-					}
-				}
-			}
-			if !moved {
-				break
-			}
+			moves = append(moves, m)
+			vk := volKey{collection: m.collection, vid: m.volumeID}
+			releaseShard(m.source, vk, m.shardID)
+			reserveShard(m.target, vk, m.shardID, m.targetDisk)
+			spread.move(vk, m.source.host, m.target.host)
+			blocked.forget(m.source, m.target)
+			nodeShardCounts[m.source.id]--
+			nodeShardCounts[m.target.id]++
+			m.source.freeSlots++
+			m.target.freeSlots--
 		}
 	}
 
 	return moves
+}
+
+// rackSpread indexes each volume's shard counts in a rack, per machine and in
+// total, so the global phase can check spread without rescanning the rack.
+type rackSpread struct {
+	machine map[volKey]map[string]int
+	rack    map[volKey]int
+}
+
+func newRackSpread(r *rack) rackSpread {
+	s := rackSpread{machine: make(map[volKey]map[string]int), rack: make(map[volKey]int)}
+	for _, n := range r.nodes {
+		for vk, info := range n.shards {
+			c := info.shardBits.Count()
+			if c == 0 {
+				continue
+			}
+			if s.machine[vk] == nil {
+				s.machine[vk] = make(map[string]int)
+			}
+			s.machine[vk][n.host] += c
+			s.rack[vk] += c
+		}
+	}
+	return s
+}
+
+// move records one shard of vk leaving fromHost for toHost within the rack.
+func (s rackSpread) move(vk volKey, fromHost, toHost string) {
+	s.machine[vk][fromHost]--
+	s.machine[vk][toHost]++
+}
+
+// blockedPairs remembers source/target pairs with no movable shard, so a long
+// drain does not rescan them every iteration.
+type blockedPairs map[[2]*Node]bool
+
+// forget drops the pairs a move from source to target can unblock. Losing a
+// shard only narrows source's options and gaining one only narrows target's, so
+// within a machine only target as a source (it holds a new shard) and source as
+// a target (it no longer holds one) can open up. A move between machines also
+// changes the volume's count on both machines, which every pair touching either
+// machine checks.
+func (b blockedPairs) forget(source, target *Node) {
+	crossMachine := source.host != target.host
+	for pair := range b {
+		from, to := pair[0], pair[1]
+		if from == target || to == source ||
+			(crossMachine && (from.host == source.host || from.host == target.host || to.host == source.host || to.host == target.host)) {
+			delete(b, pair)
+		}
+	}
+}
+
+// planGlobalMove picks one shard to move from a fuller node to an emptier one in
+// the rack, or returns nil when no move would narrow the gap. Sources are tried
+// fullest first and destinations emptiest first once they hold the shard, so a
+// node whose shards cannot go to the emptiest node still drains to the next one
+// that can take them, such as another disk on its own machine.
+func planGlobalMove(r *rack, spread rackSpread, blocked blockedPairs, rackMachineCount int, counts, capacity map[string]int, diskType string, dataShardsByVolume, parityShardsByVolume map[volKey]int) *move {
+	util := func(n *Node, delta int) float64 {
+		return float64(counts[n.id]+delta) / float64(capacity[n.id])
+	}
+	var sources, targets []*Node
+	for _, n := range sortedNodeSlice(r.nodes) {
+		if capacity[n.id] <= 0 {
+			continue
+		}
+		sources = append(sources, n)
+		if n.receiveSlots() > 0 {
+			targets = append(targets, n)
+		}
+	}
+	sort.SliceStable(sources, func(i, j int) bool { return util(sources[i], 0) > util(sources[j], 0) })
+	sort.SliceStable(targets, func(i, j int) bool { return util(targets[i], 1) < util(targets[j], 1) })
+	for _, source := range sources {
+		for _, target := range targets {
+			if target.id == source.id {
+				continue
+			}
+			// Targets are ordered by their fullness after taking the shard, so once
+			// one would end up fuller than the source, every later one would too.
+			if util(target, 1) > util(source, -1) {
+				break
+			}
+			pair := [2]*Node{source, target}
+			if blocked[pair] {
+				continue
+			}
+			if m := pickGlobalShard(spread, rackMachineCount, source, target, diskType, dataShardsByVolume, parityShardsByVolume); m != nil {
+				return m
+			}
+			blocked[pair] = true
+		}
+	}
+	return nil
+}
+
+// pickGlobalShard returns a move of one of source's shards to target that keeps
+// each volume spread across machines, or nil.
+func pickGlobalShard(spread rackSpread, rackMachineCount int, source, target *Node, diskType string, dataShardsByVolume, parityShardsByVolume map[volKey]int) *move {
+	sameMachine := source.host == target.host
+	// Prefer a volume absent from the target's machine (pass 0) before adding to
+	// one already there (pass 1), to keep volumes spread.
+	for pass := 0; pass < 2; pass++ {
+		for _, vk := range sortedVolumeKeys(source.shards) {
+			info := source.shards[vk]
+			if info.frozen {
+				continue
+			}
+			targetInfo := target.shards[vk]
+			volumeOnTargetMachine := spread.machine[vk][target.host] > 0
+			if pass == 0 && volumeOnTargetMachine {
+				continue // pass 0: only volumes absent from the target machine
+			}
+			if pass == 1 {
+				if !volumeOnTargetMachine {
+					continue
+				}
+				if sameMachine {
+					// The machine's count is unchanged; keep the volume on as many
+					// of the machine's disks as before by not doubling up on one.
+					if targetInfo != nil && targetInfo.shardBits.Count() > 0 {
+						continue
+					}
+				} else {
+					// Protect the volume's machine spread only where it's achievable
+					// (enough machines for this rack's shards to each stay within
+					// parity); there a cross-machine load move is allowed only if it
+					// doesn't raise the target machine's count past the source's.
+					// Where it isn't achievable, capacity rules and any leveling move
+					// is fine. Feasibility uses the rack's shards, not the whole volume.
+					parity := parityShardsByVolume[vk]
+					spreadFeasible := parity > 0 && rackMachineCount >= ceilDivide(spread.rack[vk], parity)
+					if spreadFeasible && spread.machine[vk][target.host] >= spread.machine[vk][source.host] {
+						continue
+					}
+				}
+			}
+			// Walk the volume's actual shard bitmap so custom ratios with more
+			// than the standard total (ids 14..MaxShardCount-1) are candidates too.
+			for sid := range info.shardBits.All() {
+				if targetInfo != nil && targetInfo.shardBits.Has(sid) {
+					continue
+				}
+				shardID := int(sid)
+				dataShards := dataShardsByVolume[vk]
+				if dataShards <= 0 {
+					dataShards = erasure_coding.DataShardsCount
+				}
+				return &move{
+					volumeID:   vk.vid,
+					shardID:    shardID,
+					collection: vk.collection,
+					source:     source,
+					sourceDisk: shardDiskID(source, vk, shardID),
+					target:     target,
+					targetDisk: pickBestDiskOnNode(target, vk, diskType, shardID, dataShards),
+					phase:      "global",
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // shardsByGroup classifies a volume's shards into data (id < dataShards) and
@@ -1284,7 +1513,8 @@ func volumeShardCount(node *Node, vk volKey) int {
 }
 
 // nodeLiveShardCount is the disk-level EC shard cardinality (master EcShards),
-// not the UI "EC volumes" count (len of the volume map).
+// not the UI "EC volumes" count (len of the volume map). Place uses it as the
+// remainder after even-this-volume and freeSlots (with deadband).
 func nodeLiveShardCount(n *Node) int {
 	if n == nil {
 		return 0

@@ -4,6 +4,8 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -553,6 +555,61 @@ func TestSamePathBarrierSerialization(t *testing.T) {
 	})
 }
 
+// TestConcurrentJobsUpToLimit proves independent-path jobs run in parallel up
+// to the concurrency limit: every admitted job is in flight before any
+// finishes (a serial loop could only have one running), and admissions past
+// the limit wait for a slot rather than running ahead of it.
+func TestConcurrentJobsUpToLimit(t *testing.T) {
+	const limit = 3
+	started := make(chan struct{}, limit)
+	release := make(chan struct{})
+	var inFlight, maxInFlight atomic.Int32
+
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		cur := inFlight.Add(1)
+		for {
+			if old := maxInFlight.Load(); cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		inFlight.Add(-1)
+		return nil
+	}, limit, 0)
+
+	admitDone := make(chan struct{})
+	go func() {
+		defer close(admitDone)
+		for i := 0; i < limit+1; i++ {
+			p.AddSyncJob(makeResp("/d", fmt.Sprintf("f%d", i), false, int64(i+1), true))
+		}
+	}()
+
+	for i := 0; i < limit; i++ {
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d jobs entered flight", i, limit)
+		}
+	}
+	// The extra admission must still be blocked on a full pool.
+	select {
+	case <-started:
+		t.Fatal("a job started with no free slot")
+	case <-admitDone:
+		t.Fatal("submission returned past the concurrency limit")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	<-admitDone
+	p.Drain()
+	if got := maxInFlight.Load(); got != limit {
+		t.Fatalf("peak in-flight = %d, want %d", got, limit)
+	}
+}
+
 // benchResult prevents the compiler from optimizing away the conflict check.
 var benchResult bool
 
@@ -1071,5 +1128,240 @@ func TestResubscribeWaitsForSameTsSibling(t *testing.T) {
 	case <-p.ResubscribeCh():
 	case <-time.After(time.Second):
 		t.Fatal("resubscribe channel never closed after the same-ts jobs drained")
+	}
+}
+
+// TestResumeStaysBehindClearedPin verifies the resume floor outlives the
+// ledger pin: a redelivery can clear failedTs, but events dropped while the
+// processor was stopped — including ones sharing the failure's timestamp —
+// still have to replay, so the resume position stays one tick below the
+// earliest failure.
+func TestResumeStaysBehindClearedPin(t *testing.T) {
+	fail := true
+	release := make(chan struct{})
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		name := resp.EventNotification.NewEntry.GetName()
+		if name == "slow.txt" {
+			<-release
+		}
+		if name == "bad.txt" && fail {
+			return errors.New("AccessDenied: Access Denied")
+		}
+		return nil
+	}, 10, 0)
+
+	// the slow job holds the drain — and the resubscribe — open so the
+	// redelivery still lands on this processor
+	p.AddSyncJob(makeResp("/dir", "slow.txt", false, 300, true))
+	p.AddSyncJob(makeResp("/dir", "bad.txt", false, 200, true))
+	deadline := time.Now().Add(10 * time.Second)
+	for p.OldestFailedTsNs() != 200 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	// a same-ts sibling arriving after the stop is dropped
+	p.AddSyncJob(makeResp("/dir", "sib.txt", false, 200, true))
+	p.activeJobsLock.Lock()
+	dropped := p.activeJobTs[200] == 0
+	p.activeJobsLock.Unlock()
+	if !dropped {
+		t.Fatal("sibling admitted after the failure stopped the processor")
+	}
+
+	// the redelivery runs and clears the pin
+	fail = false
+	p.AddSyncJob(makeResp("/dir", "bad.txt", false, 200, true))
+	deadline = time.Now().Add(10 * time.Second)
+	for p.OldestFailedTsNs() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := p.OldestFailedTsNs(); got != 0 {
+		t.Fatalf("oldest failed = %d after the redelivery, want 0", got)
+	}
+
+	if got := p.EarliestFailedTsNs(); got != 200 {
+		t.Fatalf("earliest failed = %d, want the floor held at 200", got)
+	}
+	if got := resumeTsNsFor(p); got != 199 {
+		t.Fatalf("resume = %d, want 199 so the dropped sibling replays", got)
+	}
+
+	close(release)
+	waitForJobsToDrain(t, p)
+}
+
+// TestResumeStaysBelowNewestSeen covers the frontier case: when every admitted
+// job has finished, the watermark sits on the newest timestamp seen — but the
+// log can still hold same-timestamp events the stream has not delivered yet.
+// An exclusive resume there would skip them, so the position stays one tick
+// below until a newer timestamp proves the block is closed.
+func TestResumeStaysBelowNewestSeen(t *testing.T) {
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		return nil
+	}, 10, 0)
+
+	// the event at 100 finishes before a same-timestamp sibling could even be
+	// read; the watermark reaches the frontier but cannot persist there
+	p.AddSyncJob(makeResp("/dir", "a.txt", false, 100, true))
+	waitForJobsToDrain(t, p)
+	if got := resumeTsNsFor(p); got != 99 {
+		t.Fatalf("resume = %d at the frontier, want 99 so an unread same-ts event replays", got)
+	}
+
+	// once a newer timestamp is seen the 100-block is closed: a slow job at
+	// 200 in flight pins nothing below it, so 100 is now a safe position
+	release := make(chan struct{})
+	p2 := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == 200 {
+			<-release
+		}
+		return nil
+	}, 10, 0)
+	p2.AddSyncJob(makeResp("/dir", "c.txt", false, 100, true))
+	p2.AddSyncJob(makeResp("/dir", "b.txt", false, 200, true))
+	deadline := time.Now().Add(10 * time.Second)
+	for p2.processedTsWatermark.Load() != 100 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := resumeTsNsFor(p2); got != 100 {
+		t.Fatalf("resume = %d below the frontier, want 100", got)
+	}
+
+	// finishing the 200 job lands the watermark back on the frontier
+	close(release)
+	waitForJobsToDrain(t, p2)
+	if got := resumeTsNsFor(p2); got != 199 {
+		t.Fatalf("resume = %d at the frontier, want 199", got)
+	}
+}
+
+func TestWatermarkAfterOutOfOrderCompletion(t *testing.T) {
+	gates := map[int64]chan struct{}{100: make(chan struct{}), 101: make(chan struct{}), 102: make(chan struct{})}
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		<-gates[resp.TsNs]
+		return nil
+	}, 10, 0)
+	for _, ts := range []int64{100, 101, 102} {
+		p.AddSyncJob(makeResp("/dir", fmt.Sprintf("f%d.txt", ts), false, ts, true))
+	}
+
+	close(gates[102])
+	waitForActiveJobs(t, p, 2)
+	close(gates[101])
+	waitForActiveJobs(t, p, 1)
+	if got := p.processedTsWatermark.Load(); got != 0 {
+		t.Fatalf("watermark = %d while the job at 100 runs, want 0", got)
+	}
+	close(gates[100])
+	waitForJobsToDrain(t, p)
+
+	if got := p.processedTsWatermark.Load(); got != 102 {
+		t.Fatalf("watermark = %d after every job finished, want 102", got)
+	}
+	if got := resumeTsNsFor(p); got != 101 {
+		t.Fatalf("resume = %d, want 101", got)
+	}
+}
+
+func TestDoneTimestampsStayBoundedBehindSlowJob(t *testing.T) {
+	release := make(chan struct{})
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == 1 {
+			<-release
+		}
+		return nil
+	}, 4, 0)
+	p.AddSyncJob(makeResp("/dir", "slow.txt", false, 1, true))
+	for ts := int64(2); ts <= 2001; ts++ {
+		p.AddSyncJob(makeResp("/dir", fmt.Sprintf("f%d.txt", ts), false, ts, true))
+	}
+	if done := waitForActiveJobs(t, p, 1); done > 2*4+64+1 {
+		t.Fatalf("%d finished timestamps kept behind the slow job", done)
+	}
+	if got := p.processedTsWatermark.Load(); got != 0 {
+		t.Fatalf("watermark = %d while the oldest job runs, want 0", got)
+	}
+	close(release)
+	waitForJobsToDrain(t, p)
+	if got := p.processedTsWatermark.Load(); got != 2001 {
+		t.Fatalf("watermark = %d after every job finished, want 2001", got)
+	}
+}
+
+// waitForActiveJobs waits until exactly n jobs are in flight and returns how
+// many finished timestamps the processor is holding.
+func waitForActiveJobs(t *testing.T, p *MetadataProcessor, n int) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		p.activeJobsLock.Lock()
+		active, done := p.activeJobCount, len(p.doneTsHeap)
+		p.activeJobsLock.Unlock()
+		if active == n {
+			return done
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d active jobs", n)
+	return 0
+}
+
+func TestCompactedDoneTimestampsKeepProgressBetweenRunningJobs(t *testing.T) {
+	gates := map[string]chan struct{}{"a10": make(chan struct{}), "a20": make(chan struct{}), "a30": make(chan struct{})}
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if gate, ok := gates[resp.EventNotification.NewEntry.Name]; ok {
+			<-gate
+		}
+		return nil
+	}, 200, 0)
+	add := func(name string, ts int64) {
+		p.AddSyncJob(makeResp("/dir", name, false, ts, true))
+	}
+	add("a10", 10)
+	for ts := int64(11); ts <= 19; ts++ {
+		add(fmt.Sprintf("f%d", ts), ts)
+	}
+	add("a20", 20)
+	// a finished job sharing the running job's timestamp
+	add("f20", 20)
+	for ts := int64(21); ts <= 29; ts++ {
+		add(fmt.Sprintf("f%d", ts), ts)
+	}
+	add("a30", 30)
+	for ts := int64(31); ts <= 130; ts++ {
+		add(fmt.Sprintf("f%d", ts), ts)
+	}
+	if done := waitForActiveJobs(t, p, 3); done > 2*3+64+1 {
+		t.Fatalf("%d finished timestamps kept, want them compacted", done)
+	}
+
+	for _, step := range []struct {
+		gate string
+		want int64
+	}{{"a10", 19}, {"a20", 29}, {"a30", 130}} {
+		close(gates[step.gate])
+		deadline := time.Now().Add(10 * time.Second)
+		for p.processedTsWatermark.Load() != step.want && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := p.processedTsWatermark.Load(); got != step.want {
+			t.Fatalf("watermark = %d after %s finished, want %d", got, step.gate, step.want)
+		}
+	}
+}
+
+func TestCompactDoneTsKeepsNewestPerGap(t *testing.T) {
+	p := NewMetadataProcessor(func(*filer_pb.SubscribeMetadataResponse) error { return nil }, 10, 0)
+	p.activeJobTs[10] = 1
+	p.activeJobTs[30] = 1
+	p.failedTs[failedEventKey{tsNs: 20, path: "/dir/f20"}] = struct{}{}
+	p.oldestFailedTsNs = 20
+	for _, ts := range []int64{5, 11, 15, 20, 22, 29, 30, 31, 40} {
+		heap.Push(&p.doneTsHeap, ts)
+	}
+	p.compactDoneTs()
+	got := slices.Sorted(slices.Values(p.doneTsHeap))
+	if want := []int64{5, 15, 29, 40}; !slices.Equal(got, want) {
+		t.Fatalf("compacted done timestamps = %v, want %v", got, want)
 	}
 }

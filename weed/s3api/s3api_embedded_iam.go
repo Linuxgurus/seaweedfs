@@ -342,6 +342,8 @@ func iamAuthErrorCode(errCode s3err.ErrorCode) string {
 		return "RequestTimeTooSkewed"
 	case s3err.ErrInternalError:
 		return iam.ErrCodeServiceFailureException
+	case s3err.ErrEntityTooLarge:
+		return "InvalidInput"
 	default:
 		return "IncompleteSignature"
 	}
@@ -1123,8 +1125,24 @@ func iamPolicyArn(policyName string) string {
 // res[5] contains the bucket and optional path after :::
 func (e *EmbeddedIamApi) getActions(policy *policy_engine.PolicyDocument) ([]string, error) {
 	var actions []string
+	hasVectorPolicy := false
 
 	for _, statement := range policy.Statement {
+		vectorOnly := len(statement.Action.Strings()) > 0
+		for _, action := range statement.Action.Strings() {
+			if !strings.HasPrefix(action, "s3vectors:") {
+				vectorOnly = false
+			}
+		}
+		if vectorOnly && (statement.Effect == policy_engine.PolicyEffectAllow || statement.Effect == policy_engine.PolicyEffectDeny) {
+			for _, resource := range statement.Resource.Strings() {
+				if resource == "*" || strings.HasPrefix(resource, "arn:aws:s3vectors:") {
+					hasVectorPolicy = true
+				}
+			}
+			continue
+		}
+
 		if statement.Effect != policy_engine.PolicyEffectAllow {
 			return nil, fmt.Errorf("not a valid effect: '%s'. Only 'Allow' is possible", statement.Effect)
 		}
@@ -1179,7 +1197,7 @@ func (e *EmbeddedIamApi) getActions(policy *policy_engine.PolicyDocument) ([]str
 		}
 	}
 
-	if len(actions) == 0 {
+	if len(actions) == 0 && !hasVectorPolicy {
 		return nil, fmt.Errorf("no valid actions found in policy document")
 	}
 	return actions, nil
@@ -1291,15 +1309,23 @@ func (e *EmbeddedIamApi) GetUserPolicy(s3cfg *iam_pb.S3ApiConfiguration, values 
 			ctx := context.Background()
 			storedDoc, storeErr := e.credentialManager.GetUserInlinePolicy(ctx, userName, policyName)
 			if storeErr != nil {
-				glog.Warningf("GetUserPolicy: failed to read stored inline policy %q for user %s: %v; falling back to reconstruction", policyName, userName, storeErr)
+				return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("get inline policy %s for %s: %w", policyName, userName, storeErr)}
 			}
-			if storeErr == nil && storedDoc != nil {
+			if storedDoc != nil {
 				policyDocumentJSON, err := json.Marshal(storedDoc)
 				if err != nil {
 					return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
 				}
 				resp.GetUserPolicyResult.PolicyDocument = string(policyDocumentJSON)
 				return resp, nil
+			}
+			// The user has stored inline policies, but none by this name
+			policyNames, err := e.credentialManager.ListUserInlinePolicies(ctx, userName)
+			if err != nil {
+				return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("list inline policies for %s: %w", userName, err)}
+			}
+			if len(policyNames) > 0 {
+				return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("the user policy with name %s cannot be found", policyName)}
 			}
 		}
 

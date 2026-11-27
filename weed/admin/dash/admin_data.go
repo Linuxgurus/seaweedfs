@@ -12,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // Access key status constants
@@ -25,11 +26,14 @@ type AdminData struct {
 	TotalVolumes      int                 `json:"total_volumes"`
 	TotalChunks       int64               `json:"total_chunks"`
 	TotalSize         int64               `json:"total_size"`
+	DiskUsage         int64               `json:"disk_usage"`
+	DiskCapacity      int64               `json:"disk_capacity"`
 	VolumeSizeLimitMB uint64              `json:"volume_size_limit_mb"`
 	MasterNodes       []MasterNode        `json:"master_nodes"`
 	VolumeServers     []VolumeServer      `json:"volume_servers"`
 	FilerNodes        []FilerNode         `json:"filer_nodes"`
 	MessageBrokers    []MessageBrokerNode `json:"message_brokers"`
+	VectorNodes       []VectorNode        `json:"vector_nodes"`
 	S3Nodes           []S3Node            `json:"s3_nodes"`
 	DataCenters       []DataCenter        `json:"datacenters"`
 	LastUpdated       time.Time           `json:"last_updated"`
@@ -48,6 +52,10 @@ type AdminData struct {
 	// TierStats breaks volumes and EC shards down by storage tier: local
 	// disk types plus one entry per remote storage holding tiered volumes.
 	TierStats []TierStats `json:"tier_stats"`
+
+	// VersionSummary reports whether all cluster nodes run the same binary
+	// version, so the dashboard can warn about partially upgraded clusters.
+	VersionSummary ClusterVersionSummary `json:"version_summary"`
 }
 
 // Object Store Users management structures
@@ -145,6 +153,7 @@ type FilerNode struct {
 	Address     string    `json:"address"`
 	DataCenter  string    `json:"datacenter"`
 	Rack        string    `json:"rack"`
+	Version     string    `json:"version"`
 	LastUpdated time.Time `json:"last_updated"`
 }
 
@@ -152,12 +161,14 @@ type MessageBrokerNode struct {
 	Address     string    `json:"address"`
 	DataCenter  string    `json:"datacenter"`
 	Rack        string    `json:"rack"`
+	Version     string    `json:"version"`
 	LastUpdated time.Time `json:"last_updated"`
 }
 
 type S3Node struct {
 	Address     string    `json:"address"`
 	DataCenter  string    `json:"datacenter"`
+	Version     string    `json:"version"`
 	LastUpdated time.Time `json:"last_updated"`
 }
 
@@ -233,12 +244,15 @@ func (s *AdminServer) GetAdminData(username string) (AdminData, error) {
 		TotalVolumes:      topology.TotalVolumes,
 		TotalChunks:       topology.TotalChunks,
 		TotalSize:         topology.TotalSize,
+		DiskUsage:         topology.DiskUsage,
+		DiskCapacity:      topology.DiskCapacity,
 		VolumeSizeLimitMB: volumeSizeLimitMB,
 		MasterNodes:       masterNodes,
 		VolumeServers:     volumeServersData.VolumeServers,
 		FilerNodes:        filerNodes,
 		MessageBrokers:    messageBrokers,
 		S3Nodes:           s3Nodes,
+		VectorNodes:       s.getVectorNodesStatus(context.Background()).Engines,
 		DataCenters:       topology.DataCenters,
 		LastUpdated:       topology.UpdatedAt,
 		TotalEcVolumes:    totalEcVolumes,
@@ -246,6 +260,7 @@ func (s *AdminServer) GetAdminData(username string) (AdminData, error) {
 		TotalMountClients: totalMountClients,
 		Trends:            s.GetDashboardTrends(),
 		TierStats:         topology.TierStats,
+		VersionSummary:    buildClusterVersionSummary(volumeServersData.VolumeServers, filerNodes, s3Nodes, messageBrokers),
 	}
 
 	return adminData, nil
@@ -276,6 +291,17 @@ func (s *AdminServer) ShowOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, topology)
 }
 
+// raftMasterHttpAddress returns a raft member's HTTP address. Members are
+// named after their master address, while the raft address only carries the
+// gRPC port, which is not always the HTTP port + 10000.
+func raftMasterHttpAddress(server *master_pb.RaftListClusterServersResponse_ClusterServers) string {
+	httpAddress := pb.ServerAddress(server.Id).ToHttpAddress()
+	if _, port, err := util.ParseHostPort(httpAddress); err == nil && port > 0 && port < 65536 {
+		return httpAddress
+	}
+	return pb.GrpcAddressToServerAddress(server.Address)
+}
+
 // getMasterNodesStatus returns the full set of master nodes in the cluster.
 // It prefers the authoritative raft membership (RaftListClusterServers) and
 // falls back to the currently-connected master if the raft call fails, so the
@@ -299,7 +325,7 @@ func (s *AdminServer) getMasterNodesStatus() []MasterNode {
 				glog.Warningf("skip master with invalid raft address %q: %v", server.Address, splitErr)
 				continue
 			}
-			httpAddress := pb.GrpcAddressToServerAddress(server.Address)
+			httpAddress := raftMasterHttpAddress(server)
 			if httpAddress == "" {
 				glog.Warningf("skip master with invalid raft address %q", server.Address)
 				continue
@@ -359,6 +385,7 @@ func (s *AdminServer) getFilerNodesStatus() []FilerNode {
 				Address:     pb.ServerAddress(node.Address).ToHttpAddress(),
 				DataCenter:  node.DataCenter,
 				Rack:        node.Rack,
+				Version:     node.Version,
 				LastUpdated: time.Now(),
 			})
 		}
@@ -398,6 +425,7 @@ func (s *AdminServer) getMessageBrokerNodesStatus() []MessageBrokerNode {
 				Address:     node.Address,
 				DataCenter:  node.DataCenter,
 				Rack:        node.Rack,
+				Version:     node.Version,
 				LastUpdated: time.Now(),
 			})
 		}
@@ -436,6 +464,7 @@ func (s *AdminServer) getS3NodesStatus() []S3Node {
 			s3Nodes = append(s3Nodes, S3Node{
 				Address:     pb.ServerAddress(node.Address).ToHttpAddress(),
 				DataCenter:  node.DataCenter,
+				Version:     node.Version,
 				LastUpdated: time.Now(),
 			})
 		}

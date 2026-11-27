@@ -20,7 +20,7 @@ const testS3IamCacheSigningKey = "s3-iam-cache-test-key-do-not-use-in-prod"
 func newTestS3IamCacheServer(t *testing.T, signingKey string) *S3ApiServer {
 	t.Helper()
 	s3a := newTestS3ApiServerWithMemoryIAM(t, nil)
-	s3a.filerGuard = security.NewGuard(nil, signingKey, 10, "", 60)
+	s3a.filerGuard = security.NewGuard(nil, signingKey, 10, "", 60, "", "")
 	return s3a
 }
 
@@ -137,6 +137,27 @@ func TestS3IamCache_ValidToken_WritesIdentity(t *testing.T) {
 	}
 	if !id.isAdmin() {
 		t.Fatalf("expected pushed identity to be admin, actions=%v", id.Actions)
+	}
+}
+
+func TestS3IamCache_ValidTokenFollowingStaleToken_Succeeds(t *testing.T) {
+	s := newTestS3IamCacheServer(t, testS3IamCacheSigningKey)
+	bad := security.GenJwtForFilerAdmin(security.SigningKey("a-different-key"), 60)
+	good := security.GenJwtForFilerAdmin(security.SigningKey(testS3IamCacheSigningKey), 60)
+	multiCtx := metadata.NewIncomingContext(context.Background(), metadata.MD{
+		"authorization": []string{
+			security.BearerPrefix + string(bad),
+			security.BearerPrefix + string(good),
+		},
+	})
+	_, err := s.PutIdentity(multiCtx, &iam_pb.PutIdentityRequest{
+		Identity: &iam_pb.Identity{
+			Name:    "pushed_multi",
+			Actions: []string{"Admin"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutIdentity with valid token following stale token: unexpected error %v", err)
 	}
 }
 
