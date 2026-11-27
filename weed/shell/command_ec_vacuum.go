@@ -74,7 +74,7 @@ func (c *commandEcVacuum) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	maxParallelization := vacuumCommand.Int("maxParallelization", 1, "run up to X volumes in parallel")
 
 	if err = vacuumCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 
 	handleDeprecatedForceFlag(writer, vacuumCommand, applyChangesAlias, applyChanges)
